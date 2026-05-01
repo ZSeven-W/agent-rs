@@ -1,0 +1,64 @@
+[package]
+name = "agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description.workspace = true
+readme = "../../README.md"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# Phase 1+ surfaces. Default keeps the runtime + Anthropic provider (the hand-rolled
+# one — see notes/2026-05-01-sdk-maturity-research.md). OpenAI-compat / Ollama / MCP
+# / session persistence / swarm are opt-in so consumers (OP, Zode) only pull what
+# they actually wire up.
+default = ["anthropic"]
+
+# Provider gates (Phase 2 / 5)
+anthropic = ["dep:reqwest", "dep:eventsource-stream", "dep:bytes"]
+openai = ["dep:async-openai"]
+ollama = ["dep:ollama-rs"]
+
+# Adjacent capability gates
+mcp = ["dep:rmcp"]               # Phase 5+ — MCP client/server surface
+session-jsonl = ["dep:fs4"]      # Phase 4 — JSONL persistence + file lock
+swarm = ["dep:fs4", "dep:lru"]   # Phase 6 — mailbox / sub_agent / teams
+
+# Convenience bundle for full feature set (used by OP today, by Zode tomorrow)
+full = ["anthropic", "openai", "ollama", "mcp", "session-jsonl", "swarm"]
+
+[dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+thiserror = { workspace = true }
+
+tracing = { workspace = true }
+
+uuid = { workspace = true }
+
+# Feature-gated optional deps
+reqwest = { workspace = true, optional = true }
+eventsource-stream = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+async-openai = { workspace = true, optional = true }
+ollama-rs = { workspace = true, optional = true }
+rmcp = { workspace = true, optional = true }
+fs4 = { workspace = true, optional = true }
+lru = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber = { workspace = true }
+tempfile = { workspace = true }
+assert_fs = { workspace = true }
