@@ -44,7 +44,7 @@ rmcp = "1.5"
 lru = "0.12"
 fs4 = "0.9"
 
-schemars = "0.8"
+schemars = "1.2"
 
 bytes = "1"
 

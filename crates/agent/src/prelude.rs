@@ -4,6 +4,7 @@
 
 pub use crate::abort::AbortController;
 pub use crate::error::AgentError;
+pub use crate::file_cache::FileStateCache;
 pub use crate::message::{
     ContentBlock, Header, ImageSource, Message, MessageStore, ToolResultContent,
 };
