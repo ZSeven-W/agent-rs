@@ -14,4 +14,10 @@
 
 mod types;
 
+#[cfg(feature = "anthropic")]
+pub mod anthropic;
+
+#[cfg(feature = "anthropic")]
+pub use anthropic::AnthropicProvider;
+
 pub use types::{Provider, ProviderCapabilities, StreamRequest, ThinkingConfig};
