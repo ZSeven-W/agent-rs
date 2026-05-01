@@ -31,12 +31,28 @@
 //!   [`summarize::CompactionResult`] ready to splice into a
 //!   [`MessageStore`].
 
+pub mod auto;
+pub mod microcompact;
 pub mod prompt;
+pub mod session_memory;
 pub mod summarize;
 
+pub use auto::{
+    auto_compact_threshold, effective_context_window, manual_compact_threshold, warning_threshold,
+    AutoCompactDecision, AutoCompactReason, AutoCompactState, AUTOCOMPACT_BUFFER_TOKENS,
+    ERROR_THRESHOLD_BUFFER_TOKENS, MANUAL_COMPACT_BUFFER_TOKENS,
+    MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES, WARNING_THRESHOLD_BUFFER_TOKENS,
+};
+pub use microcompact::{
+    microcompact, MicrocompactConfig, MicrocompactResult, CLEARED_PLACEHOLDER,
+};
 pub use prompt::{
     parse_summary_response, summarization_prompt, ParseSummaryError, ParsedSummary,
     PartialCompactDirection,
+};
+pub use session_memory::{
+    extract_memories_from_analysis, promote_to_store, InMemoryStore, JsonlMemoryStore,
+    SessionMemoryEntry, SessionMemoryError, SessionMemoryKind, SessionMemoryStore,
 };
 pub use summarize::{
     apply_compaction_to_store, compact_conversation, CompactError, CompactionResult,
