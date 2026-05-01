@@ -17,6 +17,6 @@ pub use crate::permission::{
 pub use crate::provider::AnthropicProvider;
 pub use crate::provider::{Provider, ProviderCapabilities, StreamRequest, ThinkingConfig};
 pub use crate::query::QueryEngine;
-pub use crate::stream::{Event, EventStream, ResultData};
+pub use crate::stream::{Event, EventStream, RequestedToolUse, ResultData, ToolExecutor};
 pub use crate::tool::{Tool, ToolRegistry, ToolUseContext};
 pub use crate::VERSION;

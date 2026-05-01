@@ -8,5 +8,7 @@
 //! `notes/2026-05-01-claude-code-feature-reference.md`).
 
 mod event;
+mod tool_executor;
 
 pub use event::{Event, EventStream, ResultData};
+pub use tool_executor::{RequestedToolUse, ToolExecutor};
