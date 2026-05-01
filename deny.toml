@@ -20,8 +20,13 @@ allow = [
     "MPL-2.0",
     "CC0-1.0",
     "OpenSSL",
+    "CDLA-Permissive-2.0",  # webpki-root-certs (transitive via reqwest/rustls)
 ]
 confidence-threshold = 0.93
+
+# ollama-rs 0.3.4 ships without a `license` field in Cargo.toml — only a
+# `[no-license-field]` warning, not a deny error. Treating as known-MIT
+# per upstream LICENSE file in the repo. Re-evaluate when 0.4 ships.
 
 [bans]
 multiple-versions = "warn"

@@ -41,7 +41,7 @@ async-openai = "0.36"
 ollama-rs = "0.3"
 rmcp = "1.5"
 
-lru = "0.12"
+lru = "0.18"  # bumped from 0.12 to avoid RUSTSEC-2026-0002 (IterMut unsoundness in 0.12.x)
 fs4 = "0.9"
 
 schemars = "1.2"
