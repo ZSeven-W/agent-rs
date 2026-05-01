@@ -43,9 +43,9 @@ pub enum Event {
     Error { code: String, message: String },
     /// Forward-compatibility catch-all. Any `kind` value not recognized by
     /// this crate version deserializes to `Unknown` instead of failing the
-    /// whole stream. Used by older consumers (e.g., a pen-server WASM
-    /// frontend on an old release) when newer producers emit event kinds
-    /// added in later phases.
+    /// whole stream. Used by older consumers when newer producers emit
+    /// event kinds added in later phases (typical scenario: a long-running
+    /// daemon ships ahead of its WASM/web frontend).
     ///
     /// **Payload is dropped** on read because `#[serde(other)]` requires a
     /// unit variant. Consumers that need to forward raw unknown events

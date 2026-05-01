@@ -10,11 +10,15 @@
 pub mod abort;
 pub mod error;
 pub mod file_cache;
+pub mod hook;
 pub mod json;
 pub mod message;
+pub mod permission;
 pub mod prelude;
 pub mod provider;
 pub mod stream;
+pub mod testing;
+pub mod tool;
 
 /// Crate version, sourced from `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
