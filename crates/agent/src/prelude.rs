@@ -3,6 +3,11 @@
 //! `use agent::prelude::*;` to bring in the most-commonly-used types.
 
 pub use crate::abort::AbortController;
+pub use crate::compact::{estimate_text_tokens, estimate_tokens, insert_boundary_marker};
+pub use crate::context::{
+    estimate_total_tokens, ContextStrategy, PassThroughStrategy, SlidingWindowStrategy,
+};
+pub use crate::session::{Session, SessionError, SessionHeader, SCHEMA_VERSION};
 pub use crate::error::AgentError;
 pub use crate::file_cache::FileStateCache;
 pub use crate::hook::{HookEvent, HookHandler, HookOutcome, HookRunner, RustHookHandler};
