@@ -15,6 +15,8 @@
 #![allow(clippy::result_large_err)]
 
 #[cfg(feature = "swarm")]
+mod backends;
+#[cfg(feature = "swarm")]
 mod coordinator;
 #[cfg(feature = "swarm")]
 mod mailbox;
@@ -26,6 +28,12 @@ mod sub_agent;
 mod task;
 #[cfg(feature = "swarm")]
 mod team;
+
+#[cfg(feature = "swarm")]
+pub use backends::{
+    Backend, BackendError, BackendHandle, InProcessBackend, Iterm2Backend, RunnerFn,
+    SpawnSpec, TmuxBackend,
+};
 
 #[cfg(feature = "swarm")]
 pub use coordinator::Coordinator;
