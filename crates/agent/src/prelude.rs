@@ -22,6 +22,8 @@ pub use crate::permission::{
 pub use crate::provider::AnthropicProvider;
 #[cfg(feature = "openai")]
 pub use crate::provider::{OpenAiCompatConfig, OpenAiCompatProvider, OpenAiDialect};
+#[cfg(feature = "ollama")]
+pub use crate::provider::{OllamaConfig, OllamaProvider};
 pub use crate::provider::{Provider, ProviderCapabilities, StreamRequest, ThinkingConfig};
 pub use crate::query::{Phase, QueryEngine, QueryLoop, QueryLoopBuilder, Transition};
 pub use crate::stream::{Event, EventStream, RequestedToolUse, ResultData, ToolExecutor};

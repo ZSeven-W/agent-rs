@@ -26,4 +26,10 @@ pub mod openai_compat;
 #[cfg(feature = "openai")]
 pub use openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider, OpenAiDialect};
 
+#[cfg(feature = "ollama")]
+pub mod ollama;
+
+#[cfg(feature = "ollama")]
+pub use ollama::{OllamaConfig, OllamaProvider};
+
 pub use types::{Provider, ProviderCapabilities, StreamRequest, ThinkingConfig};

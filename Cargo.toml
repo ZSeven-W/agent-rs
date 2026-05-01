@@ -38,7 +38,7 @@ eventsource-stream = "0.2"
 
 # LLM SDK crates (per notes/2026-05-01-sdk-maturity-research.md verdict)
 async-openai = { version = "0.36", default-features = false, features = ["chat-completion"] }
-ollama-rs = "0.3"
+ollama-rs = { version = "0.3", features = ["stream"] }
 rmcp = "1.5"
 
 lru = "0.18"  # bumped from 0.12 to avoid RUSTSEC-2026-0002 (IterMut unsoundness in 0.12.x)
