@@ -37,7 +37,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 eventsource-stream = "0.2"
 
 # LLM SDK crates (per notes/2026-05-01-sdk-maturity-research.md verdict)
-async-openai = "0.36"
+async-openai = { version = "0.36", default-features = false, features = ["chat-completion"] }
 ollama-rs = "0.3"
 rmcp = "1.5"
 

@@ -20,4 +20,10 @@ pub mod anthropic;
 #[cfg(feature = "anthropic")]
 pub use anthropic::AnthropicProvider;
 
+#[cfg(feature = "openai")]
+pub mod openai_compat;
+
+#[cfg(feature = "openai")]
+pub use openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider, OpenAiDialect};
+
 pub use types::{Provider, ProviderCapabilities, StreamRequest, ThinkingConfig};
