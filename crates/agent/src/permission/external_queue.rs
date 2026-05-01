@@ -164,7 +164,7 @@ pub fn timeout_default_deny(tool: &str, err: ExternalQueueError) -> PermissionDe
         message_text: format!(
             "Tool '{tool}' denied: external approval did not arrive ({err})."
         ),
-        reason: DecisionReason::Other(format!("external_queue: {err}")),
+        reason: DecisionReason::other(format!("external_queue: {err}")),
     })
 }
 
@@ -176,7 +176,7 @@ mod tests {
     fn allow() -> PermissionDecision {
         PermissionDecision::Allow(AllowDecision {
             updated_input: None,
-            reason: DR::Other("test".into()),
+            reason: DR::other("test"),
         })
     }
 
@@ -237,7 +237,7 @@ mod tests {
                 |_tool, _err| {
                     PermissionDecision::Ask(crate::permission::AskDecision {
                         message_text: "approver offline; please approve".into(),
-                        reason: Some(DR::Other("custom fallback".into())),
+                        reason: Some(DR::other("custom fallback")),
                     })
                 },
             )
@@ -273,7 +273,7 @@ mod tests {
                 let req = receiver.next().await.unwrap();
                 req.respond(PermissionDecision::Allow(AllowDecision {
                     updated_input: None,
-                    reason: DR::Other(format!("approved {i}")),
+                    reason: DR::other(format!("approved {i}")),
                 }))
                 .unwrap();
             }

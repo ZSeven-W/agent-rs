@@ -15,7 +15,29 @@
 #![allow(clippy::result_large_err)]
 
 #[cfg(feature = "swarm")]
+mod coordinator;
+#[cfg(feature = "swarm")]
 mod mailbox;
+#[cfg(feature = "swarm")]
+mod permission_sync;
+#[cfg(feature = "swarm")]
+mod sub_agent;
+#[cfg(feature = "swarm")]
+mod task;
+#[cfg(feature = "swarm")]
+mod team;
 
 #[cfg(feature = "swarm")]
+pub use coordinator::Coordinator;
+#[cfg(feature = "swarm")]
 pub use mailbox::{Mailbox, MailboxError, MailboxHeader, MailboxMessage, MAILBOX_SCHEMA_VERSION};
+#[cfg(feature = "swarm")]
+pub use permission_sync::{
+    PendingRequest, PermissionSync, PermissionSyncError, ResolvedResponse,
+};
+#[cfg(feature = "swarm")]
+pub use sub_agent::SubAgent;
+#[cfg(feature = "swarm")]
+pub use task::{SwarmTask, SwarmTaskPriority, SwarmTaskStatus};
+#[cfg(feature = "swarm")]
+pub use team::{MemberSpec, Team, TeamError};

@@ -115,7 +115,7 @@ fn step_1b_ask_rule_triggers_ask_with_rule_reason() {
     let decision = evaluate_permission("Bash", &null_input(), &ctx, None);
     match decision {
         PermissionDecision::Ask(AskDecision { reason, .. }) => match reason {
-            Some(DecisionReason::Rule(r)) => assert_eq!(r, ask_rule),
+            Some(DecisionReason::Rule { rule: r }) => assert_eq!(r, ask_rule),
             other => panic!("expected Rule reason, got {other:?}"),
         },
         other => panic!("expected ask, got {other:?}"),
@@ -145,7 +145,7 @@ fn step_1c_callback_deny_short_circuits() {
         Box::new(|_input| {
             PermissionDecision::Deny(agent::permission::DenyDecision {
                 message_text: "callback says no".into(),
-                reason: DecisionReason::Other("custom".into()),
+                reason: DecisionReason::other("custom"),
             })
         });
     let decision = evaluate_permission("Bash", &null_input(), &ctx, Some(&*cb));
@@ -163,14 +163,14 @@ fn step_1c_callback_allow_falls_through_to_allow_rule() {
         Box::new(|_input| {
             PermissionDecision::Allow(agent::permission::AllowDecision {
                 updated_input: None,
-                reason: DecisionReason::Other("callback ok".into()),
+                reason: DecisionReason::other("callback ok"),
             })
         });
     let decision = evaluate_permission("Bash", &null_input(), &ctx, Some(&*cb));
     // Allow rule reason wins (callback Allow falls through to Step 2b).
     match decision {
         PermissionDecision::Allow(allow) => match allow.reason {
-            DecisionReason::Rule(r) => assert_eq!(r.tool_name, "Bash"),
+            DecisionReason::Rule { rule: r } => assert_eq!(r.tool_name, "Bash"),
             other => panic!("expected allow rule reason, got {other:?}"),
         },
         other => panic!("expected allow, got {other:?}"),
@@ -184,7 +184,7 @@ fn step_1c_callback_allow_falls_through_to_default_ask() {
         Box::new(|_input| {
             PermissionDecision::Allow(agent::permission::AllowDecision {
                 updated_input: None,
-                reason: DecisionReason::Other("ok".into()),
+                reason: DecisionReason::other("ok"),
             })
         });
     let decision = evaluate_permission("Bash", &null_input(), &ctx, Some(&*cb));

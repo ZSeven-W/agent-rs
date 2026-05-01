@@ -47,7 +47,7 @@ pub fn evaluate_permission(
     if let Some(rule) = find_rule_for_tool(&ctx.always_deny_rules, tool_name) {
         return PermissionDecision::Deny(DenyDecision {
             message_text: "Tool use denied by rule.".into(),
-            reason: DecisionReason::Rule(rule.clone()),
+            reason: DecisionReason::rule(rule.clone()),
         });
     }
 
@@ -55,7 +55,7 @@ pub fn evaluate_permission(
     if let Some(rule) = find_rule_for_tool(&ctx.always_ask_rules, tool_name) {
         return PermissionDecision::Ask(AskDecision {
             message_text: "Tool use requires confirmation.".into(),
-            reason: Some(DecisionReason::Rule(rule.clone())),
+            reason: Some(DecisionReason::rule(rule.clone())),
         });
     }
 
@@ -74,7 +74,7 @@ pub fn evaluate_permission(
     if ctx.mode == PermissionMode::Bypass {
         return PermissionDecision::Allow(AllowDecision {
             updated_input: None,
-            reason: DecisionReason::Mode(PermissionMode::Bypass),
+            reason: DecisionReason::mode(PermissionMode::Bypass),
         });
     }
 
@@ -82,7 +82,7 @@ pub fn evaluate_permission(
     if let Some(rule) = find_rule_for_tool(&ctx.always_allow_rules, tool_name) {
         return PermissionDecision::Allow(AllowDecision {
             updated_input: None,
-            reason: DecisionReason::Rule(rule.clone()),
+            reason: DecisionReason::rule(rule.clone()),
         });
     }
 
@@ -90,7 +90,7 @@ pub fn evaluate_permission(
     if ctx.mode == PermissionMode::DontAsk {
         return PermissionDecision::Deny(DenyDecision {
             message_text: "Permission required but prompting is disabled.".into(),
-            reason: DecisionReason::Mode(PermissionMode::DontAsk),
+            reason: DecisionReason::mode(PermissionMode::DontAsk),
         });
     }
 

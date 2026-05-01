@@ -69,13 +69,33 @@ impl PermissionRule {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DecisionReason {
-    Rule(PermissionRule),
-    Mode(PermissionMode),
+    Rule {
+        rule: PermissionRule,
+    },
+    Mode {
+        mode: PermissionMode,
+    },
     SafetyCheck {
         reason: String,
         classifier_approvable: bool,
     },
-    Other(String),
+    Other {
+        message: String,
+    },
+}
+
+impl DecisionReason {
+    pub fn rule(rule: PermissionRule) -> Self {
+        Self::Rule { rule }
+    }
+    pub fn mode(mode: PermissionMode) -> Self {
+        Self::Mode { mode }
+    }
+    pub fn other(message: impl Into<String>) -> Self {
+        Self::Other {
+            message: message.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
