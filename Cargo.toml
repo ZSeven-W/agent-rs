@@ -3,10 +3,7 @@ resolver = "2"
 members = ["crates/agent"]
 
 [workspace.package]
-# Aligned with OpenPencil's release coordinate (v0.8.x). Phase 1+ may bump to
-# 0.8.1 / 0.8.2 etc as features land. Independent semver returns post Phase 7
-# cutover when API stabilizes for 1.0.
-version = "0.8.0"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
 license = "MIT"

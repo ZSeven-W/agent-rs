@@ -75,6 +75,15 @@ pub enum HookEvent {
     OnCompact {
         reason: String,
     },
+    PreCompact {
+        trigger: String,
+        custom_instructions: Option<String>,
+    },
+    PostCompact {
+        pre_tokens: u32,
+        post_tokens: u32,
+        replaced_count: u32,
+    },
     OnSubagentSpawn {
         id: String,
     },
@@ -129,6 +138,8 @@ impl HookEvent {
             Self::OnRetry { .. } => "on_retry",
             Self::OnContextWindowFull => "on_context_window_full",
             Self::OnCompact { .. } => "on_compact",
+            Self::PreCompact { .. } => "pre_compact",
+            Self::PostCompact { .. } => "post_compact",
             Self::OnSubagentSpawn { .. } => "on_subagent_spawn",
             Self::OnSubagentDone { .. } => "on_subagent_done",
             Self::OnTeamMessage { .. } => "on_team_message",

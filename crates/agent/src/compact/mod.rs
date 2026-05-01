@@ -32,10 +32,13 @@
 //!   [`MessageStore`].
 
 pub mod auto;
+pub mod grouping;
 pub mod microcompact;
+pub mod post_cleanup;
 pub mod prompt;
 pub mod session_memory;
 pub mod summarize;
+pub mod with_hooks;
 
 pub use auto::{
     auto_compact_threshold, effective_context_window, manual_compact_threshold, warning_threshold,
@@ -54,10 +57,15 @@ pub use session_memory::{
     extract_memories_from_analysis, promote_to_store, InMemoryStore, JsonlMemoryStore,
     SessionMemoryEntry, SessionMemoryError, SessionMemoryKind, SessionMemoryStore,
 };
+pub use grouping::{group_messages, safe_split_index, GroupKind, MessageGroup};
+pub use post_cleanup::{
+    build_post_compact_message, FileAttachment, PostCompactConfig, PostCompactResult,
+};
 pub use summarize::{
     apply_compaction_to_store, compact_conversation, CompactError, CompactionResult,
     COMPACT_BOUNDARY_TEXT, MAX_OUTPUT_TOKENS_FOR_SUMMARY,
 };
+pub use with_hooks::{compact_with_hooks, CompactTrigger, CompactWithHooksRequest};
 
 use crate::message::{ContentBlock, Header, ImageSource, Message, MessageStore, ToolResultContent};
 
