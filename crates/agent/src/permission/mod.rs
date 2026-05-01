@@ -1,17 +1,16 @@
-//! Permission system — Phase 3 fills this with the 7-step evaluation chain
-//! ported from the Zig corpus (see `notes/2026-05-01-zig-skeleton-audit.md`,
-//! Tier A).
+//! 7-step permission evaluation chain (Phase 3 / Task 3.1).
 //!
-//! Phase 2 ships only the type stub so [`crate::tool::ToolUseContext`] can
-//! reference it. `PermissionManager::evaluate(...)` lands in Phase 3.
+//! Logic + types ported from Zig `agent/src/permission.zig` (Tier A in
+//! the audit). Six Zig unit tests are mirrored as Rust integration tests
+//! at `tests/permission_corpus.rs` (red-then-green corpus).
 
-#[derive(Debug, Default)]
-pub struct PermissionManager {
-    _phase_2_stub: (),
-}
+mod chain;
+mod manager;
+mod types;
 
-impl PermissionManager {
-    pub fn new() -> Self {
-        Self { _phase_2_stub: () }
-    }
-}
+pub use chain::{evaluate_permission, find_rule_for_tool, ToolPermissionCheckFn};
+pub use manager::PermissionManager;
+pub use types::{
+    AllowDecision, AskDecision, DecisionReason, DenyDecision, PermissionBehavior,
+    PermissionContext, PermissionDecision, PermissionMode, PermissionRule, RuleSource,
+};
