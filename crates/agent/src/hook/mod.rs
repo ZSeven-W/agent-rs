@@ -1,17 +1,13 @@
-//! Hook system — Phase 3 fills this with the typed event registry
-//! (PreToolUse / PostToolUse / PostToolUseFailure / PermissionRequest /
-//! PermissionDenied / etc.).
+//! Hook system — typed event registry with shell-script + Rust-closure
+//! handlers (Phase 3 / Task 3.3).
 //!
-//! Phase 2 ships only the type stub so [`crate::tool::ToolUseContext`] can
-//! reference it. `HookRunner::run(...)` lands in Phase 3.
+//! See `runner` for the [`HookHandler`] trait and the [`HookRunner`]
+//! registry; see `event` for the [`HookEvent`] vocabulary (24+
+//! variants ported from the Claude Code reference + the Zig
+//! placeholder).
 
-#[derive(Debug, Default)]
-pub struct HookRunner {
-    _phase_2_stub: (),
-}
+mod event;
+mod runner;
 
-impl HookRunner {
-    pub fn new() -> Self {
-        Self { _phase_2_stub: () }
-    }
-}
+pub use event::HookEvent;
+pub use runner::{HookHandler, HookOutcome, HookRunner, RustHookHandler, ScriptHookHandler};

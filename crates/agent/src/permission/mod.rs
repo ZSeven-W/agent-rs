@@ -5,11 +5,16 @@
 //! at `tests/permission_corpus.rs` (red-then-green corpus).
 
 mod chain;
+mod external_queue;
 mod manager;
 mod types;
 
 pub use chain::{evaluate_permission, find_rule_for_tool, ToolPermissionCheckFn};
-pub use manager::PermissionManager;
+pub use external_queue::{
+    external_queue, timeout_default_deny, ExternalQueue, ExternalQueueError,
+    ExternalQueueReceiver, ExternalRequest,
+};
+pub use manager::{AsyncToolPermissionCheck, PermissionManager};
 pub use types::{
     AllowDecision, AskDecision, DecisionReason, DenyDecision, PermissionBehavior,
     PermissionContext, PermissionDecision, PermissionMode, PermissionRule, RuleSource,

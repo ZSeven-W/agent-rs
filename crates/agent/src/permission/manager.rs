@@ -1,8 +1,20 @@
+use async_trait::async_trait;
+
 use super::chain::{evaluate_permission, ToolPermissionCheckFn};
 use super::types::{
-    PermissionBehavior, PermissionContext, PermissionDecision, PermissionMode, PermissionRule,
-    RuleSource,
+    AllowDecision, AskDecision, DecisionReason, DenyDecision, PermissionBehavior,
+    PermissionContext, PermissionDecision, PermissionMode, PermissionRule, RuleSource,
 };
+
+/// Async equivalent of [`ToolPermissionCheckFn`] (Phase 3 batch H).
+///
+/// Implementations may genuinely await — e.g., bridging to an
+/// [`super::ExternalQueue`] for human approval, or hitting a remote
+/// policy service. Use this with [`PermissionManager::evaluate_async`].
+#[async_trait]
+pub trait AsyncToolPermissionCheck: Send + Sync {
+    async fn check(&self, input: &serde_json::Value) -> PermissionDecision;
+}
 
 /// Stateful wrapper that owns the [`PermissionContext`] and runs the
 /// 7-step chain on every tool invocation.
@@ -100,5 +112,75 @@ impl PermissionManager {
         callback: Option<&ToolPermissionCheckFn>,
     ) -> PermissionDecision {
         evaluate_permission(tool_name, input, &self.context, callback)
+    }
+
+    /// Async variant — same 7-step chain, but the Step 1c callback is
+    /// allowed to genuinely await (e.g., bridging to an
+    /// [`super::ExternalQueue`] for human approval). Steps 1a, 1b, 2a,
+    /// 2b, 3, 4 resolve synchronously; only Step 1c can yield.
+    pub async fn evaluate_async(
+        &self,
+        tool_name: &str,
+        input: &serde_json::Value,
+        callback: Option<&dyn AsyncToolPermissionCheck>,
+    ) -> PermissionDecision {
+        // Step 1a — deny rule.
+        if let Some(rule) = super::chain::find_rule_for_tool(
+            &self.context.always_deny_rules,
+            tool_name,
+        ) {
+            return PermissionDecision::Deny(DenyDecision {
+                message_text: "Tool use denied by rule.".into(),
+                reason: DecisionReason::Rule(rule.clone()),
+            });
+        }
+        // Step 1b — ask rule.
+        if let Some(rule) = super::chain::find_rule_for_tool(
+            &self.context.always_ask_rules,
+            tool_name,
+        ) {
+            return PermissionDecision::Ask(AskDecision {
+                message_text: "Tool use requires confirmation.".into(),
+                reason: Some(DecisionReason::Rule(rule.clone())),
+            });
+        }
+        // Step 1c — async tool callback.
+        if let Some(cb) = callback {
+            match cb.check(input).await {
+                decision @ PermissionDecision::Deny(_) => return decision,
+                decision @ PermissionDecision::Ask(_) => return decision,
+                PermissionDecision::Allow(_) => {
+                    // Fall through — bypass / allow rule may upgrade.
+                }
+            }
+        }
+        // Step 2a — bypass mode.
+        if self.context.mode == PermissionMode::Bypass {
+            return PermissionDecision::Allow(AllowDecision {
+                updated_input: None,
+                reason: DecisionReason::Mode(PermissionMode::Bypass),
+            });
+        }
+        // Step 2b — whole-tool allow rule.
+        if let Some(rule) = super::chain::find_rule_for_tool(
+            &self.context.always_allow_rules,
+            tool_name,
+        ) {
+            return PermissionDecision::Allow(AllowDecision {
+                updated_input: None,
+                reason: DecisionReason::Rule(rule.clone()),
+            });
+        }
+        // Step 3 + 4 — default-ask, with dont_ask escalating to deny.
+        if self.context.mode == PermissionMode::DontAsk {
+            return PermissionDecision::Deny(DenyDecision {
+                message_text: "Permission required but prompting is disabled.".into(),
+                reason: DecisionReason::Mode(PermissionMode::DontAsk),
+            });
+        }
+        PermissionDecision::Ask(AskDecision {
+            message_text: "Permission required.".into(),
+            reason: None,
+        })
     }
 }
