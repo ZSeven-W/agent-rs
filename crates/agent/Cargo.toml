@@ -27,7 +27,7 @@ ollama = ["dep:ollama-rs"]
 # Adjacent capability gates
 mcp = ["dep:rmcp"]               # Phase 5+ — MCP client/server surface
 session-jsonl = ["dep:fs4"]      # Phase 4 — JSONL persistence + file lock
-swarm = ["dep:fs4"]              # Phase 6 — mailbox / sub_agent / teams (lru is core)
+swarm = ["dep:fs4", "dep:notify"]  # Phase 6 — mailbox / sub_agent / teams (lru is core)
 
 # Convenience bundle for full feature set (used by OP today, by Zode tomorrow)
 full = ["anthropic", "openai", "ollama", "mcp", "session-jsonl", "swarm"]
@@ -63,6 +63,7 @@ rmcp = { workspace = true, optional = true }
 # need exclusive file locks. Phase 1's FileStateCache deliberately does
 # not lock reads — see file_cache module docstring.
 fs4 = { workspace = true, optional = true }
+notify = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

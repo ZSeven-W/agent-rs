@@ -42,7 +42,8 @@ ollama-rs = { version = "0.3", features = ["stream"] }
 rmcp = "1.5"
 
 lru = "0.18"  # bumped from 0.12 to avoid RUSTSEC-2026-0002 (IterMut unsoundness in 0.12.x)
-fs4 = "0.9"
+fs4 = { version = "0.9", features = ["tokio"] }
+notify = "6"
 
 schemars = "1.2"
 

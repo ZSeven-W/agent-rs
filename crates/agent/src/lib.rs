@@ -21,6 +21,8 @@ pub mod provider;
 pub mod query;
 pub mod session;
 pub mod stream;
+#[cfg(feature = "swarm")]
+pub mod swarm;
 pub mod testing;
 pub mod tool;
 
