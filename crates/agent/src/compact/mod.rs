@@ -22,6 +22,26 @@
 //! [`insert_boundary_marker`] separates "old context (summary above)"
 //! from "active context (below)" — used by reactive compaction in
 //! later phases.
+//!
+//! ## Submodules (Tier 1 claude-code parity)
+//!
+//! - [`prompt`] — `<analysis>`/`<summary>` template + parser.
+//! - [`summarize`] — [`summarize::compact_conversation`] calls a
+//!   provider, parses the model's response, and produces a
+//!   [`summarize::CompactionResult`] ready to splice into a
+//!   [`MessageStore`].
+
+pub mod prompt;
+pub mod summarize;
+
+pub use prompt::{
+    parse_summary_response, summarization_prompt, ParseSummaryError, ParsedSummary,
+    PartialCompactDirection,
+};
+pub use summarize::{
+    apply_compaction_to_store, compact_conversation, CompactError, CompactionResult,
+    COMPACT_BOUNDARY_TEXT, MAX_OUTPUT_TOKENS_FOR_SUMMARY,
+};
 
 use crate::message::{ContentBlock, Header, ImageSource, Message, MessageStore, ToolResultContent};
 
