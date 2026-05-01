@@ -7,5 +7,7 @@
 //! evaluation, and hook firing land in Phase 3+.
 
 mod engine;
+mod loop_;
 
 pub use engine::QueryEngine;
+pub use loop_::{Phase, QueryLoop, QueryLoopBuilder, Transition};

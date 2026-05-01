@@ -17,24 +17,33 @@ use crate::tool::{Tool, ToolUseContext};
 
 /// A provider whose `stream()` returns a pre-canned sequence of [`Event`]s.
 ///
-/// Construct with [`MockProvider::new`] (passes-through whatever script you
-/// supply) and assert against the events your QueryEngine forwards.
+/// Two construction modes:
+/// - [`MockProvider::new`] takes a single Vec; the first `stream()` call
+///   drains it, subsequent calls return empty (matches the Phase 2
+///   single-turn QueryEngine test pattern).
+/// - [`MockProvider::with_turns`] takes a `Vec<Vec<Event>>` — one Vec per
+///   turn. Each `stream()` call pops the front Vec, useful for the
+///   multi-turn QueryLoop in Phase 3.
 #[derive(Debug)]
 pub struct MockProvider {
     id: String,
     capabilities: ProviderCapabilities,
-    scripted: Mutex<Vec<Event>>,
+    turns: Mutex<Vec<Vec<Event>>>,
 }
 
 impl MockProvider {
     pub fn new(scripted: Vec<Event>) -> Self {
+        Self::with_turns(vec![scripted])
+    }
+
+    pub fn with_turns(turns: Vec<Vec<Event>>) -> Self {
         Self {
             id: "mock".into(),
             capabilities: ProviderCapabilities {
                 supports_tool_use: true,
                 ..Default::default()
             },
-            scripted: Mutex::new(scripted),
+            turns: Mutex::new(turns),
         }
     }
 
@@ -46,6 +55,11 @@ impl MockProvider {
     pub fn with_capabilities(mut self, capabilities: ProviderCapabilities) -> Self {
         self.capabilities = capabilities;
         self
+    }
+
+    /// Number of turns remaining to be drained.
+    pub fn remaining_turns(&self) -> usize {
+        self.turns.lock().map(|t| t.len()).unwrap_or(0)
     }
 }
 
@@ -64,13 +78,20 @@ impl Provider for MockProvider {
         _req: StreamRequest,
         _abort: AbortController,
     ) -> Result<Box<dyn EventStream>, AgentError> {
-        // Drain (not clone) so a second call sees an empty script — keeps
-        // tests honest about expected call count.
-        let events = self
-            .scripted
-            .lock()
-            .map(|mut g| std::mem::take(&mut *g))
-            .map_err(|_| AgentError::Other("MockProvider lock poisoned".into()))?;
+        // Pop the front turn. Subsequent calls beyond the scripted turns
+        // see an empty stream — keeps tests honest about expected call
+        // count.
+        let events = {
+            let mut turns = self
+                .turns
+                .lock()
+                .map_err(|_| AgentError::Other("MockProvider lock poisoned".into()))?;
+            if turns.is_empty() {
+                Vec::new()
+            } else {
+                turns.remove(0)
+            }
+        };
         let iter = events.into_iter().map(Ok);
         Ok(Box::new(stream::iter(iter)))
     }

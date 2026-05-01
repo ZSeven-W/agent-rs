@@ -21,7 +21,7 @@ use crate::stream::{Event, EventStream};
 use crate::tool::{ToolRegistry, ToolUseContext};
 
 /// One requested tool call coming out of an LLM assistant turn.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RequestedToolUse {
     pub id: String,
     pub name: String,
