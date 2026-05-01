@@ -66,7 +66,10 @@ impl Provider for MockProvider {
     ) -> Result<Box<dyn EventStream>, AgentError> {
         // Drain (not clone) so a second call sees an empty script — keeps
         // tests honest about expected call count.
-        let events = self.scripted.lock().map(|mut g| std::mem::take(&mut *g))
+        let events = self
+            .scripted
+            .lock()
+            .map(|mut g| std::mem::take(&mut *g))
             .map_err(|_| AgentError::Other("MockProvider lock poisoned".into()))?;
         let iter = events.into_iter().map(Ok);
         Ok(Box::new(stream::iter(iter)))
@@ -168,7 +171,9 @@ mod tests {
 
     #[tokio::test]
     async fn mock_provider_drains_after_first_call() {
-        let p = MockProvider::new(vec![Event::TextDelta { delta: "once".into() }]);
+        let p = MockProvider::new(vec![Event::TextDelta {
+            delta: "once".into(),
+        }]);
         let req = StreamRequest::new("any", vec![]);
         let _first = p.stream(req.clone(), AbortController::new()).await.unwrap();
         let mut second = p.stream(req, AbortController::new()).await.unwrap();
@@ -189,8 +194,7 @@ mod tests {
 
     #[tokio::test]
     async fn fake_tool_returns_error_when_configured() {
-        let t = FakeTool::new("err", serde_json::json!({}))
-            .with_error(AgentError::other("boom"));
+        let t = FakeTool::new("err", serde_json::json!({})).with_error(AgentError::other("boom"));
         let ctx = ToolUseContext::new("/tmp");
         let res = t.call(&ctx, serde_json::json!({})).await;
         assert!(res.is_err());

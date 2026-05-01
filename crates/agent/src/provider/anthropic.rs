@@ -91,7 +91,10 @@ impl Provider for AnthropicProvider {
                 AgentError::provider("anthropic", format!("invalid x-api-key header: {e}"))
             })?,
         );
-        headers.insert("anthropic-version", HeaderValue::from_static(ANTHROPIC_VERSION));
+        headers.insert(
+            "anthropic-version",
+            HeaderValue::from_static(ANTHROPIC_VERSION),
+        );
         headers.insert("content-type", HeaderValue::from_static("application/json"));
 
         let mut betas: Vec<&'static str> = Vec::new();
@@ -457,7 +460,10 @@ async fn parse_sse_into_events<S>(
                     total_usage.merge(&u);
                 }
             }
-            SseEvent::ContentBlockStart { index, content_block } => match content_block {
+            SseEvent::ContentBlockStart {
+                index,
+                content_block,
+            } => match content_block {
                 ContentBlockStart::Text { .. } => {
                     blocks.insert(index, BlockState::Text);
                 }
@@ -483,36 +489,45 @@ async fn parse_sse_into_events<S>(
                 (_, BlockDelta::Thinking { thinking }) => {
                     let _ = tx.unbounded_send(Ok(Event::Thinking { delta: thinking }));
                 }
-                (Some(BlockState::ToolUse { partial_json, .. }), BlockDelta::InputJson { partial_json: chunk }) => {
+                (
+                    Some(BlockState::ToolUse { partial_json, .. }),
+                    BlockDelta::InputJson {
+                        partial_json: chunk,
+                    },
+                ) => {
                     partial_json.push_str(&chunk);
                 }
                 _ => {}
             },
             SseEvent::ContentBlockStop { index } => {
-                if let Some(BlockState::ToolUse { id, name, partial_json }) = blocks.remove(&index) {
-                    let input: serde_json::Value =
-                        if partial_json.is_empty() {
-                            serde_json::Value::Object(Default::default())
-                        } else {
-                            match serde_json::from_str(&partial_json) {
-                                Ok(v) => v,
-                                Err(err) => {
-                                    // Tool-call input is malformed — the
-                                    // turn cannot complete soundly. Surface
-                                    // the error and terminate the stream
-                                    // so the consumer doesn't see a
-                                    // synthetic Result for a turn whose
-                                    // tool call was silently dropped.
-                                    let _ = tx.unbounded_send(Err(AgentError::provider(
+                if let Some(BlockState::ToolUse {
+                    id,
+                    name,
+                    partial_json,
+                }) = blocks.remove(&index)
+                {
+                    let input: serde_json::Value = if partial_json.is_empty() {
+                        serde_json::Value::Object(Default::default())
+                    } else {
+                        match serde_json::from_str(&partial_json) {
+                            Ok(v) => v,
+                            Err(err) => {
+                                // Tool-call input is malformed — the
+                                // turn cannot complete soundly. Surface
+                                // the error and terminate the stream
+                                // so the consumer doesn't see a
+                                // synthetic Result for a turn whose
+                                // tool call was silently dropped.
+                                let _ = tx.unbounded_send(Err(AgentError::provider(
                                         "anthropic",
                                         format!(
                                             "tool_use input JSON parse error (id={id}, name={name}): {err}"
                                         ),
                                     )));
-                                    return;
-                                }
+                                return;
                             }
-                        };
+                        }
+                    };
                     let _ = tx.unbounded_send(Ok(Event::ToolUse { id, name, input }));
                 }
             }
@@ -634,9 +649,7 @@ mod tests {
     fn render_block_tool_result_with_blocks() {
         let block = ContentBlock::ToolResult {
             tool_use_id: "tu_1".into(),
-            content: ToolResultContent::Blocks(vec![ContentBlock::Text {
-                text: "ok".into(),
-            }]),
+            content: ToolResultContent::Blocks(vec![ContentBlock::Text { text: "ok".into() }]),
             is_error: false,
         };
         let v = render_block(&block);
@@ -678,7 +691,8 @@ mod tests {
 
     #[test]
     fn sse_parse_text_delta() {
-        let raw = r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#;
+        let raw =
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#;
         let p: SseEvent = serde_json::from_str(raw).unwrap();
         match p {
             SseEvent::ContentBlockDelta { index, delta } => {

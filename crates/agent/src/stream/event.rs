@@ -72,15 +72,9 @@ pub struct ResultData {
 /// can write `Box<dyn EventStream>` instead of the longer
 /// `Pin<Box<dyn Stream<Item = ..>>>` form for already-`Unpin` streams
 /// (e.g., `futures::stream::iter` results, or `Box::pin(...)` wrappers).
-pub trait EventStream:
-    Stream<Item = Result<Event, AgentError>> + Unpin + Send
-{
-}
+pub trait EventStream: Stream<Item = Result<Event, AgentError>> + Unpin + Send {}
 
-impl<T> EventStream for T where
-    T: Stream<Item = Result<Event, AgentError>> + Unpin + Send
-{
-}
+impl<T> EventStream for T where T: Stream<Item = Result<Event, AgentError>> + Unpin + Send {}
 
 #[cfg(test)]
 mod tests {

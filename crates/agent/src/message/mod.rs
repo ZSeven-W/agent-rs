@@ -95,13 +95,8 @@ fn is_false(b: &bool) -> bool {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ImageSource {
-    Base64 {
-        media_type: String,
-        data: String,
-    },
-    Url {
-        url: String,
-    },
+    Base64 { media_type: String, data: String },
+    Url { url: String },
 }
 
 /// Tool-result content can be a single string OR a list of content blocks
@@ -202,9 +197,7 @@ mod tests {
     fn message_serde_roundtrip_user() {
         let msg = Message::User {
             header: Header::new(),
-            content: vec![ContentBlock::Text {
-                text: "hi".into(),
-            }],
+            content: vec![ContentBlock::Text { text: "hi".into() }],
         };
         let j = serde_json::to_string(&msg).unwrap();
         let back: Message = serde_json::from_str(&j).unwrap();

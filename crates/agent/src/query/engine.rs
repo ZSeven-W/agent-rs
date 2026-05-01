@@ -206,8 +206,12 @@ mod tests {
     #[test]
     fn happy_path_text_only() {
         let (emitted, snap) = run_blocking(vec![
-            Event::TextDelta { delta: "hi ".into() },
-            Event::TextDelta { delta: "there".into() },
+            Event::TextDelta {
+                delta: "hi ".into(),
+            },
+            Event::TextDelta {
+                delta: "there".into(),
+            },
         ]);
 
         // Engine emits the 2 forwarded TextDeltas + 1 synthesized Result.

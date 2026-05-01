@@ -130,8 +130,7 @@ impl FileStateCache {
         }
 
         // Evict LRU entries until the new entry fits.
-        while inner.current_size_bytes + entry_size > self.max_size_bytes
-            && !inner.cache.is_empty()
+        while inner.current_size_bytes + entry_size > self.max_size_bytes && !inner.cache.is_empty()
         {
             let Some((_, evicted)) = inner.cache.pop_lru() else {
                 break;

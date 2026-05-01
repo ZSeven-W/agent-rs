@@ -81,9 +81,7 @@ impl MessageStore {
         let mut current = Some(uuid);
         while let Some(u) = current {
             let msg = self.get(u).ok_or_else(|| {
-                AgentError::InvalidMessage(format!(
-                    "dangling parent uuid {u} during DAG walk"
-                ))
+                AgentError::InvalidMessage(format!("dangling parent uuid {u} during DAG walk"))
             })?;
             chain.push(msg);
             current = msg.parent_uuid();
@@ -189,7 +187,9 @@ mod tests {
                 parent_uuid: Some(dangling_uuid),
                 timestamp_ms: 0,
             },
-            content: vec![ContentBlock::Text { text: "orphan".into() }],
+            content: vec![ContentBlock::Text {
+                text: "orphan".into(),
+            }],
         };
         let m_id = m.uuid();
         s.push(m).unwrap();
@@ -209,7 +209,9 @@ mod tests {
                 parent_uuid: Some(dangling_uuid),
                 timestamp_ms: 0,
             },
-            content: vec![ContentBlock::Text { text: "orphan".into() }],
+            content: vec![ContentBlock::Text {
+                text: "orphan".into(),
+            }],
         };
         let m_id = m.uuid();
         s.push(m).unwrap();
