@@ -29,4 +29,4 @@ The `agent` crate must NOT import or reference product-specific concepts. No `op
 
 ## License
 
-Apache-2.0 — see [LICENSE](./LICENSE).
+MIT — see [LICENSE](./LICENSE).
