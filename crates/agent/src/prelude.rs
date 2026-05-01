@@ -11,6 +11,7 @@ pub use crate::message::{
 };
 pub use crate::permission::PermissionManager;
 pub use crate::provider::{Provider, ProviderCapabilities, StreamRequest, ThinkingConfig};
+pub use crate::query::QueryEngine;
 pub use crate::stream::{Event, EventStream, ResultData};
 pub use crate::tool::{Tool, ToolRegistry, ToolUseContext};
 pub use crate::VERSION;

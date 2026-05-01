@@ -16,6 +16,7 @@ pub mod message;
 pub mod permission;
 pub mod prelude;
 pub mod provider;
+pub mod query;
 pub mod stream;
 pub mod testing;
 pub mod tool;
