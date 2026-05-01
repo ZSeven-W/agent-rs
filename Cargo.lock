@@ -533,7 +533,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8c6b3bd49c37d2aa3f3f2220233b29a7cd23f79d1fe70e5337d25fb390793de"
 dependencies = [
  "rustix 0.38.44",
- "tokio",
  "windows-sys 0.52.0",
 ]
 

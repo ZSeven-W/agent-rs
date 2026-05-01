@@ -19,17 +19,18 @@
 //! - `send(envelope)` — open + flock(EX) + append + flush + unlock.
 //! - `drain()` — open + flock(EX) + read all + rewrite header-only + unlock.
 //!
-//! `flock` is held only for the duration of a single operation; long
-//! readers that want to process messages without blocking writers
-//! should drain into memory and process out-of-lock.
+//! All file I/O runs inside [`tokio::task::spawn_blocking`] because
+//! `fs4::FileExt::lock_exclusive` is a sync OS syscall that blocks the
+//! calling thread. Running it on the blocking pool keeps the tokio
+//! runtime worker threads free to make progress on other tasks even
+//! while many senders contend for the same lock.
 
 use std::path::{Path, PathBuf};
 
-use fs4::tokio::AsyncFileExt;
+use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::fs;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 use uuid::Uuid;
 
 pub const MAILBOX_SCHEMA_VERSION: &str = "v1";
@@ -121,7 +122,7 @@ impl Mailbox {
         Ok(Self { path })
     }
 
-    /// Construct a Mailbox at `<team_root>/teams/{team_name}/inboxes/<agent_id>.jsonl`.
+    /// Construct a Mailbox at `<agent_root>/teams/{team_name}/inboxes/<agent_id>.jsonl`.
     /// Convenience that pairs the team name + product root.
     pub async fn for_team_agent(
         agent_root: impl AsRef<Path>,
@@ -139,28 +140,29 @@ impl Mailbox {
     /// Append `message` to the inbox. Holds the file's exclusive lock
     /// only for the duration of the open+append+flush.
     pub async fn send(&self, message: &MailboxMessage) -> Result<(), MailboxError> {
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&self.path)
-            .await?;
-        file.lock_exclusive()?;
-
-        // If the file is brand-new (size 0), write the header first.
-        let len = file.metadata().await?.len();
-        if len == 0 {
-            let header = serde_json::to_string(&MailboxHeader::current())?;
-            file.write_all(header.as_bytes()).await?;
-            file.write_all(b"\n").await?;
-        }
-
+        let path = self.path.clone();
+        let header_line = serde_json::to_string(&MailboxHeader::current())?;
         let line = serde_json::to_string(message)?;
-        file.write_all(line.as_bytes()).await?;
-        file.write_all(b"\n").await?;
-        file.flush().await?;
-        // unlock_exclusive on drop — fs4 unlocks when File is dropped.
-        Ok(())
+        spawn_blocking(move || -> Result<(), MailboxError> {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .append(true)
+                .open(&path)?;
+            file.lock_exclusive()?;
+            let len = file.metadata()?.len();
+            if len == 0 {
+                file.write_all(header_line.as_bytes())?;
+                file.write_all(b"\n")?;
+            }
+            file.write_all(line.as_bytes())?;
+            file.write_all(b"\n")?;
+            file.flush()?;
+            // unlock on Drop via fs4's FileExt impl
+            Ok(())
+        })
+        .await
     }
 
     /// Read all queued messages, truncate the file (re-write header),
@@ -170,46 +172,47 @@ impl Mailbox {
         if !self.path.exists() {
             return Ok(Vec::new());
         }
-        let mut file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&self.path)
-            .await?;
-        file.lock_exclusive()?;
+        let path = self.path.clone();
+        let header_line = serde_json::to_string(&MailboxHeader::current())?;
+        spawn_blocking(move || -> Result<Vec<MailboxMessage>, MailboxError> {
+            use std::io::{Read, Seek, SeekFrom, Write};
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)?;
+            file.lock_exclusive()?;
 
-        // Read all bytes.
-        file.seek(std::io::SeekFrom::Start(0)).await?;
-        let mut contents = Vec::new();
-        file.read_to_end(&mut contents).await?;
+            file.seek(SeekFrom::Start(0))?;
+            let mut contents = Vec::new();
+            file.read_to_end(&mut contents)?;
+            let messages = parse_messages(&contents)?;
 
-        // Parse header + lines.
-        let messages = parse_messages(&contents)?;
-
-        // Truncate + rewrite header.
-        file.set_len(0).await?;
-        file.seek(std::io::SeekFrom::Start(0)).await?;
-        let header = serde_json::to_string(&MailboxHeader::current())?;
-        file.write_all(header.as_bytes()).await?;
-        file.write_all(b"\n").await?;
-        file.flush().await?;
-
-        Ok(messages)
+            file.set_len(0)?;
+            file.seek(SeekFrom::Start(0))?;
+            file.write_all(header_line.as_bytes())?;
+            file.write_all(b"\n")?;
+            file.flush()?;
+            Ok(messages)
+        })
+        .await
     }
 
     /// Inspect without draining. Returns Ok(Vec::new()) if file doesn't
-    /// exist. Holds a shared lock so concurrent senders block briefly
-    /// (write lock contention). For a long-running observer that
-    /// shouldn't block writers, use [`Self::peek_unlocked`] which
-    /// accepts a stale read.
+    /// exist. Holds an exclusive lock briefly.
     pub async fn peek(&self) -> Result<Vec<MailboxMessage>, MailboxError> {
         if !self.path.exists() {
             return Ok(Vec::new());
         }
-        let mut file = fs::OpenOptions::new().read(true).open(&self.path).await?;
-        file.lock_exclusive()?;
-        let mut contents = Vec::new();
-        file.read_to_end(&mut contents).await?;
-        parse_messages(&contents)
+        let path = self.path.clone();
+        spawn_blocking(move || -> Result<Vec<MailboxMessage>, MailboxError> {
+            use std::io::Read;
+            let mut file = std::fs::OpenOptions::new().read(true).open(&path)?;
+            file.lock_exclusive()?;
+            let mut contents = Vec::new();
+            file.read_to_end(&mut contents)?;
+            parse_messages(&contents)
+        })
+        .await
     }
 
     /// Lock-free peek — may see a partial write if a sender is
@@ -219,66 +222,66 @@ impl Mailbox {
             return Ok(Vec::new());
         }
         let bytes = fs::read(&self.path).await?;
-        // Tolerate trailing partial line from a concurrent writer.
-        parse_messages_lenient(&bytes)
+        Ok(parse_messages_lenient(&bytes))
     }
+}
+
+async fn spawn_blocking<F, T>(f: F) -> Result<T, MailboxError>
+where
+    F: FnOnce() -> Result<T, MailboxError> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| MailboxError::Other(format!("blocking task: {e}")))?
 }
 
 fn parse_messages(bytes: &[u8]) -> Result<Vec<MailboxMessage>, MailboxError> {
     if bytes.is_empty() {
         return Err(MailboxError::MissingHeader);
     }
-    let reader = BufReader::new(bytes);
-    let mut lines = Vec::new();
-    let mut buf = String::new();
-    let mut br = reader;
-    let rt = tokio::runtime::Handle::try_current();
-    let _ = rt; // suppress warning when not needed
-    // Use a sync read since we already have the bytes in memory.
-    for line in std::str::from_utf8(bytes)
-        .map_err(|e| MailboxError::Other(format!("non-utf8 mailbox: {e}")))?
-        .split('\n')
-    {
-        if !line.is_empty() {
-            lines.push(line.to_string());
-        }
-    }
-    let _ = buf;
-    let _ = br;
-    parse_lines(&lines)
-}
-
-fn parse_messages_lenient(bytes: &[u8]) -> Result<Vec<MailboxMessage>, MailboxError> {
-    if bytes.is_empty() {
-        return Ok(Vec::new());
-    }
     let s = std::str::from_utf8(bytes)
         .map_err(|e| MailboxError::Other(format!("non-utf8 mailbox: {e}")))?;
-    let lines: Vec<String> = s.split('\n').filter(|l| !l.is_empty()).map(|l| l.to_string()).collect();
-    if lines.is_empty() {
-        return Ok(Vec::new());
-    }
-    parse_lines(&lines).or_else(|_| Ok(Vec::new()))
-}
-
-fn parse_lines(lines: &[String]) -> Result<Vec<MailboxMessage>, MailboxError> {
+    let lines: Vec<&str> = s.split('\n').filter(|l| !l.is_empty()).collect();
     if lines.is_empty() {
         return Err(MailboxError::MissingHeader);
     }
-    let header: MailboxHeader = serde_json::from_str(&lines[0])?;
+    let header: MailboxHeader = serde_json::from_str(lines[0])?;
     if header.schema_version != MAILBOX_SCHEMA_VERSION {
         return Err(MailboxError::UnsupportedVersion(header.schema_version));
     }
     let mut messages = Vec::with_capacity(lines.len().saturating_sub(1));
     for line in lines.iter().skip(1) {
-        if line.trim().is_empty() {
-            continue;
-        }
-        // Tolerate malformed trailing line (lenient mode handles it).
         let m: MailboxMessage = serde_json::from_str(line)?;
         messages.push(m);
     }
     Ok(messages)
+}
+
+/// Lenient parser: tolerates trailing partial line from a concurrent
+/// writer. Returns an empty Vec rather than erroring on a malformed
+/// last line.
+fn parse_messages_lenient(bytes: &[u8]) -> Vec<MailboxMessage> {
+    let Ok(s) = std::str::from_utf8(bytes) else {
+        return Vec::new();
+    };
+    let lines: Vec<&str> = s.split('\n').filter(|l| !l.is_empty()).collect();
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    let Ok(header) = serde_json::from_str::<MailboxHeader>(lines[0]) else {
+        return Vec::new();
+    };
+    if header.schema_version != MAILBOX_SCHEMA_VERSION {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for line in lines.iter().skip(1) {
+        if let Ok(m) = serde_json::from_str::<MailboxMessage>(line) {
+            out.push(m);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -288,7 +291,7 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn for_agent_creates_inbox_dir() {
         let dir = tempdir().unwrap();
         let mb = Mailbox::for_agent(dir.path(), "alice").await.unwrap();
@@ -297,7 +300,7 @@ mod tests {
         assert_eq!(parent.file_name().unwrap(), "inboxes");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn send_then_drain_roundtrip() {
         let dir = tempdir().unwrap();
         let mb = Mailbox::for_agent(dir.path(), "alice").await.unwrap();
@@ -310,12 +313,11 @@ mod tests {
         assert_eq!(drained.len(), 2);
         assert_eq!(drained[0].id, m1.id);
         assert_eq!(drained[1].id, m2.id);
-        // Subsequent drain on same path returns empty (cleared on drain).
         let again = mb.drain().await.unwrap();
         assert!(again.is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn peek_does_not_consume() {
         let dir = tempdir().unwrap();
         let mb = Mailbox::for_agent(dir.path(), "alice").await.unwrap();
@@ -327,22 +329,18 @@ mod tests {
         assert_eq!(peeked2.len(), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn drain_on_missing_returns_empty() {
         let dir = tempdir().unwrap();
         let mb = Mailbox::for_agent(dir.path(), "alice").await.unwrap();
-        // Never sent — file doesn't exist.
         let drained = mb.drain().await.unwrap();
         assert!(drained.is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn unsupported_version_errors() {
         let dir = tempdir().unwrap();
         let mb = Mailbox::for_agent(dir.path(), "alice").await.unwrap();
-        // Manually write a v999 file.
-        let inbox_dir = mb.path().parent().unwrap();
-        fs::create_dir_all(inbox_dir).await.unwrap();
         let bogus_header = serde_json::json!({
             "schema_version": "v999",
             "agent_version": "0.0.1",
@@ -355,7 +353,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_senders_no_data_loss() {
         let dir = tempdir().unwrap();
         let mb = Arc::new(Mailbox::for_agent(dir.path(), "shared").await.unwrap());
@@ -379,7 +377,6 @@ mod tests {
         let drained = mb.drain().await.unwrap();
         assert_eq!(drained.len(), n, "expected {n} messages, got {}", drained.len());
 
-        // Each worker's index appears exactly once.
         let mut seen = std::collections::HashSet::new();
         for m in &drained {
             let i = m.payload["i"].as_u64().unwrap();
@@ -387,7 +384,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn for_team_agent_path_includes_team_and_inboxes() {
         let dir = tempdir().unwrap();
         let mb = Mailbox::for_team_agent(dir.path(), "design-squad", "bob")
