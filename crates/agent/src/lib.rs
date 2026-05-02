@@ -15,6 +15,7 @@ pub mod error;
 pub mod file_cache;
 pub mod hook;
 pub mod json;
+pub mod memdir;
 pub mod message;
 pub mod permission;
 pub mod prelude;
