@@ -56,6 +56,57 @@ impl ToolUseContext {
     }
 }
 
+/// Optional safety classification for a tool. Defaults to
+/// [`Self::Unknown`] — hosts SHOULD override [`Tool::safety_class`]
+/// for tools they ship so policies (e.g., "auto-allow read-only,
+/// always-ask destructive") can act on the metadata.
+///
+/// **Lattice semantics**: each class has a numeric "danger level"
+/// (see [`Self::level`]). [`Self::Unknown`] sits at the top of the
+/// lattice — equal to `Destructive` — so callers using
+/// [`Self::is_at_least`] for conservative gating will treat
+/// unclassified tools as the most-dangerous case by default. Hosts
+/// that want a less conservative default can match on the variant
+/// directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SafetyClass {
+    /// No side effects (search, file read, lookups).
+    ReadOnly,
+    /// Mutates state outside the agent (file write, shell command,
+    /// network call) but is reversible or low-impact.
+    Mutating,
+    /// Irreversible / destructive (rm -rf, drop table, force push,
+    /// delete branch). Hosts typically gate these behind explicit
+    /// confirmation.
+    Destructive,
+    /// Host hasn't classified. Treated as `Destructive`-equivalent
+    /// for [`Self::is_at_least`] checks so unclassified tools fail
+    /// safe (i.e., gates intended to fire on dangerous tools also
+    /// fire on unknown ones).
+    Unknown,
+}
+
+impl SafetyClass {
+    /// Numeric danger level. `ReadOnly = 0` … `Destructive = 2`,
+    /// `Unknown = 2` (equivalent to Destructive for gating).
+    pub fn level(self) -> u8 {
+        match self {
+            Self::ReadOnly => 0,
+            Self::Mutating => 1,
+            Self::Destructive | Self::Unknown => 2,
+        }
+    }
+
+    /// `true` iff `self`'s danger level is at least `other`'s. Useful
+    /// for policy gates like "ask for anything Mutating-or-worse" —
+    /// unclassified tools (`Unknown`) satisfy any non-`ReadOnly` gate
+    /// and thus fail safe.
+    pub fn is_at_least(self, other: Self) -> bool {
+        self.level() >= other.level()
+    }
+}
+
 /// A tool the LLM can invoke during a turn.
 ///
 /// Implementations are typically struct values stored as `Arc<dyn Tool>`
@@ -91,6 +142,21 @@ pub trait Tool: Send + Sync + std::fmt::Debug {
         ctx: &ToolUseContext,
         input: serde_json::Value,
     ) -> Result<serde_json::Value, AgentError>;
+
+    /// Classification used by permission policies and UI gating.
+    /// Defaults to [`SafetyClass::Unknown`]; hosts SHOULD override.
+    fn safety_class(&self) -> SafetyClass {
+        SafetyClass::Unknown
+    }
+
+    /// `true` iff this tool can change state outside the agent. Default
+    /// impl returns `true` for everything except `ReadOnly` so
+    /// unclassified tools (`Unknown`) fail safe. Override on the impl
+    /// for `Mutating`-classed tools that are idempotent or otherwise
+    /// safe to invoke without confirmation.
+    fn is_mutating(&self) -> bool {
+        !matches!(self.safety_class(), SafetyClass::ReadOnly)
+    }
 }
 
 #[cfg(test)]
@@ -130,6 +196,84 @@ mod tests {
             .unwrap();
         assert_eq!(out, serde_json::json!({"hello": "world"}));
         assert_eq!(t.name(), "echo");
+    }
+
+    #[derive(Debug)]
+    struct ReadOnlyTool;
+    #[async_trait]
+    impl Tool for ReadOnlyTool {
+        fn name(&self) -> &str {
+            "read"
+        }
+        fn description(&self) -> &str {
+            "."
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn call(
+            &self,
+            _ctx: &ToolUseContext,
+            _input: serde_json::Value,
+        ) -> Result<serde_json::Value, AgentError> {
+            Ok(serde_json::Value::Null)
+        }
+        fn safety_class(&self) -> SafetyClass {
+            SafetyClass::ReadOnly
+        }
+    }
+
+    #[derive(Debug)]
+    struct DestructiveTool;
+    #[async_trait]
+    impl Tool for DestructiveTool {
+        fn name(&self) -> &str {
+            "drop"
+        }
+        fn description(&self) -> &str {
+            "."
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn call(
+            &self,
+            _ctx: &ToolUseContext,
+            _input: serde_json::Value,
+        ) -> Result<serde_json::Value, AgentError> {
+            Ok(serde_json::Value::Null)
+        }
+        fn safety_class(&self) -> SafetyClass {
+            SafetyClass::Destructive
+        }
+    }
+
+    #[test]
+    fn safety_class_default_is_unknown() {
+        assert_eq!(EchoTool.safety_class(), SafetyClass::Unknown);
+        // Unknown defaults to mutating=true (conservative). Hosts that
+        // want a less-conservative default override safety_class on
+        // their tool impl.
+        assert!(EchoTool.is_mutating());
+    }
+
+    #[test]
+    fn safety_class_lattice_levels() {
+        assert!(SafetyClass::Destructive.is_at_least(SafetyClass::Mutating));
+        assert!(SafetyClass::Mutating.is_at_least(SafetyClass::ReadOnly));
+        assert!(!SafetyClass::ReadOnly.is_at_least(SafetyClass::Mutating));
+        // Unknown is treated as max-danger for gating: any check at
+        // Mutating-or-worse fires for Unknown tools.
+        assert!(SafetyClass::Unknown.is_at_least(SafetyClass::Mutating));
+        assert!(SafetyClass::Unknown.is_at_least(SafetyClass::Destructive));
+        // ReadOnly never reaches Unknown's level.
+        assert!(!SafetyClass::ReadOnly.is_at_least(SafetyClass::Unknown));
+    }
+
+    #[test]
+    fn is_mutating_derived_from_safety_class() {
+        assert!(!ReadOnlyTool.is_mutating());
+        assert!(DestructiveTool.is_mutating());
     }
 
     #[tokio::test]

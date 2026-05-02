@@ -124,18 +124,18 @@ impl PermissionManager {
         input: &serde_json::Value,
         callback: Option<&dyn AsyncToolPermissionCheck>,
     ) -> PermissionDecision {
-        // Step 1a — deny rule.
+        // Step 1a — deny rule (matcher-aware).
         if let Some(rule) =
-            super::chain::find_rule_for_tool(&self.context.always_deny_rules, tool_name)
+            super::chain::find_matching_rule(&self.context.always_deny_rules, tool_name, input)
         {
             return PermissionDecision::Deny(DenyDecision {
                 message_text: "Tool use denied by rule.".into(),
                 reason: DecisionReason::rule(rule.clone()),
             });
         }
-        // Step 1b — ask rule.
+        // Step 1b — ask rule (matcher-aware).
         if let Some(rule) =
-            super::chain::find_rule_for_tool(&self.context.always_ask_rules, tool_name)
+            super::chain::find_matching_rule(&self.context.always_ask_rules, tool_name, input)
         {
             return PermissionDecision::Ask(AskDecision {
                 message_text: "Tool use requires confirmation.".into(),
@@ -159,9 +159,9 @@ impl PermissionManager {
                 reason: DecisionReason::mode(PermissionMode::Bypass),
             });
         }
-        // Step 2b — whole-tool allow rule.
+        // Step 2b — whole-tool or matcher-bearing allow rule.
         if let Some(rule) =
-            super::chain::find_rule_for_tool(&self.context.always_allow_rules, tool_name)
+            super::chain::find_matching_rule(&self.context.always_allow_rules, tool_name, input)
         {
             return PermissionDecision::Allow(AllowDecision {
                 updated_input: None,
@@ -179,5 +179,47 @@ impl PermissionManager {
             message_text: "Permission required.".into(),
             reason: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod async_matcher_tests {
+    use super::super::types::{PermissionBehavior, PermissionRule, RuleSource, StringPattern};
+    use super::*;
+
+    #[tokio::test]
+    async fn evaluate_async_honors_field_matcher_on_deny() {
+        let mgr = PermissionManager::new().add_rule(PermissionRule::with_input_match(
+            RuleSource::Project,
+            PermissionBehavior::Deny,
+            "Bash",
+            "/command",
+            StringPattern::glob("rm -rf *"),
+        ));
+        let danger = serde_json::json!({"command": "rm -rf /tmp"});
+        let safe = serde_json::json!({"command": "ls -la"});
+        assert!(mgr.evaluate_async("Bash", &danger, None).await.is_deny());
+        // Non-matching input falls through to default-ask.
+        assert!(mgr.evaluate_async("Bash", &safe, None).await.is_ask());
+    }
+
+    #[tokio::test]
+    async fn evaluate_async_honors_field_matcher_on_allow() {
+        let mgr = PermissionManager::new().add_rule(PermissionRule::with_matcher(
+            RuleSource::Project,
+            PermissionBehavior::Allow,
+            "FileEdit",
+            super::super::types::PermissionMatcher::field_prefix("/file_path", "/tmp/"),
+        ));
+        let inside = serde_json::json!({"file_path": "/tmp/a.txt"});
+        let outside = serde_json::json!({"file_path": "/etc/passwd"});
+        assert!(mgr
+            .evaluate_async("FileEdit", &inside, None)
+            .await
+            .is_allow());
+        assert!(mgr
+            .evaluate_async("FileEdit", &outside, None)
+            .await
+            .is_ask());
     }
 }

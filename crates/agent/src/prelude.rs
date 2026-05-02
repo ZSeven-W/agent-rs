@@ -15,7 +15,7 @@ pub use crate::message::{
 };
 pub use crate::permission::{
     AsyncToolPermissionCheck, ExternalQueue, ExternalQueueError, ExternalQueueReceiver,
-    ExternalRequest, PermissionManager,
+    ExternalRequest, PermissionManager, PermissionMatcher, StringPattern,
 };
 #[cfg(feature = "anthropic")]
 pub use crate::provider::AnthropicProvider;
@@ -27,5 +27,5 @@ pub use crate::provider::{Provider, ProviderCapabilities, StreamRequest, Thinkin
 pub use crate::query::{Phase, QueryEngine, QueryLoop, QueryLoopBuilder, Transition};
 pub use crate::session::{Session, SessionError, SessionHeader, SCHEMA_VERSION};
 pub use crate::stream::{Event, EventStream, RequestedToolUse, ResultData, ToolExecutor};
-pub use crate::tool::{Tool, ToolRegistry, ToolUseContext};
+pub use crate::tool::{SafetyClass, Tool, ToolRegistry, ToolUseContext};
 pub use crate::VERSION;

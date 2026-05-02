@@ -202,6 +202,7 @@ fn input_pattern_rules_are_ignored_in_phase_3_batch_g() {
         behavior: PermissionBehavior::Deny,
         tool_name: "Bash".into(),
         rule_content: Some("rm *".into()),
+        ..PermissionRule::whole_tool(RuleSource::User, PermissionBehavior::Deny, "Bash")
     };
     let ctx = make_ctx(PermissionMode::Default, vec![], vec![pattern_rule], vec![]);
     let decision = evaluate_permission("Bash", &serde_json::json!({"cmd": "rm /"}), &ctx, None);
