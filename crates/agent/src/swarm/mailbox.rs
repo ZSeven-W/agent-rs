@@ -406,8 +406,14 @@ mod tests {
             .iter()
             .position(|c| c == "teams")
             .expect("path missing `teams` component");
-        assert_eq!(comps.get(teams_idx + 1).map(String::as_str), Some("design-squad"));
-        assert_eq!(comps.get(teams_idx + 2).map(String::as_str), Some("inboxes"));
+        assert_eq!(
+            comps.get(teams_idx + 1).map(String::as_str),
+            Some("design-squad")
+        );
+        assert_eq!(
+            comps.get(teams_idx + 2).map(String::as_str),
+            Some("inboxes")
+        );
         assert!(path
             .file_name()
             .unwrap()
