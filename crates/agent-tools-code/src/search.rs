@@ -28,6 +28,21 @@ use serde_json::json;
 
 use crate::policy::WorkspacePolicy;
 
+/// Synchronous bounded file read for the `Grep` blocking walker.
+/// Reads at most `cap + 1` bytes from `path`. Caller compares the
+/// resulting buffer length against `cap` to detect overflow:
+/// `out.len() > cap` means the file grew past the cap between the
+/// stat and the read (TOCTOU race) and should be skipped.
+fn read_file_capped(path: &std::path::Path, cap: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let f = std::fs::File::open(path)?;
+    let limit = cap.saturating_add(1);
+    let cap_usize = usize::try_from(cap).unwrap_or(usize::MAX);
+    let mut buf = Vec::with_capacity(cap_usize.min(64 * 1024));
+    f.take(limit).read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
 const MAX_RESULTS: usize = 1000;
 
 /// Hard cap on the compiled regex size in bytes. Bounds the worst
@@ -206,9 +221,13 @@ impl Tool for GrepTool {
                 if policy.check_size(meta.len()).is_err() {
                     continue;
                 }
-                let bytes = match std::fs::read(path) {
-                    Ok(b) => b,
-                    Err(_) => continue,
+                // Bounded read so a TOCTOU grow between the stat
+                // above and this read can't pull a multi-GB file
+                // into RAM. Files that grew past the cap are
+                // skipped — they would have been skipped anyway.
+                let bytes = match read_file_capped(path, policy.max_file_size_bytes) {
+                    Ok(b) if (b.len() as u64) <= policy.max_file_size_bytes => b,
+                    _ => continue,
                 };
                 let text = match String::from_utf8(bytes) {
                     Ok(t) => t,

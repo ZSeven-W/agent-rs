@@ -128,9 +128,14 @@ impl Tool for FileReadTool {
         self.policy
             .check_size(meta.len())
             .map_err(policy_to_agent_err)?;
-        let bytes = tokio::fs::read(&resolved)
+        // Bounded read defends against TOCTOU growth between the
+        // stat above and the read here.
+        let bytes = read_with_cap(&resolved, self.policy.max_file_size_bytes)
             .await
             .map_err(|e| io_to_agent_err("read", &parsed.path, e))?;
+        self.policy
+            .check_size(bytes.len() as u64)
+            .map_err(policy_to_agent_err)?;
         let text = String::from_utf8(bytes).map_err(|e| {
             AgentError::other(format!("FileRead '{}' is not UTF-8: {e}", parsed.path))
         })?;
