@@ -17,17 +17,24 @@
 //!
 //! By default the tool refuses URLs that resolve to **loopback,
 //! private RFC 1918, link-local (incl. cloud metadata at
-//! 169.254.169.254), or unique-local IPv6** addresses. The check
-//! resolves the hostname up-front and inspects every returned
-//! `SocketAddr`. There's a TOCTOU window — an attacker could re-
-//! resolve to a private IP between the check and the fetch — but
-//! the upfront screen catches the common cases (model paste,
-//! prompt injection of `http://localhost:8080/admin`, etc.).
+//! 169.254.169.254), unique-local IPv6, or IPv4-mapped versions of
+//! any of the above (`::ffff:127.0.0.1` etc.)**. For each hop we:
+//!
+//! 1. Resolve the host (`tokio::net::lookup_host`) and reject if any
+//!    returned IP falls in a blocked range.
+//! 2. **Pin** the resolved IP into the request via reqwest's
+//!    `Client::builder().resolve()` so the connect-time DNS lookup
+//!    can't swap to a private address (DNS rebinding mitigation).
+//! 3. Disable reqwest auto-redirects (`Policy::none()`) and walk the
+//!    redirect chain manually, re-applying steps 1–2 on each
+//!    `Location:` header, capped at `MAX_REDIRECTS` hops.
 //!
 //! Hosts that legitimately need to hit private networks (intranet
-//! docs, dev servers) pass `allow_private_networks: true`.
+//! docs, dev servers) pass `allow_private_networks: true`, which
+//! bypasses both the IP screen and the per-hop pinning (the host's
+//! injected `with_client` is then used).
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use agent::error::AgentError;
@@ -50,7 +57,10 @@ const MAX_REDIRECTS: usize = 5;
 
 #[derive(Debug)]
 pub struct WebFetchTool {
-    client: reqwest::Client,
+    /// Used only when `allow_private_networks: true`. The default
+    /// secure path builds a fresh client per hop with the resolved
+    /// IP pinned via `Client::builder().resolve()`.
+    fallback_client: reqwest::Client,
 }
 
 impl Default for WebFetchTool {
@@ -66,14 +76,22 @@ impl WebFetchTool {
             .user_agent(format!("agent-tools-code/{}", env!("CARGO_PKG_VERSION")))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        Self { client }
+        Self {
+            fallback_client: client,
+        }
     }
 
     /// Inject a custom `reqwest::Client` — useful for hosts that
     /// want to add a proxy, a corporate root CA, or a custom
-    /// timeout.
+    /// timeout. **Used only on the `allow_private_networks: true`
+    /// path**; the SSRF-guarded path builds its own per-hop client
+    /// so it can pin resolved IPs and disable auto-redirects. Hosts
+    /// that need both a custom transport AND SSRF guarding should
+    /// implement their own `WebFetch` `Tool`.
     pub fn with_client(client: reqwest::Client) -> Self {
-        Self { client }
+        Self {
+            fallback_client: client,
+        }
     }
 }
 
@@ -156,33 +174,34 @@ impl Tool for WebFetchTool {
             .clamp(1024, HARD_MAX_BYTES);
         let abort = ctx.abort.clone();
 
-        // SSRF guard: resolve the host up-front and refuse loopback
-        // / private / link-local targets unless the caller opted in.
-        if !parsed.allow_private_networks {
-            check_url_target(&url).await?;
-        }
-
-        let request = self
-            .client
-            .get(&url)
-            .timeout(Duration::from_secs(timeout_secs));
-
-        let response = tokio::select! {
-            biased;
-            _ = abort.cancelled() => {
-                return Err(AgentError::Aborted(
-                    abort.reason().unwrap_or_else(|| "aborted".into()),
-                ));
-            }
-            r = timeout(Duration::from_secs(timeout_secs + 5), request.send()) => {
-                match r {
-                    Ok(Ok(resp)) => resp,
-                    Ok(Err(e)) => return Err(AgentError::other(format!("WebFetch '{url}' failed: {e}"))),
-                    Err(_) => return Err(AgentError::other(format!(
-                        "WebFetch '{url}' timed out after {timeout_secs}s"
-                    ))),
+        // Walk redirects ourselves so we can re-validate every hop's
+        // host against the SSRF guard and pin its resolved IP. When
+        // the caller has opted out of the guard we fall back to the
+        // shared client which honors auto-redirects normally.
+        let response = if parsed.allow_private_networks {
+            let request = self
+                .fallback_client
+                .get(&url)
+                .timeout(Duration::from_secs(timeout_secs));
+            tokio::select! {
+                biased;
+                _ = abort.cancelled() => {
+                    return Err(AgentError::Aborted(
+                        abort.reason().unwrap_or_else(|| "aborted".into()),
+                    ));
+                }
+                r = timeout(Duration::from_secs(timeout_secs + 5), request.send()) => {
+                    match r {
+                        Ok(Ok(resp)) => resp,
+                        Ok(Err(e)) => return Err(AgentError::other(format!("WebFetch '{url}' failed: {e}"))),
+                        Err(_) => return Err(AgentError::other(format!(
+                            "WebFetch '{url}' timed out after {timeout_secs}s"
+                        ))),
+                    }
                 }
             }
+        } else {
+            fetch_with_pinned_redirects(&url, timeout_secs, &abort).await?
         };
 
         let status = response.status().as_u16();
@@ -247,53 +266,12 @@ impl Tool for WebFetchTool {
     }
 }
 
-/// SSRF guard. Parses the URL host, resolves it to one or more
-/// `SocketAddr`s, and rejects the fetch if **any** resolved IP
-/// falls into a private / loopback / link-local / metadata range.
-/// Hostname literals that fail to resolve also fail the fetch —
-/// don't try to fetch a host that can't be reached.
-///
-/// Caveat: there's a TOCTOU window between this check and reqwest's
-/// own DNS lookup at connect time. An attacker controlling DNS for
-/// the domain could swap to a private IP between the two calls.
-/// Defending against that requires a custom resolver wired into
-/// reqwest; that's a host concern.
-async fn check_url_target(url: &str) -> Result<(), AgentError> {
-    let parsed = match url::Url::parse(url) {
-        Ok(u) => u,
-        // url crate not always available — fall back to manual host
-        // extraction. We accept the looser parsing because the
-        // earlier scheme check already constrained `url`.
-        Err(_) => return manual_host_check(url).await,
-    };
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| AgentError::other(format!("WebFetch '{url}' has no host")))?;
-    let port = parsed.port_or_known_default().unwrap_or(443);
-    resolve_and_check(host, port, url).await
-}
-
-/// Fallback path when the URL can't be parsed by the `url` crate.
-/// Strips `http(s)://` and the optional path/query and resolves
-/// whatever's left as a hostname[:port].
-async fn manual_host_check(url: &str) -> Result<(), AgentError> {
-    let after_scheme = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))
-        .ok_or_else(|| AgentError::other(format!("WebFetch '{url}' has no scheme")))?;
-    let host_port = after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or(after_scheme);
-    let (host, port) = match host_port.rsplit_once(':') {
-        Some((h, p)) => (h.to_string(), p.parse().unwrap_or(443)),
-        None => (host_port.to_string(), 443),
-    };
-    resolve_and_check(&host, port, url).await
-}
-
-async fn resolve_and_check(host: &str, port: u16, url: &str) -> Result<(), AgentError> {
-    let addrs: Vec<_> = tokio::net::lookup_host(format!("{host}:{port}"))
+/// Resolve a URL's host and reject if any returned IP is blocked.
+/// Returns `(host, port, addrs)` so the caller can pin those exact
+/// addresses into reqwest and skip the connect-time DNS lookup.
+async fn resolve_and_validate(url: &str) -> Result<(String, u16, Vec<SocketAddr>), AgentError> {
+    let (host, port) = host_port_of(url)?;
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(format!("{host}:{port}"))
         .await
         .map_err(|e| AgentError::other(format!("WebFetch DNS lookup for '{host}' failed: {e}")))?
         .collect();
@@ -310,13 +288,126 @@ async fn resolve_and_check(host: &str, port: u16, url: &str) -> Result<(), Agent
             )));
         }
     }
-    Ok(())
+    Ok((host, port, addrs))
+}
+
+fn host_port_of(url: &str) -> Result<(String, u16), AgentError> {
+    if let Ok(parsed) = url::Url::parse(url) {
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| AgentError::other(format!("WebFetch '{url}' has no host")))?
+            .to_string();
+        let port = parsed.port_or_known_default().unwrap_or(443);
+        return Ok((host, port));
+    }
+    // Fallback parser — `url` crate refuses some weird-but-valid-ish
+    // shapes; the earlier scheme check ensures this is http(s).
+    let after_scheme = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .ok_or_else(|| AgentError::other(format!("WebFetch '{url}' has no scheme")))?;
+    let host_port = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    let (host, port) = match host_port.rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse().unwrap_or(443)),
+        None => (host_port.to_string(), 443),
+    };
+    Ok((host, port))
+}
+
+/// Fetch a URL with the SSRF guard applied at every redirect hop.
+/// Disables reqwest auto-redirects, then for each hop:
+/// 1. Resolves + validates the host's IP(s).
+/// 2. Builds a fresh `reqwest::Client` with `resolve()` pinning the
+///    pre-validated addresses, defeating connect-time DNS rebinding.
+/// 3. Sends the GET; on 30x, parses `Location:` and loops.
+async fn fetch_with_pinned_redirects(
+    initial_url: &str,
+    timeout_secs: u64,
+    abort: &agent::abort::AbortController,
+) -> Result<reqwest::Response, AgentError> {
+    let mut current = initial_url.to_string();
+    let mut hops = 0usize;
+    loop {
+        let (host, _port, addrs) = resolve_and_validate(&current).await?;
+        let mut builder = reqwest::Client::builder()
+            .redirect(Policy::none())
+            .user_agent(format!("agent-tools-code/{}", env!("CARGO_PKG_VERSION")));
+        for addr in &addrs {
+            // `Client::builder().resolve()` ignores the port in the
+            // SocketAddr; the URL's port is what reqwest will use.
+            builder = builder.resolve(&host, *addr);
+        }
+        let client = builder
+            .build()
+            .map_err(|e| AgentError::other(format!("WebFetch client build failed: {e}")))?;
+        let request = client
+            .get(&current)
+            .timeout(Duration::from_secs(timeout_secs));
+
+        let resp = tokio::select! {
+            biased;
+            _ = abort.cancelled() => {
+                return Err(AgentError::Aborted(
+                    abort.reason().unwrap_or_else(|| "aborted".into()),
+                ));
+            }
+            r = timeout(Duration::from_secs(timeout_secs + 5), request.send()) => {
+                match r {
+                    Ok(Ok(resp)) => resp,
+                    Ok(Err(e)) => return Err(AgentError::other(format!("WebFetch '{current}' failed: {e}"))),
+                    Err(_) => return Err(AgentError::other(format!(
+                        "WebFetch '{current}' timed out after {timeout_secs}s"
+                    ))),
+                }
+            }
+        };
+
+        let status = resp.status();
+        if status.is_redirection() {
+            if hops >= MAX_REDIRECTS {
+                return Err(AgentError::other(format!(
+                    "WebFetch '{initial_url}' exceeded {MAX_REDIRECTS} redirect hops"
+                )));
+            }
+            let location = match resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+            {
+                Some(loc) => loc,
+                None => return Ok(resp), // 30x without Location: surface as-is.
+            };
+            let base = url::Url::parse(&current).map_err(|e| {
+                AgentError::other(format!("WebFetch redirect base parse failed: {e}"))
+            })?;
+            let next = base.join(&location).map_err(|e| {
+                AgentError::other(format!(
+                    "WebFetch redirect '{location}' from '{current}' parse failed: {e}"
+                ))
+            })?;
+            let scheme = next.scheme();
+            if scheme != "http" && scheme != "https" {
+                return Err(AgentError::other(format!(
+                    "WebFetch redirect '{next}' from '{current}' uses non-http scheme"
+                )));
+            }
+            current = next.to_string();
+            hops += 1;
+            continue;
+        }
+        return Ok(resp);
+    }
 }
 
 /// `true` for IPs that should be blocked by default — loopback,
 /// RFC 1918 private, IPv4 link-local (incl. cloud metadata
-/// 169.254.169.254), unspecified, and IPv6 unique-local /
-/// link-local.
+/// 169.254.169.254), unspecified, IPv6 unique-local / link-local,
+/// and **IPv4-mapped IPv6** versions of any blocked IPv4 (e.g.
+/// `::ffff:127.0.0.1` resolves to IPv4 127.0.0.1 and is blocked).
 pub(crate) fn is_blocked_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -328,6 +419,10 @@ pub(crate) fn is_blocked_ip(ip: IpAddr) -> bool {
                 || v4.is_multicast()
         }
         IpAddr::V6(v6) => {
+            // ::ffff:a.b.c.d → recurse so the IPv4 ranges apply.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_blocked_ip(IpAddr::V4(v4));
+            }
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
@@ -602,6 +697,23 @@ mod tests {
         // IPv6 allowed
         let public_v6: Ipv6Addr = "2606:4700:4700::1111".parse().unwrap();
         assert!(!is_blocked_ip(public_v6.into()));
+    }
+
+    #[test]
+    fn is_blocked_ip_blocks_ipv4_mapped_loopback_and_private() {
+        use std::net::Ipv6Addr;
+        // ::ffff:127.0.0.1 — loopback via IPv4-mapped IPv6.
+        let mapped_loop: Ipv6Addr = "::ffff:127.0.0.1".parse().unwrap();
+        assert!(is_blocked_ip(mapped_loop.into()));
+        // ::ffff:10.0.0.1 — RFC1918 via IPv4-mapped IPv6.
+        let mapped_priv: Ipv6Addr = "::ffff:10.0.0.1".parse().unwrap();
+        assert!(is_blocked_ip(mapped_priv.into()));
+        // ::ffff:169.254.169.254 — cloud metadata via IPv4-mapped.
+        let mapped_meta: Ipv6Addr = "::ffff:169.254.169.254".parse().unwrap();
+        assert!(is_blocked_ip(mapped_meta.into()));
+        // ::ffff:8.8.8.8 — public IPv4 via mapping must NOT be blocked.
+        let mapped_pub: Ipv6Addr = "::ffff:8.8.8.8".parse().unwrap();
+        assert!(!is_blocked_ip(mapped_pub.into()));
     }
 
     #[tokio::test]

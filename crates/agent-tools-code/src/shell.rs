@@ -231,12 +231,26 @@ impl Tool for BashTool {
 /// when the stream is longer than the cap. Memory stays bounded at
 /// `cap` regardless of how much the process emits — gigabytes of
 /// `yes` won't OOM the agent.
+///
+/// `cap == 0` is treated as "discard everything but track that the
+/// stream was non-empty", so the buffer can never grow.
 async fn read_capped<R>(reader: &mut R, cap: usize) -> std::io::Result<(Vec<u8>, bool)>
 where
     R: AsyncRead + Unpin,
 {
-    let mut tail: VecDeque<u8> = VecDeque::with_capacity(cap.min(64 * 1024));
     let mut tmp = [0u8; 16 * 1024];
+    if cap == 0 {
+        let mut total: u64 = 0;
+        loop {
+            let n = reader.read(&mut tmp).await?;
+            if n == 0 {
+                break;
+            }
+            total = total.saturating_add(n as u64);
+        }
+        return Ok((Vec::new(), total > 0));
+    }
+    let mut tail: VecDeque<u8> = VecDeque::with_capacity(cap.min(64 * 1024));
     let mut total: u64 = 0;
     loop {
         let n = reader.read(&mut tmp).await?;
@@ -255,7 +269,27 @@ where
     Ok((tail.into_iter().collect(), truncated))
 }
 
+/// When tail-truncation cuts mid-codepoint, `String::from_utf8_lossy`
+/// inserts a U+FFFD at the prefix. Trim the leading bytes to the
+/// next valid UTF-8 boundary so output starts on a real character.
+fn trim_to_utf8_boundary(bytes: Vec<u8>) -> Vec<u8> {
+    // Walk forward looking for a byte that isn't a UTF-8 continuation
+    // (top two bits != 10). Up to 3 leading bytes can be invalid
+    // continuations after a tail cut.
+    for (i, &b) in bytes.iter().take(4).enumerate() {
+        if b & 0b1100_0000 != 0b1000_0000 {
+            return if i == 0 { bytes } else { bytes[i..].to_vec() };
+        }
+    }
+    bytes
+}
+
 fn format_capture(bytes: Vec<u8>, truncated: bool) -> String {
+    let bytes = if truncated {
+        trim_to_utf8_boundary(bytes)
+    } else {
+        bytes
+    };
     let body = String::from_utf8_lossy(&bytes);
     if truncated {
         format!("[output truncated; tail preserved]\n{body}")
@@ -268,19 +302,25 @@ fn format_capture(bytes: Vec<u8>, truncated: bool) -> String {
 /// `/bin/kill -9 -<pid>`. We shell out instead of pulling `nix` /
 /// `libc` because (a) it works without an `unsafe` block, and (b)
 /// `kill(1)` is on every POSIX target. Best-effort: failures are
-/// logged and swallowed so the caller's error path isn't shadowed.
+/// logged at `debug` and swallowed so the caller's error path isn't
+/// shadowed.
 #[cfg(unix)]
 fn kill_process_group(pid: Option<u32>) {
     let Some(pid) = pid else { return };
     // Negative PID = process group with that leader.
     let arg = format!("-{pid}");
-    let _ = std::process::Command::new("/bin/kill")
+    match std::process::Command::new("/bin/kill")
         .arg("-9")
-        .arg(arg)
+        .arg(&arg)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status();
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        Ok(s) => tracing::debug!(pgid = pid, status = ?s, "/bin/kill -9 returned non-zero"),
+        Err(e) => tracing::debug!(pgid = pid, error = %e, "/bin/kill -9 spawn failed"),
+    }
 }
 
 #[cfg(unix)]
@@ -375,6 +415,8 @@ mod tests {
         );
     }
 
+    // Same Windows/MSYS pwd issue as above — gate cfg(unix).
+    #[cfg(unix)]
     #[tokio::test]
     async fn bash_explicit_cwd_validated_through_policy() {
         let dir = TempDir::new().unwrap();
@@ -413,6 +455,10 @@ mod tests {
         assert!(err.to_string().contains("non-empty"));
     }
 
+    // `sleep` isn't a Windows `cmd` builtin and may not be on PATH in
+    // restricted CI, even though Git-for-Windows runners happen to ship
+    // one. Gate to keep behavior deterministic.
+    #[cfg(unix)]
     #[tokio::test]
     async fn bash_timeout_kills_long_running_command() {
         let dir = TempDir::new().unwrap();
@@ -424,6 +470,7 @@ mod tests {
         assert!(err.to_string().contains("timed out"), "got {err}");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn bash_aborts_on_ctx_abort() {
         let dir = TempDir::new().unwrap();
@@ -498,6 +545,34 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tool = BashTool::new(policy_for(dir.path()));
         assert_eq!(tool.safety_class(), SafetyClass::Mutating);
+    }
+
+    #[tokio::test]
+    async fn read_capped_zero_cap_discards_but_flags_truncated() {
+        // cap == 0 must NOT grow the buffer regardless of input size.
+        let mut data: &[u8] = b"abcdefghij";
+        let (out, truncated) = read_capped(&mut data, 0).await.unwrap();
+        assert!(out.is_empty());
+        assert!(truncated);
+        // Empty stream with cap 0 → not truncated.
+        let mut empty: &[u8] = b"";
+        let (out, truncated) = read_capped(&mut empty, 0).await.unwrap();
+        assert!(out.is_empty());
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn trim_to_utf8_boundary_drops_continuation_prefix() {
+        // 4-byte codepoint U+1F600 = F0 9F 98 80. Cut after first byte
+        // and prepend continuations: tail starts at B2/B3-style bytes.
+        let bytes = vec![0x9F, 0x98, 0x80, b'a', b'b'];
+        let trimmed = trim_to_utf8_boundary(bytes);
+        // After trimming continuations, first byte should be ASCII 'a'.
+        assert_eq!(trimmed, b"ab");
+        // ASCII tail unchanged.
+        assert_eq!(trim_to_utf8_boundary(b"hello".to_vec()), b"hello");
+        // Multi-byte start byte (0xC3 = 2-byte) preserved.
+        assert_eq!(trim_to_utf8_boundary(vec![0xC3, 0xA9]), vec![0xC3, 0xA9]);
     }
 
     #[tokio::test]

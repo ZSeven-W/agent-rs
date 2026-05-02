@@ -153,7 +153,17 @@ fn register_inner(
     }
     #[cfg(feature = "todo")]
     {
-        let state = todo_state.unwrap_or_default();
+        let state = match todo_state {
+            Some(s) => s,
+            None => {
+                tracing::warn!(
+                    "register_default with `todo` feature enabled and no caller-provided \
+                     TodoState — the host loses the handle. Use \
+                     register_default_with_todo() if you need to read the list back."
+                );
+                todo::TodoState::new()
+            }
+        };
         registry.register(Arc::new(TodoWriteTool::new(state)) as Arc<dyn Tool>);
     }
     let _ = policy; // suppress unused when no features enabled
