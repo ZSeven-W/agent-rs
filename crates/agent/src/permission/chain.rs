@@ -34,8 +34,7 @@ use super::types::{
 /// alias name as a stable surface** — it may be repackaged once the
 /// async path lands; prefer constructing the boxed Fn inline at call
 /// sites.
-pub type ToolPermissionCheckFn =
-    dyn Fn(&serde_json::Value) -> PermissionDecision + Send + Sync;
+pub type ToolPermissionCheckFn = dyn Fn(&serde_json::Value) -> PermissionDecision + Send + Sync;
 
 pub fn evaluate_permission(
     tool_name: &str,

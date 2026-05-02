@@ -21,11 +21,7 @@ fn null_input() -> serde_json::Value {
     serde_json::Value::Null
 }
 
-fn whole_tool(
-    source: RuleSource,
-    behavior: PermissionBehavior,
-    tool_name: &str,
-) -> PermissionRule {
+fn whole_tool(source: RuleSource, behavior: PermissionBehavior, tool_name: &str) -> PermissionRule {
     PermissionRule::whole_tool(source, behavior, tool_name)
 }
 
@@ -207,12 +203,7 @@ fn input_pattern_rules_are_ignored_in_phase_3_batch_g() {
         tool_name: "Bash".into(),
         rule_content: Some("rm *".into()),
     };
-    let ctx = make_ctx(
-        PermissionMode::Default,
-        vec![],
-        vec![pattern_rule],
-        vec![],
-    );
+    let ctx = make_ctx(PermissionMode::Default, vec![], vec![pattern_rule], vec![]);
     let decision = evaluate_permission("Bash", &serde_json::json!({"cmd": "rm /"}), &ctx, None);
     assert!(
         decision.is_ask(),

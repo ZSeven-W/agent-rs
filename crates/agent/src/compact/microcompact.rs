@@ -103,8 +103,7 @@ pub fn microcompact(messages: &mut [Message], config: &MicrocompactConfig) -> Mi
     // Pass 2: filter — drop everything within `preserve_last_n` (most
     // recent), drop ages below `min_age_turns`, drop cheap blocks.
     let total_results = candidates.len();
-    let preserve_floor =
-        total_results.saturating_sub(config.preserve_last_n as usize);
+    let preserve_floor = total_results.saturating_sub(config.preserve_last_n as usize);
     let mut to_clear: Vec<(usize, usize, String, u32)> = Vec::new();
     for (idx, (mi, bi, age, cost, tu_id)) in candidates.into_iter().enumerate() {
         if idx >= preserve_floor {
@@ -128,7 +127,10 @@ pub fn microcompact(messages: &mut [Message], config: &MicrocompactConfig) -> Mi
     for (mi, bi, tu_id, cost) in to_clear {
         let placeholder_cost: u32 = estimate_tokens_in_text(CLEARED_PLACEHOLDER);
         let freed = cost.saturating_sub(placeholder_cost);
-        if let Some(Message::User { content, header, .. }) = messages.get_mut(mi) {
+        if let Some(Message::User {
+            content, header, ..
+        }) = messages.get_mut(mi)
+        {
             if let Some(ContentBlock::ToolResult { content: c, .. }) = content.get_mut(bi) {
                 *c = ToolResultContent::Text(CLEARED_PLACEHOLDER.into());
             }

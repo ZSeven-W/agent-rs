@@ -43,24 +43,22 @@ pub fn effective_context_window(model_max_tokens: u32) -> u32 {
 
 /// Token count below which auto-compaction shouldn't fire.
 pub fn auto_compact_threshold(model_max_tokens: u32) -> u32 {
-    effective_context_window(model_max_tokens)
-        .saturating_sub(AUTOCOMPACT_BUFFER_TOKENS)
+    effective_context_window(model_max_tokens).saturating_sub(AUTOCOMPACT_BUFFER_TOKENS)
 }
 
 /// Token count below which the user shouldn't see a warning yet.
 pub fn warning_threshold(model_max_tokens: u32) -> u32 {
-    effective_context_window(model_max_tokens)
-        .saturating_sub(WARNING_THRESHOLD_BUFFER_TOKENS)
+    effective_context_window(model_max_tokens).saturating_sub(WARNING_THRESHOLD_BUFFER_TOKENS)
 }
 
 /// Token count below which manual compaction shouldn't be required.
 pub fn manual_compact_threshold(model_max_tokens: u32) -> u32 {
-    effective_context_window(model_max_tokens)
-        .saturating_sub(MANUAL_COMPACT_BUFFER_TOKENS)
+    effective_context_window(model_max_tokens).saturating_sub(MANUAL_COMPACT_BUFFER_TOKENS)
 }
 
 /// Why the auto-compact decision came out the way it did.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AutoCompactReason {
     UnderThreshold {
         current_tokens: u32,
@@ -73,6 +71,10 @@ pub enum AutoCompactReason {
     CircuitBreakerOpen {
         consecutive_failures: u32,
     },
+    /// A successful compaction failed to drop the transcript below
+    /// threshold; further auto-compaction is suppressed until
+    /// [`AutoCompactState::reset_no_progress`].
+    NoProgress,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +101,13 @@ pub struct AutoCompactState {
     /// [`MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES`] opens the circuit
     /// breaker.
     pub consecutive_failures: u32,
+    /// Latched when a successful compaction did not bring the token
+    /// total back below the auto-compact threshold. Once set, future
+    /// `evaluate()` calls return `should_compact = false` until
+    /// [`Self::reset_no_progress`] is called. Prevents oscillation
+    /// where every iteration re-summarizes a transcript that summary
+    /// itself made too long.
+    pub no_progress: bool,
 }
 
 impl Default for AutoCompactState {
@@ -108,6 +117,7 @@ impl Default for AutoCompactState {
             turn_counter: 0,
             turn_id: Uuid::new_v4().to_string(),
             consecutive_failures: 0,
+            no_progress: false,
         }
     }
 }
@@ -133,6 +143,18 @@ impl AutoCompactState {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
     }
 
+    /// Latch the no-progress flag. Call after a successful compaction
+    /// when the post-compact token total is still ≥ threshold.
+    pub fn record_no_progress(&mut self) {
+        self.no_progress = true;
+    }
+
+    /// Clear the no-progress flag — e.g., when the caller has manually
+    /// reduced context (deleted attachments, switched session).
+    pub fn reset_no_progress(&mut self) {
+        self.no_progress = false;
+    }
+
     pub fn circuit_open(&self) -> bool {
         self.consecutive_failures >= MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES
     }
@@ -146,6 +168,14 @@ impl AutoCompactState {
         let warn_threshold = warning_threshold(model_max_tokens);
 
         let should_warn = current_tokens >= warn_threshold;
+
+        if self.no_progress {
+            return AutoCompactDecision {
+                should_compact: false,
+                should_warn,
+                reason: AutoCompactReason::NoProgress,
+            };
+        }
 
         if self.circuit_open() {
             return AutoCompactDecision {
@@ -246,7 +276,9 @@ mod tests {
         assert!(!d.should_compact);
         assert!(matches!(
             d.reason,
-            AutoCompactReason::CircuitBreakerOpen { consecutive_failures: 3 }
+            AutoCompactReason::CircuitBreakerOpen {
+                consecutive_failures: 3
+            }
         ));
     }
 
@@ -259,6 +291,25 @@ mod tests {
         assert_eq!(s.consecutive_failures, 0);
         assert!(s.compacted);
         assert!(!s.circuit_open());
+    }
+
+    #[test]
+    fn no_progress_flag_suppresses_future_compaction() {
+        let mut s = AutoCompactState::new();
+        s.record_no_progress();
+        // Would normally fire (>= threshold), but no_progress takes priority.
+        let d = s.evaluate(170_000, 200_000);
+        assert!(!d.should_compact);
+        assert!(matches!(d.reason, AutoCompactReason::NoProgress));
+    }
+
+    #[test]
+    fn reset_no_progress_re_enables_compaction() {
+        let mut s = AutoCompactState::new();
+        s.record_no_progress();
+        s.reset_no_progress();
+        let d = s.evaluate(170_000, 200_000);
+        assert!(d.should_compact);
     }
 
     #[test]

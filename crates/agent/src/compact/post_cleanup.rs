@@ -168,7 +168,11 @@ mod tests {
     #[test]
     fn restores_files_in_input_order() {
         let result = build_post_compact_message(
-            vec![file("/a.rs", "alpha"), file("/b.rs", "bravo"), file("/c.rs", "charlie")],
+            vec![
+                file("/a.rs", "alpha"),
+                file("/b.rs", "bravo"),
+                file("/c.rs", "charlie"),
+            ],
             &PostCompactConfig::default(),
         );
         let paths: Vec<String> = result
@@ -210,7 +214,11 @@ mod tests {
             ..Default::default()
         };
         let result = build_post_compact_message(
-            vec![file("/a.rs", &big), file("/b.rs", &big), file("/c.rs", &big)],
+            vec![
+                file("/a.rs", &big),
+                file("/b.rs", &big),
+                file("/c.rs", &big),
+            ],
             &cfg,
         );
         assert!(result.restored_paths.len() < 3);

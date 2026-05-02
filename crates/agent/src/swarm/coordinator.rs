@@ -139,7 +139,8 @@ mod tests {
 
         let drained = coord.poll_all_inboxes().await;
         assert_eq!(drained.len(), 2);
-        let teams: std::collections::HashSet<_> = drained.iter().map(|(t, _, _)| t.clone()).collect();
+        let teams: std::collections::HashSet<_> =
+            drained.iter().map(|(t, _, _)| t.clone()).collect();
         assert!(teams.contains("t1"));
         assert!(teams.contains("t2"));
     }

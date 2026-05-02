@@ -11,8 +11,8 @@ mod types;
 
 pub use chain::{evaluate_permission, find_rule_for_tool, ToolPermissionCheckFn};
 pub use external_queue::{
-    external_queue, timeout_default_deny, ExternalQueue, ExternalQueueError,
-    ExternalQueueReceiver, ExternalRequest,
+    external_queue, timeout_default_deny, ExternalQueue, ExternalQueueError, ExternalQueueReceiver,
+    ExternalRequest,
 };
 pub use manager::{AsyncToolPermissionCheck, PermissionManager};
 pub use types::{

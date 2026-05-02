@@ -43,7 +43,10 @@ pub enum MailboxError {
     Json(#[from] serde_json::Error),
     #[error("missing schema header")]
     MissingHeader,
-    #[error("unsupported schema version: {0} (this build expects {})", MAILBOX_SCHEMA_VERSION)]
+    #[error(
+        "unsupported schema version: {0} (this build expects {})",
+        MAILBOX_SCHEMA_VERSION
+    )]
     UnsupportedVersion(String),
     #[error("mailbox: {0}")]
     Other(String),
@@ -74,11 +77,7 @@ pub struct MailboxMessage {
 }
 
 impl MailboxMessage {
-    pub fn new(
-        from: impl Into<String>,
-        to: impl Into<String>,
-        payload: serde_json::Value,
-    ) -> Self {
+    pub fn new(from: impl Into<String>, to: impl Into<String>, payload: serde_json::Value) -> Self {
         Self {
             id: Uuid::new_v4(),
             from: from.into(),
@@ -375,7 +374,12 @@ mod tests {
             t.await.unwrap();
         }
         let drained = mb.drain().await.unwrap();
-        assert_eq!(drained.len(), n, "expected {n} messages, got {}", drained.len());
+        assert_eq!(
+            drained.len(),
+            n,
+            "expected {n} messages, got {}",
+            drained.len()
+        );
 
         let mut seen = std::collections::HashSet::new();
         for m in &drained {
@@ -391,7 +395,13 @@ mod tests {
             .await
             .unwrap();
         let path = mb.path();
-        assert!(path.to_string_lossy().contains("teams/design-squad/inboxes"));
-        assert!(path.file_name().unwrap().to_string_lossy().starts_with("bob"));
+        assert!(path
+            .to_string_lossy()
+            .contains("teams/design-squad/inboxes"));
+        assert!(path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("bob"));
     }
 }

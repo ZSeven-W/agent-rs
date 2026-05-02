@@ -148,9 +148,12 @@ pub fn parse_summary_response(text: &str) -> Result<ParsedSummary, ParseSummaryE
         .map(|i| summary_open + SUMMARY_OPEN.len() + i)
         .ok_or(ParseSummaryError::Malformed)?;
 
-    let analysis =
-        text[analysis_open + ANALYSIS_OPEN.len()..analysis_close].trim().to_string();
-    let summary = text[summary_open + SUMMARY_OPEN.len()..summary_close].trim().to_string();
+    let analysis = text[analysis_open + ANALYSIS_OPEN.len()..analysis_close]
+        .trim()
+        .to_string();
+    let summary = text[summary_open + SUMMARY_OPEN.len()..summary_close]
+        .trim()
+        .to_string();
 
     if analysis.is_empty() {
         return Err(ParseSummaryError::Malformed);
@@ -192,8 +195,7 @@ mod tests {
 
     #[test]
     fn summarization_prompt_partial_directions() {
-        let earliest =
-            summarization_prompt(PartialCompactDirection::EarliestHalf, None);
+        let earliest = summarization_prompt(PartialCompactDirection::EarliestHalf, None);
         assert!(earliest.contains("EARLIEST half"));
         let latest = summarization_prompt(PartialCompactDirection::LatestHalf, None);
         assert!(latest.contains("LATEST half"));

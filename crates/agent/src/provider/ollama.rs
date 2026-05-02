@@ -115,9 +115,7 @@ impl Provider for OllamaProvider {
         let mut sse = client
             .send_chat_messages_stream(request)
             .await
-            .map_err(|e| {
-                AgentError::provider("ollama", format!("model={request_model}: {e}"))
-            })?;
+            .map_err(|e| AgentError::provider("ollama", format!("model={request_model}: {e}")))?;
 
         let (tx, rx) = mpsc::unbounded::<Result<Event, AgentError>>();
         let error_model = request_model;
@@ -171,11 +169,7 @@ impl Provider for OllamaProvider {
                 }
             }
 
-            let stop_reason = if last_done {
-                Some("stop".into())
-            } else {
-                None
-            };
+            let stop_reason = if last_done { Some("stop".into()) } else { None };
             let _ = tx.unbounded_send(Ok(Event::Result {
                 data: ResultData {
                     stop_reason,
@@ -198,7 +192,9 @@ fn render_messages(system: &Option<String>, messages: &[Message]) -> Vec<ChatMes
         match msg {
             Message::User { content, .. } => {
                 let pure_tool_results = !content.is_empty()
-                    && content.iter().all(|b| matches!(b, ContentBlock::ToolResult { .. }));
+                    && content
+                        .iter()
+                        .all(|b| matches!(b, ContentBlock::ToolResult { .. }));
                 if pure_tool_results {
                     // Each tool_result becomes its own `tool` role
                     // message — skip the (would-be-empty) user message.
@@ -309,9 +305,7 @@ mod tests {
         let messages = vec![
             Message::User {
                 header: Header::new(),
-                content: vec![ContentBlock::Text {
-                    text: "hi".into(),
-                }],
+                content: vec![ContentBlock::Text { text: "hi".into() }],
             },
             Message::Assistant {
                 header: Header::new(),

@@ -41,6 +41,12 @@ pub enum Event {
     /// Provider-side or runtime error. Recoverable cases continue; fatal
     /// cases are followed by stream termination.
     Error { code: String, message: String },
+    /// Non-fatal informational signal from the runtime — e.g., reactive
+    /// auto-compaction firing, sliding-window trim happening, retry
+    /// occurring. Distinct from [`Self::TextDelta`] (which is assistant
+    /// content) and [`Self::Error`] (which carries failure semantics).
+    /// Renderers MAY display these inline as small status notices.
+    Notice { code: String, message: String },
     /// Forward-compatibility catch-all. Any `kind` value not recognized by
     /// this crate version deserializes to `Unknown` instead of failing the
     /// whole stream. Used by older consumers when newer producers emit
@@ -150,6 +156,15 @@ mod tests {
         let e = Event::Error {
             code: "rate_limit".into(),
             message: "slow down".into(),
+        };
+        assert_eq!(e, roundtrip(&e));
+    }
+
+    #[test]
+    fn notice_roundtrip() {
+        let e = Event::Notice {
+            code: "compact".into(),
+            message: "auto-compacted".into(),
         };
         assert_eq!(e, roundtrip(&e));
     }

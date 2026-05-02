@@ -131,14 +131,10 @@ mod tests {
     fn drops_oldest_when_over_budget() {
         // 3 large user messages; budget too small for 3.
         let big = "x".repeat(800); // ~200 tokens
-        let msgs = vec![
-            user(&big),
-            user(&big),
-            user(&big),
-        ];
+        let msgs = vec![user(&big), user(&big), user(&big)];
         let s = SlidingWindowStrategy::new(10); // keep up to 10 turns
-        // budget too small for 3 turns (~600 tokens) — should drop
-        // older ones until fits.
+                                                // budget too small for 3 turns (~600 tokens) — should drop
+                                                // older ones until fits.
         let got = s.select(&msgs, 250);
         assert!(got.len() < 3);
         assert!(!got.is_empty());

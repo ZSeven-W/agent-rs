@@ -282,7 +282,8 @@ impl ToolCallAccumulator {
         let input = if self.arguments.is_empty() {
             serde_json::Value::Object(Default::default())
         } else {
-            serde_json::from_str(&self.arguments).unwrap_or(serde_json::Value::Object(Default::default()))
+            serde_json::from_str(&self.arguments)
+                .unwrap_or(serde_json::Value::Object(Default::default()))
         };
         Some(Event::ToolUse { id, name, input })
     }
@@ -353,10 +354,7 @@ fn render_messages(
                             .content(text)
                             .build()
                             .map_err(|e| {
-                                AgentError::provider(
-                                    "openai-compat",
-                                    format!("tool_result: {e}"),
-                                )
+                                AgentError::provider("openai-compat", format!("tool_result: {e}"))
                             })?;
                         out.push(tool_msg.into());
                     }
@@ -551,7 +549,9 @@ mod tests {
             },
             Message::Assistant {
                 header: Header::new(),
-                content: vec![ContentBlock::Text { text: "hello".into() }],
+                content: vec![ContentBlock::Text {
+                    text: "hello".into(),
+                }],
             },
         ];
         let rendered = render_messages(&None, &messages).unwrap();
@@ -579,7 +579,9 @@ mod tests {
         let messages = vec![Message::User {
             header: Header::new(),
             content: vec![
-                ContentBlock::Text { text: "follow-up".into() },
+                ContentBlock::Text {
+                    text: "follow-up".into(),
+                },
                 ContentBlock::ToolResult {
                     tool_use_id: "tu_1".into(),
                     content: ToolResultContent::Text("output".into()),
@@ -653,8 +655,12 @@ mod tests {
     #[test]
     fn content_to_plain_text_concatenates_with_newlines() {
         let blocks = vec![
-            ContentBlock::Text { text: "first".into() },
-            ContentBlock::Text { text: "second".into() },
+            ContentBlock::Text {
+                text: "first".into(),
+            },
+            ContentBlock::Text {
+                text: "second".into(),
+            },
         ];
         assert_eq!(content_to_plain_text(&blocks), "first\nsecond");
     }

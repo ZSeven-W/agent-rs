@@ -21,7 +21,7 @@ use super::{
 };
 use crate::abort::AbortController;
 use crate::error::AgentError;
-use crate::message::{Header, Message, MessageStore};
+use crate::message::{ContentBlock, Header, Message, MessageStore};
 use crate::provider::{Provider, StreamRequest};
 use crate::stream::Event;
 
@@ -177,10 +177,7 @@ pub async fn compact_conversation(
         return Err(CompactError::Provider(err));
     }
 
-    let response_text = collected
-        .lock()
-        .map(|b| b.clone())
-        .unwrap_or_default();
+    let response_text = collected.lock().map(|b| b.clone()).unwrap_or_default();
     if response_text.trim().is_empty() {
         return Err(CompactError::EmptyResponse);
     }
@@ -191,9 +188,17 @@ pub async fn compact_conversation(
         header: Header::new(),
         text: COMPACT_BOUNDARY_TEXT.into(),
     };
-    let summary_message = Message::System {
+    // Render the summary as a User message so providers that drop
+    // System messages from the body (notably Anthropic, which renders
+    // System content only via the request-level `system` parameter)
+    // still see the compaction summary in the conversation. Prefixed
+    // with a marker so consumers and the model can recognize it as
+    // synthesized context rather than literal user input.
+    let summary_message = Message::User {
         header: Header::new(),
-        text: summary.clone(),
+        content: vec![ContentBlock::Text {
+            text: format!("[Context summary]\n{summary}"),
+        }],
     };
     let post_compact_tokens =
         estimate_tokens(&boundary_message).saturating_add(estimate_tokens(&summary_message));
@@ -222,22 +227,54 @@ pub fn apply_compaction_to_store(
     store: &mut MessageStore,
     result: &CompactionResult,
 ) -> Result<(), AgentError> {
-    // Snapshot existing messages, replace UUIDs in `replaced_uuids` with
-    // tombstones, then push the boundary + summary on top.
+    // Snapshot existing messages, tombstone replaced UUIDs in place,
+    // and insert boundary + summary AT the compaction boundary so the
+    // chronological order makes sense to the model:
+    //
+    // - Full          → append at end (everything is replaced).
+    // - EarliestHalf  → insert AFTER the last replaced message
+    //                   (i.e., right BEFORE the first preserved).
+    // - LatestHalf    → insert BEFORE the first replaced message
+    //                   (i.e., right AFTER the last preserved).
+    //
+    // This keeps the synthetic summary chronologically next to the
+    // window it summarizes, instead of sitting at the end and
+    // appearing to come after the user's most recent input.
     let snapshot: Vec<Message> = store.iter().cloned().collect();
+    let total = snapshot.len();
+    let insert_at: usize = match result.direction {
+        PartialCompactDirection::Full => total,
+        PartialCompactDirection::EarliestHalf => snapshot
+            .iter()
+            .position(|m| !result.replaced_uuids.contains(&m.uuid()))
+            .unwrap_or(total),
+        PartialCompactDirection::LatestHalf => snapshot
+            .iter()
+            .position(|m| result.replaced_uuids.contains(&m.uuid()))
+            .unwrap_or(total),
+    };
+
     let mut new_store = MessageStore::new();
-    for mut msg in snapshot {
-        if result.replaced_uuids.contains(&msg.uuid()) {
+    for (i, msg) in snapshot.into_iter().enumerate() {
+        if i == insert_at {
+            new_store.push(result.boundary_message.clone())?;
+            new_store.push(result.summary_message.clone())?;
+        }
+        let to_push = if result.replaced_uuids.contains(&msg.uuid()) {
             let header = msg.header().clone();
-            msg = Message::Tombstone {
+            Message::Tombstone {
                 header,
                 reason: "compacted".into(),
-            };
-        }
-        new_store.push(msg)?;
+            }
+        } else {
+            msg
+        };
+        new_store.push(to_push)?;
     }
-    new_store.push(result.boundary_message.clone())?;
-    new_store.push(result.summary_message.clone())?;
+    if insert_at == total {
+        new_store.push(result.boundary_message.clone())?;
+        new_store.push(result.summary_message.clone())?;
+    }
     *store = new_store;
     Ok(())
 }
@@ -460,15 +497,106 @@ The session was about X. Y happened.
         // UUIDs preserved on tombstones.
         assert_eq!(collected[0].uuid(), m1.uuid());
         assert_eq!(collected[1].uuid(), m2.uuid());
-        // Boundary + summary at end.
+        // Boundary + summary at end. Boundary is System; summary is now
+        // User (so providers that skip System still see it).
         match collected[2] {
             Message::System { text, .. } => assert_eq!(text, COMPACT_BOUNDARY_TEXT),
             _ => panic!("expected System boundary at index 2"),
         }
         match collected[3] {
-            Message::System { text, .. } => assert!(text.starts_with("The session")),
-            _ => panic!("expected System summary at index 3"),
+            Message::User { content, .. } => {
+                let text = content
+                    .iter()
+                    .find_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .expect("summary user msg has text block");
+                assert!(text.starts_with("[Context summary]"));
+                assert!(text.contains("The session"));
+            }
+            _ => panic!("expected User summary at index 3"),
         }
     }
-}
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn apply_compaction_earliest_half_inserts_at_boundary() {
+        // 4 messages, EarliestHalf compacts the first 2; boundary +
+        // summary insert AFTER the tombstones, BEFORE the preserved
+        // tail. Final layout: [Tomb, Tomb, System, User, m3, m4].
+        let provider = ScriptedProvider::from_text(happy_response());
+        let m1 = user("a");
+        let m2 = assistant("b");
+        let m3 = user("c");
+        let m4 = assistant("d");
+        let mut store = MessageStore::new();
+        for m in [&m1, &m2, &m3, &m4] {
+            store.push(m.clone()).unwrap();
+        }
+        let messages: Vec<Message> = store.iter().cloned().collect();
+        let result = compact_conversation(
+            &messages,
+            &provider,
+            "m",
+            None,
+            PartialCompactDirection::EarliestHalf,
+            AbortController::new(),
+        )
+        .await
+        .unwrap();
+        apply_compaction_to_store(&mut store, &result).unwrap();
+
+        let collected: Vec<&Message> = store.iter().collect();
+        assert_eq!(collected.len(), 6);
+        assert!(matches!(collected[0], Message::Tombstone { .. }));
+        assert!(matches!(collected[1], Message::Tombstone { .. }));
+        match collected[2] {
+            Message::System { text, .. } => assert_eq!(text, COMPACT_BOUNDARY_TEXT),
+            _ => panic!("expected boundary at idx 2"),
+        }
+        assert!(matches!(collected[3], Message::User { .. }));
+        // Preserved m3, m4 remain at the tail with original UUIDs.
+        assert_eq!(collected[4].uuid(), m3.uuid());
+        assert_eq!(collected[5].uuid(), m4.uuid());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn apply_compaction_latest_half_inserts_before_replaced() {
+        // 4 messages, LatestHalf compacts the last 2; boundary +
+        // summary insert BEFORE the replaced tail, AFTER the preserved
+        // head. Final layout: [m1, m2, System, User, Tomb, Tomb].
+        let provider = ScriptedProvider::from_text(happy_response());
+        let m1 = user("a");
+        let m2 = assistant("b");
+        let m3 = user("c");
+        let m4 = assistant("d");
+        let mut store = MessageStore::new();
+        for m in [&m1, &m2, &m3, &m4] {
+            store.push(m.clone()).unwrap();
+        }
+        let messages: Vec<Message> = store.iter().cloned().collect();
+        let result = compact_conversation(
+            &messages,
+            &provider,
+            "m",
+            None,
+            PartialCompactDirection::LatestHalf,
+            AbortController::new(),
+        )
+        .await
+        .unwrap();
+        apply_compaction_to_store(&mut store, &result).unwrap();
+
+        let collected: Vec<&Message> = store.iter().collect();
+        assert_eq!(collected.len(), 6);
+        assert_eq!(collected[0].uuid(), m1.uuid());
+        assert_eq!(collected[1].uuid(), m2.uuid());
+        match collected[2] {
+            Message::System { text, .. } => assert_eq!(text, COMPACT_BOUNDARY_TEXT),
+            _ => panic!("expected boundary at idx 2"),
+        }
+        assert!(matches!(collected[3], Message::User { .. }));
+        assert!(matches!(collected[4], Message::Tombstone { .. }));
+        assert!(matches!(collected[5], Message::Tombstone { .. }));
+    }
+}

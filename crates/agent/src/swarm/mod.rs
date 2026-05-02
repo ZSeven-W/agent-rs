@@ -31,8 +31,8 @@ mod team;
 
 #[cfg(feature = "swarm")]
 pub use backends::{
-    Backend, BackendError, BackendHandle, InProcessBackend, Iterm2Backend, RunnerFn,
-    SpawnSpec, TmuxBackend,
+    Backend, BackendError, BackendHandle, InProcessBackend, Iterm2Backend, RunnerFn, SpawnSpec,
+    TmuxBackend,
 };
 
 #[cfg(feature = "swarm")]
@@ -40,9 +40,7 @@ pub use coordinator::Coordinator;
 #[cfg(feature = "swarm")]
 pub use mailbox::{Mailbox, MailboxError, MailboxHeader, MailboxMessage, MAILBOX_SCHEMA_VERSION};
 #[cfg(feature = "swarm")]
-pub use permission_sync::{
-    PendingRequest, PermissionSync, PermissionSyncError, ResolvedResponse,
-};
+pub use permission_sync::{PendingRequest, PermissionSync, PermissionSyncError, ResolvedResponse};
 #[cfg(feature = "swarm")]
 pub use sub_agent::SubAgent;
 #[cfg(feature = "swarm")]

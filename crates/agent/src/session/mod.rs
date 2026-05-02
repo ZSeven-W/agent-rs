@@ -57,7 +57,10 @@ pub enum SessionError {
     Json(#[from] serde_json::Error),
     #[error("missing schema header line — file is empty or malformed")]
     MissingHeader,
-    #[error("unsupported schema version: {0} (this build supports {})", SCHEMA_VERSION)]
+    #[error(
+        "unsupported schema version: {0} (this build supports {})",
+        SCHEMA_VERSION
+    )]
     UnsupportedVersion(String),
     #[error("session: {0}")]
     Other(String),

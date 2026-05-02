@@ -292,7 +292,10 @@ mod tests {
             Event::ToolResult { id, ok, output } => {
                 assert_eq!(id, "tu_e");
                 assert!(!ok);
-                assert!(output["error"].as_str().unwrap().contains("intentional failure"));
+                assert!(output["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("intentional failure"));
             }
             other => panic!("expected failed ToolResult, got {other:?}"),
         }
@@ -336,7 +339,9 @@ mod tests {
         let items = stream_handle.await.unwrap();
         // Should have at least one Aborted error item.
         assert!(
-            items.iter().any(|i| matches!(i, Err(AgentError::Aborted(_)))),
+            items
+                .iter()
+                .any(|i| matches!(i, Err(AgentError::Aborted(_)))),
             "expected Aborted error in stream, got {items:?}"
         );
     }

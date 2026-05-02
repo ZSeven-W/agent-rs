@@ -135,7 +135,10 @@ impl ExternalQueue {
         F: FnOnce(&str, ExternalQueueError) -> PermissionDecision,
     {
         let tool = tool.into();
-        match self.request_with_timeout(tool.clone(), input, timeout).await {
+        match self
+            .request_with_timeout(tool.clone(), input, timeout)
+            .await
+        {
             Ok(d) => d,
             Err(e) => fallback(&tool, e),
         }
@@ -161,9 +164,7 @@ impl ExternalQueue {
 /// callers who want to construct one manually.
 pub fn timeout_default_deny(tool: &str, err: ExternalQueueError) -> PermissionDecision {
     PermissionDecision::Deny(DenyDecision {
-        message_text: format!(
-            "Tool '{tool}' denied: external approval did not arrive ({err})."
-        ),
+        message_text: format!("Tool '{tool}' denied: external approval did not arrive ({err})."),
         reason: DecisionReason::other(format!("external_queue: {err}")),
     })
 }
@@ -203,11 +204,7 @@ mod tests {
         let (queue, _receiver) = external_queue();
         // Receiver task NEVER processes — should hit timeout.
         let result = queue
-            .request_with_timeout(
-                "Bash",
-                serde_json::json!({}),
-                Duration::from_millis(20),
-            )
+            .request_with_timeout("Bash", serde_json::json!({}), Duration::from_millis(20))
             .await;
         assert!(matches!(result, Err(ExternalQueueError::Timeout)));
     }
@@ -216,11 +213,7 @@ mod tests {
     async fn request_or_default_deny_on_timeout() {
         let (queue, _receiver) = external_queue();
         let decision = queue
-            .request_or_default_deny(
-                "Bash",
-                serde_json::json!({}),
-                Duration::from_millis(20),
-            )
+            .request_or_default_deny("Bash", serde_json::json!({}), Duration::from_millis(20))
             .await;
         assert!(decision.is_deny());
     }

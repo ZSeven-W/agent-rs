@@ -125,20 +125,18 @@ impl PermissionManager {
         callback: Option<&dyn AsyncToolPermissionCheck>,
     ) -> PermissionDecision {
         // Step 1a — deny rule.
-        if let Some(rule) = super::chain::find_rule_for_tool(
-            &self.context.always_deny_rules,
-            tool_name,
-        ) {
+        if let Some(rule) =
+            super::chain::find_rule_for_tool(&self.context.always_deny_rules, tool_name)
+        {
             return PermissionDecision::Deny(DenyDecision {
                 message_text: "Tool use denied by rule.".into(),
                 reason: DecisionReason::rule(rule.clone()),
             });
         }
         // Step 1b — ask rule.
-        if let Some(rule) = super::chain::find_rule_for_tool(
-            &self.context.always_ask_rules,
-            tool_name,
-        ) {
+        if let Some(rule) =
+            super::chain::find_rule_for_tool(&self.context.always_ask_rules, tool_name)
+        {
             return PermissionDecision::Ask(AskDecision {
                 message_text: "Tool use requires confirmation.".into(),
                 reason: Some(DecisionReason::rule(rule.clone())),
@@ -162,10 +160,9 @@ impl PermissionManager {
             });
         }
         // Step 2b — whole-tool allow rule.
-        if let Some(rule) = super::chain::find_rule_for_tool(
-            &self.context.always_allow_rules,
-            tool_name,
-        ) {
+        if let Some(rule) =
+            super::chain::find_rule_for_tool(&self.context.always_allow_rules, tool_name)
+        {
             return PermissionDecision::Allow(AllowDecision {
                 updated_input: None,
                 reason: DecisionReason::rule(rule.clone()),

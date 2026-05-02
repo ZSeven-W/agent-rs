@@ -31,6 +31,11 @@ use futures::channel::mpsc;
 use futures::StreamExt;
 
 use crate::abort::AbortController;
+use crate::compact::{
+    apply_compaction_to_store, compact_with_hooks, estimate_tokens, AutoCompactReason,
+    AutoCompactState, CompactError, CompactTrigger, CompactWithHooksRequest,
+    PartialCompactDirection,
+};
 use crate::error::AgentError;
 use crate::file_cache::FileStateCache;
 use crate::hook::{HookEvent, HookOutcome, HookRunner};
@@ -39,6 +44,11 @@ use crate::permission::{PermissionDecision, PermissionManager};
 use crate::provider::{Provider, StreamRequest};
 use crate::stream::{Event, EventStream, RequestedToolUse, ResultData, ToolExecutor};
 use crate::tool::{ToolRegistry, ToolUseContext};
+
+/// Default declared context window when the caller has no model-specific
+/// information. Matches Anthropic's `claude-3-5-sonnet` family. Callers
+/// targeting smaller windows should override via the builder.
+pub const DEFAULT_MODEL_MAX_TOKENS: u32 = 200_000;
 
 /// Loop state at any point during a turn cycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +106,17 @@ pub struct QueryLoop {
     pub tools: Arc<ToolRegistry>,
     pub permissions: Arc<PermissionManager>,
     pub hooks: Arc<HookRunner>,
+    /// Shared message store. **Single-driver invariant**: while
+    /// [`Self::run`] is in progress, only the spawned drive task may
+    /// mutate the store. External code may take a read snapshot via
+    /// `store.lock()` but MUST NOT push, pop, or otherwise modify the
+    /// store, because reactive auto-compaction relies on the snapshot
+    /// taken inside `maybe_auto_compact` matching the live store when
+    /// the compaction result is applied. Concurrent mutations would
+    /// land before the boundary marker and silently escape the
+    /// summary. If you need to drive multiple parallel turns over the
+    /// same conversation history, construct a new `QueryLoop` per
+    /// turn with the same `Arc` and serialize the `run()` calls.
     pub store: Arc<Mutex<MessageStore>>,
     pub model: String,
     pub system: Option<String>,
@@ -108,6 +129,23 @@ pub struct QueryLoop {
     pub cwd: PathBuf,
     /// Shared file state cache threaded into every [`ToolUseContext`].
     pub file_cache: Arc<FileStateCache>,
+    /// Declared context window for the active model. Used by reactive
+    /// compaction to compute thresholds. Defaults to
+    /// [`DEFAULT_MODEL_MAX_TOKENS`].
+    pub model_max_tokens: u32,
+    /// Whether reactive auto-compaction is enabled. When `true`, every
+    /// turn evaluates [`AutoCompactState`] before streaming and may
+    /// rewrite the message store via [`compact_with_hooks`] +
+    /// [`apply_compaction_to_store`]. Defaults to `true`.
+    pub auto_compact_enabled: bool,
+    /// Cross-run auto-compaction state. Latches like `no_progress` and
+    /// the `consecutive_failures` circuit breaker survive across
+    /// successive [`Self::run`] calls when the host wires the same
+    /// `Arc` into every loop instance via
+    /// [`QueryLoopBuilder::compact_state`]. Defaults to a fresh, owned
+    /// state when not provided (state then resets per-run, matching
+    /// pre-Q-δ behavior).
+    pub compact_state: Arc<Mutex<AutoCompactState>>,
 }
 
 impl QueryLoop {
@@ -158,6 +196,9 @@ pub struct QueryLoopBuilder {
     max_iterations: usize,
     cwd: PathBuf,
     file_cache: Option<Arc<FileStateCache>>,
+    model_max_tokens: u32,
+    auto_compact_enabled: bool,
+    compact_state: Option<Arc<Mutex<AutoCompactState>>>,
 }
 
 impl QueryLoopBuilder {
@@ -175,6 +216,9 @@ impl QueryLoopBuilder {
             max_iterations: 16,
             cwd: PathBuf::from("."),
             file_cache: None,
+            model_max_tokens: DEFAULT_MODEL_MAX_TOKENS,
+            auto_compact_enabled: true,
+            compact_state: None,
         }
     }
 
@@ -218,6 +262,24 @@ impl QueryLoopBuilder {
         self.file_cache = Some(c);
         self
     }
+    /// Override the declared context window. Defaults to
+    /// [`DEFAULT_MODEL_MAX_TOKENS`].
+    pub fn model_max_tokens(mut self, n: u32) -> Self {
+        self.model_max_tokens = n;
+        self
+    }
+    /// Enable or disable reactive auto-compaction. Defaults to `true`.
+    pub fn auto_compact(mut self, on: bool) -> Self {
+        self.auto_compact_enabled = on;
+        self
+    }
+    /// Inject a shared [`AutoCompactState`] so latches and circuit
+    /// breaker counters survive across successive [`QueryLoop::run`]
+    /// calls. Without this, each run starts with a fresh state.
+    pub fn compact_state(mut self, s: Arc<Mutex<AutoCompactState>>) -> Self {
+        self.compact_state = Some(s);
+        self
+    }
 
     pub fn build(self) -> QueryLoop {
         let file_cache = self.file_cache.unwrap_or_else(|| {
@@ -243,6 +305,11 @@ impl QueryLoopBuilder {
             max_iterations: self.max_iterations,
             cwd: self.cwd,
             file_cache,
+            model_max_tokens: self.model_max_tokens,
+            auto_compact_enabled: self.auto_compact_enabled,
+            compact_state: self
+                .compact_state
+                .unwrap_or_else(|| Arc::new(Mutex::new(AutoCompactState::new()))),
         }
     }
 }
@@ -262,6 +329,7 @@ async fn drive(
         model: None,
         metadata: Default::default(),
     };
+    let compact_state = qloop.compact_state.clone();
 
     loop {
         if abort.is_aborted() {
@@ -279,6 +347,21 @@ async fn drive(
             return;
         }
         iter += 1;
+        if let Ok(mut s) = compact_state.lock() {
+            s.next_turn();
+        }
+
+        // ----- Reactive auto-compaction (Q-δ) -----
+        // Before each streaming turn, evaluate whether the cumulative
+        // token estimate of the current MessageStore has crossed the
+        // auto-compact threshold. On hit, run a full hook-instrumented
+        // compaction in-place and continue with the rewritten store.
+        if qloop.auto_compact_enabled {
+            if let Err(e) = maybe_auto_compact(&qloop, &compact_state, &abort, &tx).await {
+                let _ = tx.unbounded_send(Err(e));
+                return;
+            }
+        }
 
         // ----- Streaming phase -----
         let messages = match snapshot(&qloop.store) {
@@ -555,10 +638,7 @@ async fn consume_turn(
             Ok(event) => match event {
                 Event::TextDelta { delta } => {
                     accumulated_text.push_str(&delta);
-                    if tx
-                        .unbounded_send(Ok(Event::TextDelta { delta }))
-                        .is_err()
-                    {
+                    if tx.unbounded_send(Ok(Event::TextDelta { delta })).is_err() {
                         return Err(());
                     }
                 }
@@ -592,6 +672,7 @@ async fn consume_turn(
                 }
                 Event::Usage { .. }
                 | Event::Error { .. }
+                | Event::Notice { .. }
                 | Event::ToolResult { .. }
                 | Event::Unknown => {
                     if tx.unbounded_send(Ok(event)).is_err() {
@@ -607,9 +688,9 @@ async fn consume_turn(
     }
 
     if !accumulated_text.is_empty() {
-        summary
-            .assistant_blocks
-            .push(ContentBlock::Text { text: accumulated_text });
+        summary.assistant_blocks.push(ContentBlock::Text {
+            text: accumulated_text,
+        });
     }
     if let Some(thinking) = accumulated_thinking {
         summary.assistant_blocks.push(ContentBlock::Thinking {
@@ -685,6 +766,172 @@ fn forward_tool_result(
     }));
 }
 
+/// Reactive auto-compaction helper invoked once per turn.
+///
+/// Reads the live `MessageStore`, sums token estimates, evaluates
+/// [`AutoCompactState`], and on `should_compact == true`:
+///
+/// 1. Calls [`compact_with_hooks`] (which fires PreCompact + PostCompact
+///    hooks around [`super::super::compact::summarize::compact_conversation`]).
+/// 2. Rewrites the store in-place via [`apply_compaction_to_store`].
+/// 3. Forwards an `Event::Notice`-equivalent observability ping by
+///    surfacing a synthetic `Event::Unknown`-like marker — for now we
+///    rely on hooks for telemetry and only short-circuit on
+///    [`CompactError::Aborted`].
+///
+/// **Failure handling**:
+/// - `Aborted` due to outer abort → propagates as [`AgentError::Aborted`].
+/// - `Aborted` from a `PreCompact` hook returning `Block` (outer abort
+///   NOT fired) → recoverable: surfaces an `Event::Notice`, records a
+///   failure for the breaker, and the turn continues.
+/// - Any other error → records a failure (advances circuit breaker),
+///   surfaces an `Event::Notice`, and the turn continues with the
+///   un-compacted store. Three in a row opens the breaker.
+///
+/// **Direction**: uses [`PartialCompactDirection::EarliestHalf`] so the
+/// most recent half of the transcript (including the user message that
+/// just arrived via [`QueryLoop::run`]) is preserved verbatim. Without
+/// this the current turn's user input would be tombstoned and the
+/// provider would never see fresh input.
+///
+/// **No-progress detection**: after a successful compaction, the
+/// post-compact token total is re-evaluated. If still ≥ threshold,
+/// [`AutoCompactState::record_no_progress`] is latched so subsequent
+/// turns skip auto-compaction entirely (preventing oscillation when
+/// the summary itself is dense).
+/// Minimum messages to compact in a partial direction. Below this we
+/// skip — replacing 1 message with a boundary + summary pair is a net
+/// loss in both message count and tokens.
+const MIN_PARTIAL_COMPACT_TARGET: usize = 2;
+
+async fn maybe_auto_compact(
+    qloop: &QueryLoop,
+    state: &Arc<Mutex<AutoCompactState>>,
+    abort: &AbortController,
+    tx: &mpsc::UnboundedSender<Result<Event, AgentError>>,
+) -> Result<(), AgentError> {
+    // Snapshot once — we want a stable view of the store for token
+    // accounting AND for the compaction request itself.
+    let snapshot = snapshot(&qloop.store)?;
+    if snapshot.len() < 2 {
+        return Ok(());
+    }
+
+    // Auto-compaction uses EarliestHalf, which compacts `len/2`
+    // messages. Skip when that would be fewer than the minimum.
+    let target_count = snapshot.len() / 2;
+    if target_count < MIN_PARTIAL_COMPACT_TARGET {
+        return Ok(());
+    }
+
+    let current_tokens: u32 = snapshot
+        .iter()
+        .map(estimate_tokens)
+        .fold(0u32, u32::saturating_add);
+
+    let decision = {
+        let s = state
+            .lock()
+            .map_err(|_| AgentError::other("compact state lock poisoned"))?;
+        s.evaluate(current_tokens, qloop.model_max_tokens)
+    };
+    if !decision.should_compact {
+        return Ok(());
+    }
+    // Defense in depth: evaluate() should already have masked these,
+    // but guard against future refactors changing the surface.
+    if matches!(
+        decision.reason,
+        AutoCompactReason::CircuitBreakerOpen { .. } | AutoCompactReason::NoProgress
+    ) {
+        return Ok(());
+    }
+
+    // Run the compaction. `EarliestHalf` keeps the recent half — vital
+    // because [`QueryLoop::run`] just pushed the user's prompt and we
+    // need the model to see it on the next streaming turn.
+    //
+    // Use a child abort so an internal abort during summarization
+    // doesn't poison the outer loop. Parent → child propagates, child
+    // → parent does not.
+    let request = CompactWithHooksRequest::new(&snapshot, qloop.model.clone())
+        .with_trigger(CompactTrigger::Auto)
+        .with_direction(PartialCompactDirection::EarliestHalf)
+        .with_abort(abort.child());
+    let outcome = compact_with_hooks(&qloop.hooks, &*qloop.provider, request).await;
+
+    match outcome {
+        Ok(result) => {
+            let auto_threshold = crate::compact::auto_compact_threshold(qloop.model_max_tokens);
+            // Splice result into the live store under a short critical
+            // section.
+            let new_total = {
+                let mut store = qloop
+                    .store
+                    .lock()
+                    .map_err(|_| AgentError::other("query store lock poisoned"))?;
+                apply_compaction_to_store(&mut store, &result)?;
+                store
+                    .iter()
+                    .map(estimate_tokens)
+                    .fold(0u32, u32::saturating_add)
+            };
+            {
+                let mut s = state
+                    .lock()
+                    .map_err(|_| AgentError::other("compact state lock poisoned"))?;
+                s.record_success();
+                // No-progress detection: if the post-compact total is
+                // still ≥ threshold, latch the flag so we don't
+                // oscillate. The user can clear it via
+                // [`AutoCompactState::reset_no_progress`].
+                if new_total >= auto_threshold {
+                    s.record_no_progress();
+                }
+            }
+            let _ = tx.unbounded_send(Ok(Event::Notice {
+                code: "agent.compact.ok".into(),
+                message: format!(
+                    "auto-compact {} → {} tokens ({} messages replaced)",
+                    result.pre_compact_tokens,
+                    result.post_compact_tokens,
+                    result.replaced_uuids.len()
+                ),
+            }));
+            Ok(())
+        }
+        Err(CompactError::Aborted) => {
+            // Distinguish outer abort vs. PreCompact hook block. The
+            // hook path returns Aborted without setting the abort
+            // token, so we can recover.
+            if abort.is_aborted() {
+                Err(AgentError::Aborted(
+                    abort.reason().unwrap_or_else(|| "compact aborted".into()),
+                ))
+            } else {
+                if let Ok(mut s) = state.lock() {
+                    s.record_failure();
+                }
+                let _ = tx.unbounded_send(Ok(Event::Notice {
+                    code: "agent.compact.blocked".into(),
+                    message: "PreCompact hook blocked auto-compaction".into(),
+                }));
+                Ok(())
+            }
+        }
+        Err(other) => {
+            if let Ok(mut s) = state.lock() {
+                s.record_failure();
+            }
+            let _ = tx.unbounded_send(Ok(Event::Notice {
+                code: "agent.compact.failed".into(),
+                message: other.to_string(),
+            }));
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -736,8 +983,12 @@ mod tests {
     #[tokio::test]
     async fn single_turn_text_only() {
         let provider = Arc::new(MockProvider::with_turns(vec![vec![
-            Event::TextDelta { delta: "hi ".into() },
-            Event::TextDelta { delta: "there".into() },
+            Event::TextDelta {
+                delta: "hi ".into(),
+            },
+            Event::TextDelta {
+                delta: "there".into(),
+            },
             Event::Result {
                 data: ResultData {
                     stop_reason: Some("end_turn".into()),
@@ -795,10 +1046,7 @@ mod tests {
 
         let calls = Arc::new(AtomicUsize::new(0));
         let registry = echo_registry("echo", calls.clone());
-        let perms = Arc::new(
-            PermissionManager::new()
-                .allow(RuleSource::User, "echo"),
-        );
+        let perms = Arc::new(PermissionManager::new().allow(RuleSource::User, "echo"));
 
         let qloop = QueryLoop::builder(provider, "mock")
             .tools(registry)
@@ -806,7 +1054,10 @@ mod tests {
             .build();
 
         let store = qloop.store.clone();
-        let mut stream = qloop.run("call echo", AbortController::new()).await.unwrap();
+        let mut stream = qloop
+            .run("call echo", AbortController::new())
+            .await
+            .unwrap();
         let mut events = Vec::new();
         while let Some(item) = stream.next().await {
             events.push(item.unwrap());
@@ -855,10 +1106,7 @@ mod tests {
         ]));
         let calls = Arc::new(AtomicUsize::new(0));
         let registry = echo_registry("echo", calls.clone());
-        let perms = Arc::new(
-            PermissionManager::new()
-                .deny(RuleSource::Policy, "echo"),
-        );
+        let perms = Arc::new(PermissionManager::new().deny(RuleSource::Policy, "echo"));
 
         let qloop = QueryLoop::builder(provider, "mock")
             .tools(registry)
@@ -873,13 +1121,9 @@ mod tests {
         // Echo tool was NOT called — denied at permission step.
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         // Stream still has a synthetic ToolResult ok=false.
-        assert!(events.iter().any(|e| matches!(
-            e,
-            Event::ToolResult {
-                ok: false,
-                ..
-            }
-        )));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::ToolResult { ok: false, .. })));
     }
 
     #[tokio::test]
@@ -907,18 +1151,16 @@ mod tests {
         ]));
         let calls = Arc::new(AtomicUsize::new(0));
         let registry = echo_registry("echo", calls.clone());
-        let perms = Arc::new(
-            PermissionManager::new()
-                .allow(RuleSource::User, "echo"),
-        );
+        let perms = Arc::new(PermissionManager::new().allow(RuleSource::User, "echo"));
 
-        let blocking_hook = Arc::new(crate::hook::RustHookHandler::new(
-            "blocker",
-            |event| match event {
-                HookEvent::BeforeToolUse { .. } => HookOutcome::Block,
-                _ => HookOutcome::Ok,
-            },
-        ));
+        let blocking_hook =
+            Arc::new(crate::hook::RustHookHandler::new(
+                "blocker",
+                |event| match event {
+                    HookEvent::BeforeToolUse { .. } => HookOutcome::Block,
+                    _ => HookOutcome::Ok,
+                },
+            ));
         let mut hooks = HookRunner::new();
         hooks.register(blocking_hook);
 
@@ -932,6 +1174,427 @@ mod tests {
         while let Some(_item) = stream.next().await {}
         // Hook blocked dispatch; echo was not called.
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    fn compact_response() -> &'static str {
+        "<analysis>- prior turns happened</analysis><summary>Prior context summarized.</summary>"
+    }
+
+    /// Build a builder pre-populated with `extra` messages plus aggressive
+    /// compact thresholds so any 2+ messages trigger immediately.
+    fn compact_loop_builder(
+        provider: Arc<MockProvider>,
+        store: Arc<Mutex<MessageStore>>,
+    ) -> QueryLoopBuilder {
+        QueryLoop::builder(provider, "mock")
+            .permissions(Arc::new(
+                PermissionManager::new().with_mode(PermissionMode::Bypass),
+            ))
+            .store(store)
+            // Saturates every threshold to 0: any non-empty snapshot fires.
+            .model_max_tokens(20_001)
+    }
+
+    fn preload_store(messages: Vec<Message>) -> Arc<Mutex<MessageStore>> {
+        let mut s = MessageStore::new();
+        for m in messages {
+            s.push(m).unwrap();
+        }
+        Arc::new(Mutex::new(s))
+    }
+
+    fn user_text(text: &str) -> Message {
+        Message::User {
+            header: Header::new(),
+            content: vec![ContentBlock::Text { text: text.into() }],
+        }
+    }
+
+    fn assistant_text(text: &str) -> Message {
+        Message::Assistant {
+            header: Header::new(),
+            content: vec![ContentBlock::Text { text: text.into() }],
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn auto_compact_fires_on_threshold_hit_and_rewrites_store() {
+        // Provider scripts: turn 0 = compaction summary (consumed by
+        // compact_with_hooks), turn 1 = the regular assistant streaming
+        // reply that follows, ending with end_turn.
+        let provider = Arc::new(MockProvider::with_turns(vec![
+            vec![
+                Event::TextDelta {
+                    delta: compact_response().into(),
+                },
+                Event::Result {
+                    data: Default::default(),
+                },
+            ],
+            vec![
+                Event::TextDelta { delta: "ok".into() },
+                Event::Result {
+                    data: ResultData {
+                        stop_reason: Some("end_turn".into()),
+                        ..Default::default()
+                    },
+                },
+            ],
+        ]));
+        // Preload 4 messages so EarliestHalf compacts 2 (mid = 4/2)
+        // and preserves the trailing 2 verbatim. After run() pushes
+        // the user prompt, snapshot length is 5, mid = 2, replaced = 2.
+        let store = preload_store(vec![
+            user_text("u1"),
+            assistant_text("a1"),
+            user_text("u2"),
+            assistant_text("a2"),
+        ]);
+        let qloop = compact_loop_builder(provider.clone(), store.clone()).build();
+
+        let mut stream = qloop.run("trigger", AbortController::new()).await.unwrap();
+        let mut events = Vec::new();
+        while let Some(item) = stream.next().await {
+            events.push(item.unwrap());
+        }
+
+        // Notice event (code = "agent.compact.ok") proves auto-compact fired.
+        let notice = events.iter().find_map(|e| match e {
+            Event::Notice { code, message } if code == "agent.compact.ok" => Some(message.clone()),
+            _ => None,
+        });
+        assert!(
+            notice.is_some(),
+            "expected agent.compact.ok notice, got events: {events:?}"
+        );
+
+        // Both scripted turns were consumed (compact + assistant).
+        assert_eq!(provider.remaining_turns(), 0);
+
+        // EarliestHalf snapshot of 5 (4 preload + run-pushed user)
+        // tombstones the first 2 in place AND inserts boundary+summary
+        // AT the boundary (after the tombstones, before preserved).
+        // Final layout (8 messages):
+        //   0: Tombstone(u1)
+        //   1: Tombstone(a1)
+        //   2: System boundary
+        //   3: User summary "[Context summary]…"
+        //   4: User u2 (preserved)
+        //   5: Assistant a2 (preserved)
+        //   6: User "trigger" (preserved fresh prompt)
+        //   7: Assistant fallback reply
+        let snap: Vec<_> = store.lock().unwrap().iter().cloned().collect();
+        assert_eq!(snap.len(), 8, "got {snap:?}");
+        assert!(matches!(snap[0], Message::Tombstone { .. }));
+        assert!(matches!(snap[1], Message::Tombstone { .. }));
+        assert!(matches!(
+            snap[2],
+            Message::System { ref text, .. } if text == crate::compact::COMPACT_BOUNDARY_TEXT
+        ));
+        match &snap[3] {
+            Message::User { content, .. } => {
+                let text = content
+                    .iter()
+                    .find_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .expect("summary user msg has text block");
+                assert!(text.starts_with("[Context summary]"));
+            }
+            other => panic!("expected User summary at index 3, got {other:?}"),
+        }
+        // Critical: the fresh "trigger" prompt sits AFTER the summary
+        // (at idx 6), so Anthropic's view (skipping Tombstone+System) is
+        // [summary-as-user, u2, a2, trigger, assistant_reply] —
+        // chronologically coherent.
+        let trigger_idx = snap.iter().position(|m| match m {
+            Message::User { content, .. } => content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { text } if text == "trigger")),
+            _ => false,
+        });
+        assert!(trigger_idx.is_some(), "fresh user turn was tombstoned away");
+        assert!(
+            trigger_idx.unwrap() > 3,
+            "fresh user prompt should sit after summary at idx 3, got {:?}",
+            trigger_idx
+        );
+        // Final assistant reply.
+        assert!(matches!(snap[7], Message::Assistant { .. }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn auto_compact_disabled_does_not_consume_provider_turn() {
+        // Only script the assistant turn. If auto-compact tried to run
+        // it would fail because the second turn's events don't parse as
+        // <analysis>/<summary>.
+        let provider = Arc::new(MockProvider::with_turns(vec![vec![
+            Event::TextDelta {
+                delta: "hello".into(),
+            },
+            Event::Result {
+                data: ResultData {
+                    stop_reason: Some("end_turn".into()),
+                    ..Default::default()
+                },
+            },
+        ]]));
+        let store = preload_store(vec![user_text("u1"), assistant_text("a1")]);
+        let qloop = compact_loop_builder(provider.clone(), store.clone())
+            .auto_compact(false)
+            .build();
+
+        let mut stream = qloop.run("trigger", AbortController::new()).await.unwrap();
+        let mut events = Vec::new();
+        while let Some(item) = stream.next().await {
+            events.push(item.unwrap());
+        }
+        // No compact notice, and the single scripted turn was consumed.
+        assert_eq!(provider.remaining_turns(), 0);
+        assert!(!events.iter().any(
+            |e| matches!(e, Event::Notice { code, .. } if code.starts_with("agent.compact."))
+        ));
+        // Store: u1, a1, trigger, assistant — 4, no tombstones.
+        let snap: Vec<_> = store.lock().unwrap().iter().cloned().collect();
+        assert_eq!(snap.len(), 4);
+        assert!(snap.iter().all(|m| !matches!(m, Message::Tombstone { .. })));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn auto_compact_failure_surfaces_notice_and_loop_continues() {
+        // Turn 0 = empty stream (compaction returns EmptyResponse).
+        // Turn 1 = regular assistant reply ending the loop.
+        let provider = Arc::new(MockProvider::with_turns(vec![
+            vec![Event::Result {
+                data: Default::default(),
+            }],
+            vec![
+                Event::TextDelta {
+                    delta: "fallback".into(),
+                },
+                Event::Result {
+                    data: ResultData {
+                        stop_reason: Some("end_turn".into()),
+                        ..Default::default()
+                    },
+                },
+            ],
+        ]));
+        // Preload 4 messages so EarliestHalf compacts 2 (≥ MIN_PARTIAL_COMPACT_TARGET).
+        let store = preload_store(vec![
+            user_text("u1"),
+            assistant_text("a1"),
+            user_text("u2"),
+            assistant_text("a2"),
+        ]);
+        let qloop = compact_loop_builder(provider.clone(), store.clone()).build();
+
+        let mut stream = qloop.run("trigger", AbortController::new()).await.unwrap();
+        let mut events = Vec::new();
+        while let Some(item) = stream.next().await {
+            events.push(item.unwrap());
+        }
+        // agent.compact.failed Notice event surfaced.
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::Notice { code, .. } if code == "agent.compact.failed"
+        )));
+        // Loop still completed with a final Result.
+        assert!(matches!(events.last(), Some(Event::Result { .. })));
+        // Both turns consumed (failed compact + assistant).
+        assert_eq!(provider.remaining_turns(), 0);
+        // Store unchanged by failed compaction (no tombstones).
+        let snap: Vec<_> = store.lock().unwrap().iter().cloned().collect();
+        assert!(snap.iter().all(|m| !matches!(m, Message::Tombstone { .. })));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pre_compact_hook_block_is_recoverable_not_fatal() {
+        // The blocking hook returns Block on PreCompact. compact_with_hooks
+        // converts that to CompactError::Aborted, but our integration
+        // distinguishes it from a real outer abort and continues.
+        let provider = Arc::new(MockProvider::with_turns(vec![vec![
+            Event::TextDelta {
+                delta: "still alive".into(),
+            },
+            Event::Result {
+                data: ResultData {
+                    stop_reason: Some("end_turn".into()),
+                    ..Default::default()
+                },
+            },
+        ]]));
+        let blocker = Arc::new(crate::hook::RustHookHandler::new(
+            "pre-compact-blocker",
+            |event| match event {
+                HookEvent::PreCompact { .. } => HookOutcome::Block,
+                _ => HookOutcome::Ok,
+            },
+        ));
+        let mut hooks = HookRunner::new();
+        hooks.register(blocker);
+
+        // Preload 4 so EarliestHalf target_count ≥ MIN_PARTIAL_COMPACT_TARGET.
+        let store = preload_store(vec![
+            user_text("u1"),
+            assistant_text("a1"),
+            user_text("u2"),
+            assistant_text("a2"),
+        ]);
+        let qloop = compact_loop_builder(provider.clone(), store.clone())
+            .hooks(Arc::new(hooks))
+            .build();
+
+        let mut stream = qloop.run("trigger", AbortController::new()).await.unwrap();
+        let mut events = Vec::new();
+        while let Some(item) = stream.next().await {
+            events.push(item.unwrap());
+        }
+        // agent.compact.blocked notice (not a fatal Aborted error).
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::Notice { code, .. } if code == "agent.compact.blocked"
+        )));
+        // Loop continued and completed normally.
+        assert!(matches!(events.last(), Some(Event::Result { .. })));
+        assert_eq!(provider.remaining_turns(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shared_compact_state_persists_failures_across_runs() {
+        // Each run() spawns a fresh drive(), but a shared
+        // Arc<Mutex<AutoCompactState>> survives across calls so that
+        // circuit-breaker counts and the no_progress latch persist.
+        // Verify by failing two compactions in run #1 (provider returns
+        // empty), then making another call: the breaker advances to 2
+        // failures rather than resetting to 0 each run.
+        let provider = Arc::new(MockProvider::with_turns(vec![
+            // run #1 turn 0 — failed compact (empty)
+            vec![Event::Result {
+                data: Default::default(),
+            }],
+            // run #1 turn 1 — assistant reply
+            vec![
+                Event::TextDelta { delta: "a".into() },
+                Event::Result {
+                    data: ResultData {
+                        stop_reason: Some("end_turn".into()),
+                        ..Default::default()
+                    },
+                },
+            ],
+            // run #2 turn 0 — failed compact (empty)
+            vec![Event::Result {
+                data: Default::default(),
+            }],
+            // run #2 turn 1 — assistant reply
+            vec![
+                Event::TextDelta { delta: "b".into() },
+                Event::Result {
+                    data: ResultData {
+                        stop_reason: Some("end_turn".into()),
+                        ..Default::default()
+                    },
+                },
+            ],
+        ]));
+        let store = preload_store(vec![
+            user_text("u1"),
+            assistant_text("a1"),
+            user_text("u2"),
+            assistant_text("a2"),
+        ]);
+        let shared_state = Arc::new(Mutex::new(AutoCompactState::new()));
+
+        let qloop = compact_loop_builder(provider.clone(), store.clone())
+            .compact_state(shared_state.clone())
+            .build();
+        let mut stream = qloop.run("first", AbortController::new()).await.unwrap();
+        while stream.next().await.is_some() {}
+
+        // After run #1: 1 compact failure recorded.
+        assert_eq!(shared_state.lock().unwrap().consecutive_failures, 1);
+
+        // Round 2: rebuild the loop sharing the same state + store.
+        let qloop2 = compact_loop_builder(provider.clone(), store.clone())
+            .compact_state(shared_state.clone())
+            .build();
+        let mut stream2 = qloop2.run("second", AbortController::new()).await.unwrap();
+        while stream2.next().await.is_some() {}
+
+        // After run #2: counter should be 2 (latched across runs).
+        assert_eq!(shared_state.lock().unwrap().consecutive_failures, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn auto_compact_skipped_when_target_below_minimum() {
+        // 3 messages total → EarliestHalf target = 1 < MIN_PARTIAL_COMPACT_TARGET.
+        // Provider scripts only the assistant turn; auto-compaction
+        // must NOT consume an extra turn.
+        let provider = Arc::new(MockProvider::with_turns(vec![vec![
+            Event::TextDelta {
+                delta: "small".into(),
+            },
+            Event::Result {
+                data: ResultData {
+                    stop_reason: Some("end_turn".into()),
+                    ..Default::default()
+                },
+            },
+        ]]));
+        let store = preload_store(vec![user_text("u1"), assistant_text("a1")]);
+        let qloop = compact_loop_builder(provider.clone(), store.clone()).build();
+        let mut stream = qloop.run("trigger", AbortController::new()).await.unwrap();
+        let mut events = Vec::new();
+        while let Some(item) = stream.next().await {
+            events.push(item.unwrap());
+        }
+        // Only the assistant turn was consumed (not a compaction turn).
+        assert_eq!(provider.remaining_turns(), 0);
+        // No compact notice fired.
+        assert!(!events.iter().any(
+            |e| matches!(e, Event::Notice { code, .. } if code.starts_with("agent.compact."))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn auto_compact_fires_at_minimum_target_boundary() {
+        // 4 messages total → EarliestHalf target = 2 == MIN_PARTIAL_COMPACT_TARGET
+        // (the equality boundary). Should fire, not skip.
+        let provider = Arc::new(MockProvider::with_turns(vec![
+            vec![
+                Event::TextDelta {
+                    delta: compact_response().into(),
+                },
+                Event::Result {
+                    data: Default::default(),
+                },
+            ],
+            vec![
+                Event::TextDelta { delta: "ok".into() },
+                Event::Result {
+                    data: ResultData {
+                        stop_reason: Some("end_turn".into()),
+                        ..Default::default()
+                    },
+                },
+            ],
+        ]));
+        // Preload 3 → run() pushes 1 → snapshot len = 4, mid = 2 == MIN.
+        let store = preload_store(vec![user_text("u1"), assistant_text("a1"), user_text("u2")]);
+        let qloop = compact_loop_builder(provider.clone(), store.clone()).build();
+        let mut stream = qloop.run("trigger", AbortController::new()).await.unwrap();
+        let mut events = Vec::new();
+        while let Some(item) = stream.next().await {
+            events.push(item.unwrap());
+        }
+        // Both turns consumed (compact + assistant).
+        assert_eq!(provider.remaining_turns(), 0);
+        // agent.compact.ok notice fired.
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::Notice { code, .. } if code == "agent.compact.ok")));
     }
 
     #[tokio::test]
@@ -958,10 +1621,7 @@ mod tests {
         let provider = Arc::new(MockProvider::with_turns(turns));
         let calls = Arc::new(AtomicUsize::new(0));
         let registry = echo_registry("echo", calls.clone());
-        let perms = Arc::new(
-            PermissionManager::new()
-                .allow(RuleSource::User, "echo"),
-        );
+        let perms = Arc::new(PermissionManager::new().allow(RuleSource::User, "echo"));
 
         let qloop = QueryLoop::builder(provider, "mock")
             .tools(registry)

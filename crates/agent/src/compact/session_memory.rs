@@ -338,9 +338,7 @@ mod tests {
         assert_eq!(entries[3].kind, SessionMemoryKind::OpenQuestion);
         // Default for unmarked is Observation.
         assert_eq!(entries[4].kind, SessionMemoryKind::Observation);
-        assert!(entries[0]
-            .text
-            .contains("Switch to spawn_blocking"));
+        assert!(entries[0].text.contains("Switch to spawn_blocking"));
     }
 
     #[test]

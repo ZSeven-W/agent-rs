@@ -46,8 +46,10 @@ pub use auto::{
     ERROR_THRESHOLD_BUFFER_TOKENS, MANUAL_COMPACT_BUFFER_TOKENS,
     MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES, WARNING_THRESHOLD_BUFFER_TOKENS,
 };
-pub use microcompact::{
-    microcompact, MicrocompactConfig, MicrocompactResult, CLEARED_PLACEHOLDER,
+pub use grouping::{group_messages, safe_split_index, GroupKind, MessageGroup};
+pub use microcompact::{microcompact, MicrocompactConfig, MicrocompactResult, CLEARED_PLACEHOLDER};
+pub use post_cleanup::{
+    build_post_compact_message, FileAttachment, PostCompactConfig, PostCompactResult,
 };
 pub use prompt::{
     parse_summary_response, summarization_prompt, ParseSummaryError, ParsedSummary,
@@ -56,10 +58,6 @@ pub use prompt::{
 pub use session_memory::{
     extract_memories_from_analysis, promote_to_store, InMemoryStore, JsonlMemoryStore,
     SessionMemoryEntry, SessionMemoryError, SessionMemoryKind, SessionMemoryStore,
-};
-pub use grouping::{group_messages, safe_split_index, GroupKind, MessageGroup};
-pub use post_cleanup::{
-    build_post_compact_message, FileAttachment, PostCompactConfig, PostCompactResult,
 };
 pub use summarize::{
     apply_compaction_to_store, compact_conversation, CompactError, CompactionResult,
@@ -78,9 +76,10 @@ const BOUNDARY_MARKER_TEXT: &str = "CONTEXT SUMMARY BELOW";
 /// budget triage (sliding window + compact decisions).
 pub fn estimate_tokens(msg: &Message) -> u32 {
     match msg {
-        Message::User { content, .. } | Message::Assistant { content, .. } => {
-            content.iter().map(estimate_block_tokens).fold(0, u32::saturating_add)
-        }
+        Message::User { content, .. } | Message::Assistant { content, .. } => content
+            .iter()
+            .map(estimate_block_tokens)
+            .fold(0, u32::saturating_add),
         Message::System { text, .. }
         | Message::Progress { note: text, .. }
         | Message::Tombstone { reason: text, .. } => estimate_text_tokens(text).saturating_add(2),
@@ -101,9 +100,7 @@ fn estimate_block_tokens(block: &ContentBlock) -> u32 {
             ImageSource::Url { url } => estimate_text_tokens(url).saturating_add(8),
         },
         ContentBlock::ToolUse { id, name, input } => {
-            let json_len = serde_json::to_string(input)
-                .map(|s| s.len())
-                .unwrap_or(0);
+            let json_len = serde_json::to_string(input).map(|s| s.len()).unwrap_or(0);
             estimate_text_tokens(id)
                 .saturating_add(estimate_text_tokens(name))
                 .saturating_add((json_len as u32) / 4)
@@ -116,17 +113,16 @@ fn estimate_block_tokens(block: &ContentBlock) -> u32 {
         } => {
             let inner = match content {
                 ToolResultContent::Text(t) => estimate_text_tokens(t),
-                ToolResultContent::Blocks(bs) => {
-                    bs.iter().map(estimate_block_tokens).fold(0, u32::saturating_add)
-                }
+                ToolResultContent::Blocks(bs) => bs
+                    .iter()
+                    .map(estimate_block_tokens)
+                    .fold(0, u32::saturating_add),
             };
             estimate_text_tokens(tool_use_id)
                 .saturating_add(inner)
                 .saturating_add(4)
         }
-        ContentBlock::Thinking { thinking, .. } => {
-            estimate_text_tokens(thinking).saturating_add(2)
-        }
+        ContentBlock::Thinking { thinking, .. } => estimate_text_tokens(thinking).saturating_add(2),
     }
 }
 

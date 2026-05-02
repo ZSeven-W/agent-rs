@@ -329,9 +329,21 @@ mod tests {
         let req_b = PendingRequest::new("ok-2", "T", serde_json::json!({}));
         let req_c = PendingRequest::new("bad-3", "T", serde_json::json!({}));
         let (a, b, c) = tokio::join!(
-            ps.request(&req_a, Duration::from_millis(2000), Duration::from_millis(20)),
-            ps.request(&req_b, Duration::from_millis(2000), Duration::from_millis(20)),
-            ps.request(&req_c, Duration::from_millis(2000), Duration::from_millis(20)),
+            ps.request(
+                &req_a,
+                Duration::from_millis(2000),
+                Duration::from_millis(20)
+            ),
+            ps.request(
+                &req_b,
+                Duration::from_millis(2000),
+                Duration::from_millis(20)
+            ),
+            ps.request(
+                &req_c,
+                Duration::from_millis(2000),
+                Duration::from_millis(20)
+            ),
         );
         leader_task.await.unwrap();
 
@@ -353,8 +365,12 @@ mod tests {
         // Write newer first to verify sort.
         let p_newer = ps.pending_dir().join(format!("{}.json", newer.id));
         let p_older = ps.pending_dir().join(format!("{}.json", older.id));
-        fs::write(&p_newer, serde_json::to_vec(&newer).unwrap()).await.unwrap();
-        fs::write(&p_older, serde_json::to_vec(&older).unwrap()).await.unwrap();
+        fs::write(&p_newer, serde_json::to_vec(&newer).unwrap())
+            .await
+            .unwrap();
+        fs::write(&p_older, serde_json::to_vec(&older).unwrap())
+            .await
+            .unwrap();
 
         let drained = ps.drain_pending().await.unwrap();
         assert_eq!(drained.len(), 2);

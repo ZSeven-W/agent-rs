@@ -58,10 +58,15 @@ pub fn group_messages(messages: &[Message]) -> Vec<MessageGroup> {
                 // any matching tool_result?
                 let next_idx = i + 1;
                 if next_idx < messages.len() {
-                    if let Message::User { content: next_content, .. } = &messages[next_idx] {
+                    if let Message::User {
+                        content: next_content,
+                        ..
+                    } = &messages[next_idx]
+                    {
                         let assistant_ids = collect_tool_use_ids(content);
                         let result_ids = collect_tool_result_ids(next_content);
-                        if !assistant_ids.is_empty() && assistant_ids.iter().any(|id| result_ids.contains(id))
+                        if !assistant_ids.is_empty()
+                            && assistant_ids.iter().any(|id| result_ids.contains(id))
                         {
                             out.push(MessageGroup {
                                 start: i,
@@ -217,7 +222,10 @@ mod tests {
 
     #[test]
     fn assistant_with_tool_use_no_result_is_assistant_only() {
-        let msgs = vec![assistant_with_tool_use("tu_1", "calc"), assistant_text("hi")];
+        let msgs = vec![
+            assistant_with_tool_use("tu_1", "calc"),
+            assistant_text("hi"),
+        ];
         let groups = group_messages(&msgs);
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].kind, GroupKind::AssistantOnly);
