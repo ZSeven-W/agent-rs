@@ -61,8 +61,8 @@ const MAX_REDIRECTS: usize = 5;
 #[derive(Debug)]
 pub struct WebFetchTool {
     /// Used only when `allow_private_networks: true`. The default
-    /// secure path builds a fresh client per hop with the resolved
-    /// IP pinned via `Client::builder().resolve()`.
+    /// secure path builds a fresh client per hop with all resolved
+    /// IPs pinned via `Client::builder().resolve_to_addrs()`.
     fallback_client: reqwest::Client,
 }
 
