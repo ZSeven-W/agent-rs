@@ -8,6 +8,7 @@
 #![warn(missing_debug_implementations, rust_2018_idioms)]
 
 pub mod abort;
+pub mod api;
 pub mod compact;
 pub mod context;
 pub mod error;

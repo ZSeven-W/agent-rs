@@ -46,6 +46,9 @@ schemars = "1.2"
 
 bytes = "1"
 
+# Used by api::retry (decorrelated jitter) — small, well-maintained.
+rand = "0.8"
+
 tempfile = "3"
 assert_fs = "1"
 

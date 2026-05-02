@@ -51,6 +51,8 @@ uuid = { workspace = true }
 # state cache that ship as core API surface)
 schemars = { workspace = true }
 lru = { workspace = true }
+# Used by api::retry decorrelated jitter — always on, very small.
+rand = { workspace = true }
 
 # Feature-gated optional deps
 reqwest = { workspace = true, optional = true }
