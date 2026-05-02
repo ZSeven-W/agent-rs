@@ -395,9 +395,19 @@ mod tests {
             .await
             .unwrap();
         let path = mb.path();
-        assert!(path
-            .to_string_lossy()
-            .contains("teams/design-squad/inboxes"));
+        // Walk components rather than substring-matching the rendered
+        // path — Windows uses `\` while Unix uses `/`, so a literal
+        // "teams/design-squad/inboxes" would not match on Windows CI.
+        let comps: Vec<String> = path
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        let teams_idx = comps
+            .iter()
+            .position(|c| c == "teams")
+            .expect("path missing `teams` component");
+        assert_eq!(comps.get(teams_idx + 1).map(String::as_str), Some("design-squad"));
+        assert_eq!(comps.get(teams_idx + 2).map(String::as_str), Some("inboxes"));
         assert!(path
             .file_name()
             .unwrap()
