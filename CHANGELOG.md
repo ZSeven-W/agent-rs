@@ -128,18 +128,57 @@ versions when `0.1.0` ships.
   `regex` + `ignore`.
 - FS pack *(feature `fs`)*: `FileReadTool` (cat -n style line
   numbers, offset/limit defaults 1/2000), `FileWriteTool`
-  (idempotent on identical content), `FileEditTool` (refuses
-  ambiguous matches unless `replace_all`), `ListDirTool`,
+  (idempotent on identical content; bounded read on the no-op
+  comparison), `FileEditTool` (refuses ambiguous matches unless
+  `replace_all`; pre-read stat + post-edit size cap), `ListDirTool`,
   `MkdirTool`, `MoveTool` (refuses to clobber unless `overwrite`),
-  `RemoveTool` (`Destructive`).
+  `RemoveTool` (`Destructive`). All read paths bounded by
+  `read_with_cap` so a TOCTOU file grow can't OOM the process.
 - Search pack *(feature `search`)*: `GrepTool` — regex over file
   contents, `ignore::WalkBuilder` for gitignore-aware traversal.
   `RegexBuilder::size_limit` cap (10 MiB) rejects pathological
   patterns at compile time. `tokio::task::spawn_blocking` worker
-  polls the abort token at every file boundary.
+  polls the abort token at every file boundary. Symlink-escape
+  guard via `entry.file_type()` + canonicalize-and-recheck
+  containment, plus a sync `read_file_capped` helper so a TOCTOU
+  grow doesn't sneak past the policy cap.
   `GlobTool` — shell glob with `*` / `**` / `?`. Splits on `/` AND
   `\` so Windows paths match. Adjacent `**` segments are collapsed
-  to bound otherwise-exponential backtracking.
+  to bound otherwise-exponential backtracking. Same symlink-escape
+  guard as `GrepTool`.
+- Shell pack *(feature `shell`)*: `BashTool` runs `/bin/sh -c`
+  (Unix) / `cmd /C` (Windows). Per-stream output capture via a
+  `VecDeque<u8>` ring buffer (constant memory regardless of output
+  size, tail preserved, `*_truncated` flags). Tail trimmed to a
+  valid UTF-8 boundary before formatting. Default 60 s timeout, hard
+  ceiling 600 s. On Unix, the child is placed in its own process
+  group (`Command::process_group(0)`) so a `/bin/kill -9 -<pgid>`
+  on timeout / abort kills descendants too — `kill_on_drop(true)`
+  alone wouldn't.
+- Web pack *(feature `web`)*: `WebFetchTool` HTTP GET → text /
+  HTML. SSRF guard with full DNS-rebinding mitigation: pre-flight
+  `tokio::net::lookup_host`, every resolved address screened
+  (loopback / RFC 1918 / IPv4 link-local incl. cloud metadata
+  169.254.169.254 / IPv4 broadcast / multicast / IPv6 fc00::/7
+  unique-local / IPv6 fe80::/10 link-local / IPv4-mapped IPv6 of
+  any of the above), then **all** validated addresses pinned via
+  `Client::builder().resolve_to_addrs()` so reqwest's connect-time
+  DNS lookup can't swap to a private IP. Auto-redirects disabled
+  (`Policy::none()`); the redirect chain is walked manually with
+  per-hop SSRF re-validation, capped at 5 hops, sharing a single
+  `Instant`-based deadline so DNS + redirects can't bypass the
+  caller's timeout. Default 30 s timeout (max 120 s), 5 MiB body
+  cap (hard ceiling 50 MiB). HTML→text strips `<script>` /
+  `<style>` / `<noscript>` and decodes named + numeric entities.
+  `allow_private_networks: true` opts out of the guard for hosts
+  that legitimately need intranet access.
+- Todo pack *(feature `todo`)*: `TodoWriteTool` — in-memory shared
+  planning list with the same surface as Claude Code's TodoWrite.
+  Replaces the list wholesale on each call; emits per-status
+  counts; synthesizes ids for items missing one; `with_fresh_state()`
+  hands the host a clonable `TodoState` handle for UI binding.
+  `TodoStatus` is `#[non_exhaustive]` so future variants aren't a
+  SemVer break.
 - Discovery (always-on): `ToolSearchTool` modeled on Claude Code's
   deferred-discovery pattern. Two query forms — `select:Name1,Name2`
   for direct selection, or a bare keyword for scored search across
@@ -148,11 +187,17 @@ versions when `0.1.0` ships.
   Case-insensitive bare-name fallback.
 - Shared `WorkspacePolicy` (path containment, file-size cap, symlink
   rules). `register_default(registry, policy)` bulk-registers every
-  enabled tool. `WorkspacePolicy::resolve(must_exist=false)` walks
-  up to the first existing ancestor and reattaches the missing tail
-  lexically — supports `mkdir -p`-style writes whose parent doesn't
-  exist yet, while keeping the canonicalize-then-containment-check
-  guarantee for the existing prefix.
+  enabled tool; `register_default_with_todo(..., todo_state)`
+  variant lets the host keep the `TodoState` handle (a
+  `tracing::warn!` fires when `todo` is enabled but the plain
+  `register_default` is used so the handle isn't silently lost).
+  `WorkspacePolicy::resolve(must_exist=false)` walks up to the
+  first existing ancestor and reattaches the missing tail
+  lexically (rejecting any non-`Component::Normal` segment) —
+  supports `mkdir -p`-style writes whose parent doesn't exist yet,
+  while keeping the canonicalize-then-containment-check guarantee
+  for the existing prefix and refusing `..` smuggling through the
+  unresolved tail.
 
 #### Repo + tooling
 
@@ -164,31 +209,10 @@ versions when `0.1.0` ships.
 
 ### Tests
 
-804 unit + 14 integration + 1 prelude smoke + 5 doc tests. 4 are
-`#[ignore]`-gated and only run when their corresponding env var is
-set (Anthropic, OpenAI, Ollama, Anthropic Files real-API smoke
-tests). `cargo clippy --workspace --all-targets --all-features
--D warnings` clean. `cargo fmt --all -- --check` clean.
-
-### Adversarial review process
-
-Every meaningful diff is run through Codex (or equivalent) review,
-typically twice — round 1 catches bugs in the new code, round 2
-catches the regressions introduced by round 1's fixes. Roughly half
-of commit messages name the bug each round caught. Notable catches
-across the work so far:
-
-- async permission path silently ignored structured matchers
-  (round 1).
-- `RmcpConnection::call_tool` held the service mutex across the
-  network await, deadlocking `close()` during slow RPCs (round 1).
-- `CostTracker::observe_event` double-counted cumulative `Usage`
-  reports (round 1); fix introduced a warm-cache same-cumulative
-  undercharge (round 2).
-- Anthropic `ToolResult` rendering silently dropped `Document` blocks
-  (round 1); same path also dropped multimodal blocks in
-  OpenAI/Ollama plain-text fallback (round 1, round 2 expanded).
-- Glob matcher only split on `/`, breaking Windows path separators
-  (round 1).
-- Authorization header was unconditionally rewritten as Bearer auth
-  in the MCP HTTP transport (round 1).
+743 unit (agent) + 101 unit (agent-tools-code) + 13 integration +
+1 prelude smoke + 5 doc tests. 4 are `#[ignore]`-gated and only
+run when their corresponding env var is set (Anthropic, OpenAI,
+Ollama, Anthropic Files real-API smoke tests). `cargo clippy
+--workspace --all-targets --all-features -D warnings` clean.
+`cargo fmt --all -- --check` clean. CI green on Linux + macOS +
+Windows.

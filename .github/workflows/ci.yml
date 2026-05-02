@@ -60,14 +60,25 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace --no-default-features
-      - run: cargo check --workspace --no-default-features --features anthropic
-      - run: cargo check --workspace --no-default-features --features openai
-      - run: cargo check --workspace --no-default-features --features ollama
-      - run: cargo check --workspace --no-default-features --features mcp
-      - run: cargo check --workspace --no-default-features --features session-jsonl
-      - run: cargo check --workspace --no-default-features --features swarm
-      - run: cargo check --workspace --no-default-features --features full
+      # `agent` crate features
+      - run: cargo check -p agent --no-default-features
+      - run: cargo check -p agent --no-default-features --features anthropic
+      - run: cargo check -p agent --no-default-features --features openai
+      - run: cargo check -p agent --no-default-features --features ollama
+      - run: cargo check -p agent --no-default-features --features mcp
+      - run: cargo check -p agent --no-default-features --features session-jsonl
+      - run: cargo check -p agent --no-default-features --features swarm
+      - run: cargo check -p agent --no-default-features --features full
+      # `agent-tools-code` companion features — make sure each pack
+      # builds in isolation so a host that only opts into `shell` or
+      # `web` doesn't get tripped by some other feature's deps.
+      - run: cargo check -p agent-tools-code --no-default-features
+      - run: cargo check -p agent-tools-code --no-default-features --features fs
+      - run: cargo check -p agent-tools-code --no-default-features --features search
+      - run: cargo check -p agent-tools-code --no-default-features --features shell
+      - run: cargo check -p agent-tools-code --no-default-features --features web
+      - run: cargo check -p agent-tools-code --no-default-features --features todo
+      - run: cargo check -p agent-tools-code --no-default-features --features all
 
   deny:
     name: cargo deny

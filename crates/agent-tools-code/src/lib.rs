@@ -91,7 +91,15 @@ pub use web::WebFetchTool;
 
 use std::sync::Arc;
 
-use agent::tool::{Tool, ToolRegistry};
+#[cfg(any(
+    feature = "fs",
+    feature = "search",
+    feature = "shell",
+    feature = "web",
+    feature = "todo"
+))]
+use agent::tool::Tool;
+use agent::tool::ToolRegistry;
 
 /// Register every enabled tool against a `ToolRegistry` using a
 /// shared [`WorkspacePolicy`]. Convenience for hosts that want the

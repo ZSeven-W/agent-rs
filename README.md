@@ -7,7 +7,7 @@
 Multi-provider · tool-capable end-to-end · structured permissions · real MCP · zero `unsafe`.
 
 [![CI](https://img.shields.io/github/actions/workflow/status/ZSeven-W/agent-rs/ci.yml?branch=main&style=flat&logo=github-actions&logoColor=white&label=CI)](https://github.com/ZSeven-W/agent-rs/actions)
-[![Tests](https://img.shields.io/badge/tests-837_passing-brightgreen?style=flat)](#testing)
+[![Tests](https://img.shields.io/badge/tests-863_passing-brightgreen?style=flat)](#testing)
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange?style=flat&logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![Unsafe](https://img.shields.io/badge/unsafe-forbidden-success?style=flat&logo=rust&logoColor=white)](https://github.com/ZSeven-W/agent-rs/blob/main/crates/agent/src/lib.rs)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat)](./LICENSE)
@@ -264,7 +264,7 @@ A shared `WorkspacePolicy` enforces path containment, file-size caps, and symlin
 
 ```sh
 cargo test --workspace --all-features
-# 837 passing · 14 integration · 5 doc · 4 ignored (real-API gates)
+# 844 unit · 13 integration · 5 doc · 4 ignored (real-API gates)
 
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
@@ -277,7 +277,7 @@ The 4 `#[ignore]`-gated tests hit real APIs (Anthropic / OpenAI / Ollama / Anthr
 
 ## Status
 
-This is a **pre-release** project — every change lives under `Unreleased` in [`CHANGELOG.md`](./CHANGELOG.md) until `0.1.0` ships. The runtime API surface has stabilized and 837 tests guard it; the open work is wiring more tools into the optional companion crate and tagging a release.
+This is a **pre-release** project — every change lives under `Unreleased` in [`CHANGELOG.md`](./CHANGELOG.md) until `0.1.0` ships. The runtime API surface has stabilized and 863 tests guard it; the open work is wiring more tools into the optional companion crate and tagging a release.
 
 See [`openpencil-docs/agent-rs/notes/2026-05-02-claude-code-non-tui-gaps.md`](https://github.com/ZSeven-W/openpencil-docs/blob/main/agent-rs/notes/2026-05-02-claude-code-non-tui-gaps.md) for what's intentionally host-side vs. what's pending.
 
