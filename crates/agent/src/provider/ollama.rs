@@ -2,8 +2,10 @@
 //!
 //! Wraps `ollama-rs` 0.3 to talk to a local (or remote) Ollama
 //! daemon. Streams text deltas from `send_chat_messages_stream`;
-//! tool calling is documented but capability-flagged off until
-//! [`crate::provider::StreamRequest`] gains a `tools` field.
+//! tool calls are surfaced from `response.message.tool_calls` and
+//! emitted as [`crate::stream::Event::ToolUse`]. Synthetic ids
+//! (`ollama_tc_<n>`) bridge Ollama's id-less ToolCall to the
+//! [`crate::tool::Tool`] dispatch loop, which is id-based.
 //!
 //! Feature-gated behind `ollama`.
 
@@ -13,13 +15,14 @@ use async_trait::async_trait;
 use futures::channel::mpsc;
 use futures::StreamExt;
 use ollama_rs::generation::chat::request::ChatMessageRequest;
-use ollama_rs::generation::chat::ChatMessage;
+use ollama_rs::generation::chat::{ChatMessage, MessageRole};
+use ollama_rs::generation::tools::{ToolCall, ToolCallFunction, ToolInfo};
 use ollama_rs::Ollama;
 
 use crate::abort::AbortController;
 use crate::error::AgentError;
 use crate::message::{ContentBlock, Message, ToolResultContent};
-use crate::provider::{Provider, ProviderCapabilities, StreamRequest};
+use crate::provider::{Provider, ProviderCapabilities, StreamRequest, ToolChoice, ToolDefinition};
 use crate::stream::{Event, EventStream, ResultData};
 
 const DEFAULT_HOST: &str = "http://localhost";
@@ -65,11 +68,9 @@ impl OllamaProvider {
         Self {
             config,
             capabilities: ProviderCapabilities {
-                // Ollama supports tools on the wire (ChatMessageRequest
-                // has a `tools` field) but our StreamRequest doesn't
-                // surface tool definitions yet — flip on when that
-                // arrives. Same scope boundary as openai_compat.rs.
-                supports_tool_use: false,
+                // tools are wired through `ChatMessageRequest::tools`
+                // and tool_calls are surfaced from streaming responses.
+                supports_tool_use: true,
                 supports_prompt_caching: false,
                 supports_thinking: false,
                 // Ollama context cap is per-model; this is a sane
@@ -110,7 +111,26 @@ impl Provider for OllamaProvider {
 
         let messages = render_messages(&req.system, &req.messages);
         let request_model = req.model.clone();
-        let request = ChatMessageRequest::new(request_model.clone(), messages);
+        // ToolChoice::None is honored by simply not sending tools; the
+        // other variants don't have a wire representation in Ollama —
+        // the daemon decides on its own whether to call. We log the
+        // unsupported variants at trace level for diagnosability.
+        let suppress_tools = matches!(req.tool_choice, Some(ToolChoice::None));
+        let mut request = ChatMessageRequest::new(request_model.clone(), messages);
+        if !req.tools.is_empty() && !suppress_tools {
+            let tools = render_tools(&req.tools)
+                .map_err(|e| AgentError::provider("ollama", format!("invalid tool schema: {e}")))?;
+            request = request.tools(tools);
+            if let Some(choice) = &req.tool_choice {
+                if !matches!(choice, ToolChoice::Auto) {
+                    tracing::trace!(
+                        target: "agent::provider::ollama",
+                        ?choice,
+                        "Ollama has no tool_choice on the wire; ignored"
+                    );
+                }
+            }
+        }
 
         let mut sse = client
             .send_chat_messages_stream(request)
@@ -123,6 +143,10 @@ impl Provider for OllamaProvider {
         tokio::spawn(async move {
             let mut model: Option<String> = None;
             let mut last_done = false;
+            // Ollama's `ToolCall` has no id field (the daemon matches
+            // by message position), so we synthesize stable IDs for
+            // downstream `tool_result` correlation.
+            let mut tool_call_seq: u32 = 0;
 
             loop {
                 tokio::select! {
@@ -144,6 +168,15 @@ impl Provider for OllamaProvider {
                                 if !text.is_empty() {
                                     let _ = tx.unbounded_send(Ok(Event::TextDelta {
                                         delta: text,
+                                    }));
+                                }
+                                for tc in response.message.tool_calls {
+                                    let id = format!("ollama_tc_{tool_call_seq}");
+                                    tool_call_seq += 1;
+                                    let _ = tx.unbounded_send(Ok(Event::ToolUse {
+                                        id,
+                                        name: tc.function.name,
+                                        input: tc.function.arguments,
                                     }));
                                 }
                                 if response.done {
@@ -181,6 +214,35 @@ impl Provider for OllamaProvider {
 
         Ok(Box::new(rx))
     }
+}
+
+/// Convert provider-neutral tool definitions into ollama-rs `ToolInfo`.
+///
+/// `ToolInfo::new::<P, T>()` is `pub(crate)` and requires a compile-time
+/// `Parameters` type, so we round-trip through JSON to construct the
+/// `Schema`-bearing struct without a custom schemars type. `ToolInfo`
+/// implements `Deserialize` and the inner `Schema(Value)` accepts any
+/// JSON Schema object.
+fn render_tools(tools: &[ToolDefinition]) -> Result<Vec<ToolInfo>, serde_json::Error> {
+    tools
+        .iter()
+        .map(|t| {
+            // ollama-rs `ToolType` is a unit enum derived as PascalCase
+            // for both serialize and deserialize, so the tag is the
+            // literal string "Function" — not "function". Round-tripping
+            // through JSON is the only public way to construct
+            // `ToolInfo` (its `new::<P,T>()` constructor is `pub(crate)`
+            // and demands a compile-time `Parameters` type).
+            serde_json::from_value::<ToolInfo>(serde_json::json!({
+                "type": "Function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.input_schema,
+                },
+            }))
+        })
+        .collect()
 }
 
 fn render_messages(system: &Option<String>, messages: &[Message]) -> Vec<ChatMessage> {
@@ -223,15 +285,30 @@ fn render_messages(system: &Option<String>, messages: &[Message]) -> Vec<ChatMes
             }
             Message::Assistant { content, .. } => {
                 let text = content_to_plain_text(content);
-                if !text.is_empty() {
-                    out.push(ChatMessage::assistant(text));
+                let tool_calls: Vec<ToolCall> = content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::ToolUse { name, input, .. } => Some(ToolCall {
+                            function: ToolCallFunction {
+                                name: name.clone(),
+                                arguments: input.clone(),
+                            },
+                        }),
+                        _ => None,
+                    })
+                    .collect();
+                // Skip emitting the assistant message altogether if it
+                // would carry no content AND no tool_calls — pushing a
+                // blank ChatMessage would be wire-rejected by Ollama.
+                if !text.is_empty() || !tool_calls.is_empty() {
+                    out.push(ChatMessage {
+                        role: MessageRole::Assistant,
+                        content: text,
+                        tool_calls,
+                        images: None,
+                        thinking: None,
+                    });
                 }
-                // Tool_use blocks: Ollama's ChatMessage doesn't have a
-                // dedicated tool_calls field exposed at this trait
-                // level; capability flag is off and we don't emit a
-                // text marker (would mislead the model). When tools
-                // are wired through StreamRequest, build the typed
-                // tool_calls payload then.
             }
             Message::System { text, .. } => {
                 out.push(ChatMessage::system(text.clone()));
@@ -292,12 +369,100 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_are_conservative() {
+    fn capabilities_advertise_tool_use() {
+        // tools are now wired through ChatMessageRequest::tools().
+        // Caching and thinking remain off — Ollama daemon doesn't
+        // expose either at the wire level.
         let p = OllamaProvider::local();
         let caps = p.capabilities();
-        assert!(!caps.supports_tool_use);
+        assert!(caps.supports_tool_use);
         assert!(!caps.supports_prompt_caching);
         assert!(!caps.supports_thinking);
+    }
+
+    #[test]
+    fn render_tools_produces_valid_tool_info() {
+        let defs = vec![ToolDefinition::new(
+            "calc",
+            "perform arithmetic",
+            serde_json::json!({"type": "object", "properties": {"a": {"type": "number"}}}),
+        )];
+        let tools = render_tools(&defs).expect("render");
+        assert_eq!(tools.len(), 1);
+        // Round-trip through serde to inspect the wire shape.
+        let json = serde_json::to_value(&tools[0]).expect("serialize");
+        assert_eq!(json["type"], "Function");
+        assert_eq!(json["function"]["name"], "calc");
+        assert_eq!(json["function"]["description"], "perform arithmetic");
+        assert_eq!(json["function"]["parameters"]["type"], "object");
+    }
+
+    #[test]
+    fn render_messages_assistant_tool_use_becomes_tool_calls() {
+        // Round-trip through the renderer must preserve tool_use blocks
+        // as Ollama tool_calls so the next turn's tool_result has
+        // something to refer back to. Previously this was dropped
+        // silently — bug (j) from codex round-2 review.
+        let messages = vec![Message::Assistant {
+            header: Header::new(),
+            content: vec![
+                ContentBlock::Text {
+                    text: "let me think...".into(),
+                },
+                ContentBlock::ToolUse {
+                    id: "tu_42".into(),
+                    name: "calc".into(),
+                    input: serde_json::json!({"a": 1}),
+                },
+            ],
+        }];
+        let rendered = render_messages(&None, &messages);
+        assert_eq!(rendered.len(), 1);
+        assert_eq!(rendered[0].role, MessageRole::Assistant);
+        assert_eq!(rendered[0].content, "let me think...");
+        assert_eq!(rendered[0].tool_calls.len(), 1);
+        assert_eq!(rendered[0].tool_calls[0].function.name, "calc");
+        assert_eq!(
+            rendered[0].tool_calls[0].function.arguments,
+            serde_json::json!({"a": 1})
+        );
+    }
+
+    #[test]
+    fn render_messages_assistant_tool_use_without_text_still_renders() {
+        // An assistant turn that's tool-use only (no preceding text)
+        // must still surface as a ChatMessage with tool_calls populated.
+        let messages = vec![Message::Assistant {
+            header: Header::new(),
+            content: vec![ContentBlock::ToolUse {
+                id: "tu_1".into(),
+                name: "search".into(),
+                input: serde_json::json!({"q": "rust"}),
+            }],
+        }];
+        let rendered = render_messages(&None, &messages);
+        assert_eq!(rendered.len(), 1);
+        assert_eq!(rendered[0].content, "");
+        assert_eq!(rendered[0].tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn render_tools_rejects_non_object_schema() {
+        // schemars 1.x's Schema validates shape — a bare boolean false
+        // is a valid Schema (matches nothing) but a non-object/non-bool
+        // payload should be rejected. We don't enforce object-ness
+        // ourselves; we surface whatever Schema's validator says.
+        let defs = vec![ToolDefinition::new(
+            "bad",
+            "",
+            serde_json::Value::Number(serde_json::Number::from(7)),
+        )];
+        let err = render_tools(&defs).expect_err("number is not a valid schema");
+        let msg = err.to_string();
+        assert!(
+            msg.to_ascii_lowercase().contains("schema") || msg.contains("expected"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]

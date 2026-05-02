@@ -21,6 +21,8 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
+use crate::provider::ToolDefinition;
+
 /// Snapshot of the prompt-cache-affecting inputs. Equal snapshots
 /// hit cache; any difference breaks it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +57,23 @@ impl PromptCacheState {
             system_hash: String::new(),
             tool_schema_hash: String::new(),
             beta_headers: BTreeSet::new(),
+        }
+    }
+
+    /// Convenience: build a state from a system prompt + a list of tool
+    /// definitions + beta headers. The tool schema hash is computed by
+    /// [`fingerprint_tools`] (canonical name-sorted JSON + FNV-1a 64).
+    /// The system prompt is hashed identically so the result is fully
+    /// self-contained.
+    pub fn fingerprint(
+        system: &str,
+        tools: &[ToolDefinition],
+        beta_headers: impl IntoIterator<Item = String>,
+    ) -> Self {
+        Self {
+            system_hash: fingerprint_string(system),
+            tool_schema_hash: fingerprint_tools(tools),
+            beta_headers: beta_headers.into_iter().collect(),
         }
     }
 
@@ -105,6 +124,116 @@ impl PromptCacheState {
             });
         }
         None
+    }
+}
+
+/// FNV-1a 64-bit hash with the standard offset basis. Returns hex
+/// without leading zeros so two structurally-distinct inputs produce
+/// different strings even when the underlying numeric hashes start
+/// with leading zeros.
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = OFFSET;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(PRIME);
+    }
+    h
+}
+
+/// Stable fingerprint of a single string. Used for the system prompt;
+/// the format is `"sys-<hex>"` so a `tool_schema_hash` that happens to
+/// match a numeric system hash never collides.
+pub fn fingerprint_string(s: &str) -> String {
+    format!("sys-{:016x}", fnv1a_64(s.as_bytes()))
+}
+
+/// Stable fingerprint of a tool schema set. The fingerprint is
+/// invariant under both registration order AND object-key insertion
+/// order inside the input schemas:
+///
+/// 1. Tools are sorted by name.
+/// 2. Each tool's `input_schema` is recursively canonicalized so all
+///    JSON object keys appear in lexicographic order. (This matters
+///    because `ollama-rs` enables `serde_json/preserve_order`, which
+///    would otherwise let two equivalent schemas hash differently
+///    depending on insertion order.)
+/// 3. The canonical JSON bytes are FNV-1a-64 hashed and rendered as a
+///    `tools-<hex>` string for symmetry with [`fingerprint_string`].
+///
+/// FNV-1a is not a cryptographic hash — it's used here for a
+/// best-effort cache-break signal, not a security boundary.
+pub fn fingerprint_tools(tools: &[ToolDefinition]) -> String {
+    if tools.is_empty() {
+        return "tools-empty".to_string();
+    }
+    let mut sorted: Vec<&ToolDefinition> = tools.iter().collect();
+    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut canonical = String::with_capacity(64 * sorted.len());
+    canonical.push('[');
+    for (i, t) in sorted.iter().enumerate() {
+        if i > 0 {
+            canonical.push(',');
+        }
+        canonical.push_str("{\"name\":");
+        if let Ok(s) = serde_json::to_string(&t.name) {
+            canonical.push_str(&s);
+        }
+        canonical.push_str(",\"description\":");
+        if let Ok(s) = serde_json::to_string(&t.description) {
+            canonical.push_str(&s);
+        }
+        canonical.push_str(",\"input_schema\":");
+        write_canonical(&mut canonical, &t.input_schema);
+        canonical.push('}');
+    }
+    canonical.push(']');
+    format!("tools-{:016x}", fnv1a_64(canonical.as_bytes()))
+}
+
+/// Recursively serialize a `serde_json::Value` with object keys sorted
+/// lexicographically by Unicode scalar value. Other shapes are
+/// delegated to `serde_json::to_string` (which is itself stable for
+/// arrays / strings / numbers / bools / nulls — only object key order
+/// is feature-flagged through `preserve_order`).
+fn write_canonical(out: &mut String, v: &serde_json::Value) {
+    match v {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            out.push('{');
+            for (i, k) in keys.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                // Use serde_json's escaping for the key by serializing
+                // a String Value to a string and appending.
+                if let Ok(key_json) = serde_json::to_string(k) {
+                    out.push_str(&key_json);
+                }
+                out.push(':');
+                write_canonical(out, &map[*k]);
+            }
+            out.push('}');
+        }
+        serde_json::Value::Array(arr) => {
+            out.push('[');
+            for (i, item) in arr.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_canonical(out, item);
+            }
+            out.push(']');
+        }
+        // Strings / numbers / bools / null have a single canonical
+        // serialization in JSON; defer to serde_json.
+        _ => {
+            if let Ok(s) = serde_json::to_string(v) {
+                out.push_str(&s);
+            }
+        }
     }
 }
 
@@ -310,6 +439,87 @@ mod tests {
         // First observe after reset is a baseline, not a break.
         assert!(t.observe(s("h99", "t99", &["b99"])).is_none());
         assert_eq!(t.break_count, 1, "reset preserves lifetime metrics");
+    }
+
+    #[test]
+    fn fingerprint_tools_is_order_invariant() {
+        let a = ToolDefinition::new("alpha", "first", serde_json::json!({"type": "object"}));
+        let b = ToolDefinition::new("beta", "second", serde_json::json!({"type": "object"}));
+        let h1 = fingerprint_tools(&[a.clone(), b.clone()]);
+        let h2 = fingerprint_tools(&[b, a]);
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn fingerprint_tools_changes_when_schema_changes() {
+        let a = ToolDefinition::new("t", "d", serde_json::json!({"type": "object"}));
+        let b = ToolDefinition::new(
+            "t",
+            "d",
+            serde_json::json!({"type": "object", "properties": {"x": {"type": "number"}}}),
+        );
+        assert_ne!(fingerprint_tools(&[a]), fingerprint_tools(&[b]));
+    }
+
+    #[test]
+    fn fingerprint_tools_invariant_under_object_key_order() {
+        // With serde_json/preserve_order (enabled transitively by
+        // ollama-rs in the `full` feature), insertion order is
+        // preserved in `serde_json::Value`. The canonicalizer must
+        // sort object keys so equivalent schemas hash identically.
+        // Build two Values with deliberately different insertion
+        // orders.
+        let mut a_obj = serde_json::Map::new();
+        a_obj.insert("type".to_string(), serde_json::json!("object"));
+        a_obj.insert(
+            "properties".to_string(),
+            serde_json::json!({"x": {"type": "number"}, "y": {"type": "string"}}),
+        );
+        let a = ToolDefinition::new("t", "d", serde_json::Value::Object(a_obj));
+
+        let mut b_obj = serde_json::Map::new();
+        b_obj.insert(
+            "properties".to_string(),
+            serde_json::json!({"y": {"type": "string"}, "x": {"type": "number"}}),
+        );
+        b_obj.insert("type".to_string(), serde_json::json!("object"));
+        let b = ToolDefinition::new("t", "d", serde_json::Value::Object(b_obj));
+
+        assert_eq!(fingerprint_tools(&[a]), fingerprint_tools(&[b]));
+    }
+
+    #[test]
+    fn fingerprint_tools_empty_marker() {
+        let h = fingerprint_tools(&[]);
+        assert_eq!(h, "tools-empty");
+    }
+
+    #[test]
+    fn fingerprint_string_is_deterministic() {
+        let h1 = fingerprint_string("you are concise");
+        let h2 = fingerprint_string("you are concise");
+        assert_eq!(h1, h2);
+        assert_ne!(h1, fingerprint_string("you are verbose"));
+    }
+
+    #[test]
+    fn prompt_cache_state_fingerprint_helper() {
+        let tools = vec![ToolDefinition::new(
+            "calc",
+            "math",
+            serde_json::json!({"type": "object"}),
+        )];
+        let s = PromptCacheState::fingerprint("be concise", &tools, ["beta-1".to_string()]);
+        assert_eq!(s.system_hash, fingerprint_string("be concise"));
+        assert_eq!(s.tool_schema_hash, fingerprint_tools(&tools));
+        assert!(s.beta_headers.contains("beta-1"));
+    }
+
+    #[test]
+    fn fingerprint_tools_reflects_description_change() {
+        let a = ToolDefinition::new("t", "first", serde_json::json!({"type": "object"}));
+        let b = ToolDefinition::new("t", "second", serde_json::json!({"type": "object"}));
+        assert_ne!(fingerprint_tools(&[a]), fingerprint_tools(&[b]));
     }
 
     #[test]

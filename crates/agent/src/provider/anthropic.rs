@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::abort::AbortController;
 use crate::error::AgentError;
 use crate::message::{ContentBlock, ImageSource, Message, ToolResultContent};
-use crate::provider::{Provider, ProviderCapabilities, StreamRequest};
+use crate::provider::{Provider, ProviderCapabilities, StreamRequest, ToolChoice, ToolDefinition};
 use crate::stream::{Event, EventStream, ResultData};
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -164,8 +164,43 @@ fn build_request_body(req: &StreamRequest) -> serde_json::Value {
             "budget_tokens": thinking.max_tokens,
         });
     }
+    if !req.tools.is_empty() {
+        body["tools"] = render_tools(&req.tools);
+    }
+    if let Some(choice) = &req.tool_choice {
+        // Anthropic's API only accepts `tool_choice` when at least one
+        // tool is supplied. Sending it standalone is a 400 — silently
+        // omit instead.
+        if !req.tools.is_empty() {
+            body["tool_choice"] = render_tool_choice(choice);
+        }
+    }
 
     body
+}
+
+fn render_tools(tools: &[ToolDefinition]) -> serde_json::Value {
+    serde_json::Value::Array(
+        tools
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.input_schema,
+                })
+            })
+            .collect(),
+    )
+}
+
+fn render_tool_choice(choice: &ToolChoice) -> serde_json::Value {
+    match choice {
+        ToolChoice::Auto => serde_json::json!({"type": "auto"}),
+        ToolChoice::Required => serde_json::json!({"type": "any"}),
+        ToolChoice::None => serde_json::json!({"type": "none"}),
+        ToolChoice::Tool(name) => serde_json::json!({"type": "tool", "name": name}),
+    }
 }
 
 fn render_system(system: &str, cache: bool) -> serde_json::Value {
@@ -643,6 +678,67 @@ mod tests {
         // Last user message's last content block also marked ephemeral.
         let last_user = &body["messages"][0]["content"].as_array().unwrap()[0];
         assert_eq!(last_user["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn build_body_with_tools_and_choice() {
+        let req = StreamRequest::new("m", vec![])
+            .with_tools(vec![ToolDefinition::new(
+                "calc",
+                "perform arithmetic",
+                serde_json::json!({"type": "object", "properties": {"x": {"type": "number"}}}),
+            )])
+            .with_tool_choice(ToolChoice::Tool("calc".into()));
+        let body = build_request_body(&req);
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "calc");
+        assert_eq!(tools[0]["description"], "perform arithmetic");
+        assert_eq!(tools[0]["input_schema"]["type"], "object");
+        assert_eq!(body["tool_choice"]["type"], "tool");
+        assert_eq!(body["tool_choice"]["name"], "calc");
+    }
+
+    #[test]
+    fn build_body_tool_choice_variants() {
+        let mk = |c: ToolChoice| {
+            StreamRequest::new("m", vec![])
+                .with_tools(vec![ToolDefinition::new(
+                    "t",
+                    "d",
+                    serde_json::json!({"type": "object"}),
+                )])
+                .with_tool_choice(c)
+        };
+        assert_eq!(
+            build_request_body(&mk(ToolChoice::Auto))["tool_choice"]["type"],
+            "auto"
+        );
+        assert_eq!(
+            build_request_body(&mk(ToolChoice::Required))["tool_choice"]["type"],
+            "any"
+        );
+        assert_eq!(
+            build_request_body(&mk(ToolChoice::None))["tool_choice"]["type"],
+            "none"
+        );
+    }
+
+    #[test]
+    fn build_body_omits_tool_choice_when_no_tools() {
+        // Anthropic 400s if tool_choice is sent without tools — make sure
+        // we drop it instead.
+        let req = StreamRequest::new("m", vec![]).with_tool_choice(ToolChoice::Auto);
+        let body = build_request_body(&req);
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn build_body_omits_tools_when_empty() {
+        let req = StreamRequest::new("m", vec![]);
+        let body = build_request_body(&req);
+        assert!(body.get("tools").is_none());
     }
 
     #[test]

@@ -22,10 +22,12 @@ use std::collections::HashMap;
 use async_openai::config::OpenAIConfig;
 use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
-    ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessageArgs,
-    ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
-    ChatCompletionRequestToolMessageArgs, ChatCompletionRequestUserMessageArgs,
-    CreateChatCompletionRequestArgs, FinishReason, FunctionCall,
+    ChatCompletionMessageToolCalls, ChatCompletionNamedToolChoice,
+    ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
+    ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
+    ChatCompletionRequestUserMessageArgs, ChatCompletionTool, ChatCompletionToolChoiceOption,
+    ChatCompletionTools, CreateChatCompletionRequestArgs, FinishReason, FunctionCall, FunctionName,
+    FunctionObject, ToolChoiceOptions,
 };
 use async_openai::Client;
 use async_trait::async_trait;
@@ -35,7 +37,7 @@ use futures::StreamExt;
 use crate::abort::AbortController;
 use crate::error::AgentError;
 use crate::message::{ContentBlock, Message, ToolResultContent};
-use crate::provider::{Provider, ProviderCapabilities, StreamRequest};
+use crate::provider::{Provider, ProviderCapabilities, StreamRequest, ToolChoice, ToolDefinition};
 use crate::stream::{Event, EventStream, ResultData};
 
 /// Vendor dialect — currently informational; the provider behaves the
@@ -116,12 +118,7 @@ impl OpenAiCompatProvider {
             id,
             config,
             capabilities: ProviderCapabilities {
-                // tool_use is wire-supported but `StreamRequest` has no
-                // `tools` field today (deferred follow-up). Flip to true
-                // once tool definitions are threaded through the request
-                // builder; advertising true now would mislead callers
-                // who gate on this flag.
-                supports_tool_use: false,
+                supports_tool_use: true,
                 supports_prompt_caching: false,
                 // DeepSeek R1 emits `reasoning_content` separately on the
                 // delta, but `async-openai` 0.36 doesn't surface that
@@ -173,10 +170,18 @@ impl Provider for OpenAiCompatProvider {
         if !req.stop_sequences.is_empty() {
             builder.stop(req.stop_sequences.clone());
         }
-        // Tool definitions are not part of `StreamRequest` in Phase 1
-        // batch B (deferred to a follow-up). When added, build them here
-        // by constructing `async_openai::types::chat::ChatCompletionTool`
-        // with a `FunctionObject` payload and call `builder.tools(...)`.
+        if !req.tools.is_empty() {
+            builder.tools(render_tools(&req.tools));
+        }
+        if let Some(choice) = &req.tool_choice {
+            // OpenAI rejects `tool_choice` if no tools are present (the
+            // server returns "tool_choice: none/required is not allowed
+            // when tools is not specified"). Drop it silently to match
+            // Anthropic's behavior.
+            if !req.tools.is_empty() {
+                builder.tool_choice(render_tool_choice(choice));
+            }
+        }
 
         let request = builder
             .build()
@@ -303,6 +308,39 @@ fn accumulate_tool_call(
         }
         if let Some(args) = function.arguments {
             entry.arguments.push_str(&args);
+        }
+    }
+}
+
+fn render_tools(tools: &[ToolDefinition]) -> Vec<ChatCompletionTools> {
+    tools
+        .iter()
+        .map(|t| {
+            ChatCompletionTools::Function(ChatCompletionTool {
+                function: FunctionObject {
+                    name: t.name.clone(),
+                    description: if t.description.is_empty() {
+                        None
+                    } else {
+                        Some(t.description.clone())
+                    },
+                    parameters: Some(t.input_schema.clone()),
+                    strict: None,
+                },
+            })
+        })
+        .collect()
+}
+
+fn render_tool_choice(choice: &ToolChoice) -> ChatCompletionToolChoiceOption {
+    match choice {
+        ToolChoice::Auto => ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto),
+        ToolChoice::Required => ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Required),
+        ToolChoice::None => ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::None),
+        ToolChoice::Tool(name) => {
+            ChatCompletionToolChoiceOption::Function(ChatCompletionNamedToolChoice {
+                function: FunctionName { name: name.clone() },
+            })
         }
     }
 }
@@ -502,19 +540,65 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_are_conservative_until_features_implemented() {
-        // Both supports_tool_use and supports_thinking are off in
-        // batch L because (a) StreamRequest has no `tools` field yet
-        // (deferred), and (b) async-openai 0.36 doesn't surface
-        // DeepSeek's `reasoning_content` field. Flipping these on
-        // before the corresponding code paths exist would mislead
-        // capability-gated callers.
+    fn capabilities_advertise_tool_use() {
+        // tools are wired into the request builder via render_tools,
+        // so supports_tool_use is on. supports_thinking stays off
+        // because async-openai 0.36 doesn't surface DeepSeek's
+        // `reasoning_content` field — flipping that on before the code
+        // path exists would mislead capability-gated callers.
         let p = OpenAiCompatProvider::new(OpenAiCompatConfig::openai("k"));
-        assert!(!p.capabilities().supports_tool_use);
+        assert!(p.capabilities().supports_tool_use);
         assert!(!p.capabilities().supports_thinking);
         let p = OpenAiCompatProvider::new(OpenAiCompatConfig::deepseek("k"));
-        assert!(!p.capabilities().supports_tool_use);
+        assert!(p.capabilities().supports_tool_use);
         assert!(!p.capabilities().supports_thinking);
+    }
+
+    #[test]
+    fn render_tools_serializes_to_function_shape() {
+        let defs = vec![ToolDefinition::new(
+            "calc",
+            "perform arithmetic",
+            serde_json::json!({"type": "object", "properties": {"a": {"type": "number"}}}),
+        )];
+        let rendered = render_tools(&defs);
+        assert_eq!(rendered.len(), 1);
+        let json = serde_json::to_value(&rendered[0]).unwrap();
+        assert_eq!(json["type"], "function");
+        assert_eq!(json["function"]["name"], "calc");
+        assert_eq!(json["function"]["description"], "perform arithmetic");
+        assert_eq!(json["function"]["parameters"]["type"], "object");
+    }
+
+    #[test]
+    fn render_tools_omits_empty_description() {
+        // OpenAI's spec allows description to be absent — sending an
+        // empty string would be valid but noisy. Confirm we drop it.
+        let defs = vec![ToolDefinition::new(
+            "noop",
+            "",
+            serde_json::json!({"type": "object"}),
+        )];
+        let rendered = render_tools(&defs);
+        let json = serde_json::to_value(&rendered[0]).unwrap();
+        assert!(json["function"].get("description").is_none());
+    }
+
+    #[test]
+    fn render_tool_choice_modes() {
+        let auto = serde_json::to_value(render_tool_choice(&ToolChoice::Auto)).unwrap();
+        assert_eq!(auto, serde_json::json!("auto"));
+        let required = serde_json::to_value(render_tool_choice(&ToolChoice::Required)).unwrap();
+        assert_eq!(required, serde_json::json!("required"));
+        let none = serde_json::to_value(render_tool_choice(&ToolChoice::None)).unwrap();
+        assert_eq!(none, serde_json::json!("none"));
+    }
+
+    #[test]
+    fn render_tool_choice_named_tool() {
+        let v = serde_json::to_value(render_tool_choice(&ToolChoice::Tool("calc".into()))).unwrap();
+        assert_eq!(v["type"], "function");
+        assert_eq!(v["function"]["name"], "calc");
     }
 
     #[test]

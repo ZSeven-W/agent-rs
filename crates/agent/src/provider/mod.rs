@@ -32,4 +32,7 @@ pub mod ollama;
 #[cfg(feature = "ollama")]
 pub use ollama::{OllamaConfig, OllamaProvider};
 
-pub use types::{Provider, ProviderCapabilities, StreamRequest, ThinkingConfig};
+pub use types::{
+    Provider, ProviderCapabilities, StreamRequest, ThinkingConfig, ToolChoice, ToolDefinition,
+    ToolDefinitionError,
+};

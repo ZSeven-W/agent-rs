@@ -376,6 +376,10 @@ async fn drive(
         if let Some(s) = &qloop.system {
             req = req.with_system(s.clone());
         }
+        let tool_defs = qloop.tools.definitions();
+        if !tool_defs.is_empty() {
+            req = req.with_tools(tool_defs);
+        }
 
         let upstream = match qloop.provider.stream(req, abort.clone()).await {
             Ok(s) => s,
@@ -978,6 +982,56 @@ mod tests {
             calls,
         }));
         Arc::new(r)
+    }
+
+    /// Provider that captures every `StreamRequest` it receives.
+    /// Returns an empty stream so the loop terminates after a single
+    /// turn when paired with a no-tool registry.
+    #[derive(Debug)]
+    struct CapturingProvider {
+        captured: Arc<std::sync::Mutex<Vec<StreamRequest>>>,
+    }
+
+    #[async_trait]
+    impl Provider for CapturingProvider {
+        fn id(&self) -> &str {
+            "capturing"
+        }
+        fn capabilities(&self) -> crate::provider::ProviderCapabilities {
+            crate::provider::ProviderCapabilities {
+                supports_tool_use: true,
+                ..Default::default()
+            }
+        }
+        async fn stream(
+            &self,
+            req: StreamRequest,
+            _abort: AbortController,
+        ) -> Result<Box<dyn EventStream>, AgentError> {
+            if let Ok(mut g) = self.captured.lock() {
+                g.push(req);
+            }
+            Ok(Box::new(futures::stream::empty()))
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_forwards_registered_tools_to_provider() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(CapturingProvider {
+            captured: captured.clone(),
+        });
+        let registry = echo_registry("calc", Arc::new(AtomicUsize::new(0)));
+        let qloop = QueryLoop::builder(provider, "m").tools(registry).build();
+        let mut stream = qloop.run("hi", AbortController::new()).await.unwrap();
+        while stream.next().await.is_some() {}
+        let captured = captured.lock().unwrap();
+        assert!(
+            !captured.is_empty(),
+            "should have captured at least one request"
+        );
+        assert_eq!(captured[0].tools.len(), 1);
+        assert_eq!(captured[0].tools[0].name, "calc");
     }
 
     #[tokio::test]

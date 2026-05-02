@@ -124,6 +124,10 @@ impl QueryEngine {
         if let Some(system) = &self.system {
             req = req.with_system(system.clone());
         }
+        let tool_defs = self.tools.definitions();
+        if !tool_defs.is_empty() {
+            req = req.with_tools(tool_defs);
+        }
 
         let upstream = self.provider.stream(req, abort.clone()).await?;
 
@@ -311,5 +315,79 @@ mod tests {
             .with_max_output_tokens(1024);
         assert_eq!(engine.system.as_deref(), Some("be brief"));
         assert_eq!(engine.max_output_tokens, 1024);
+    }
+
+    /// Provider that captures the incoming `StreamRequest` so tests
+    /// can assert what the QueryEngine actually wired up. Returns an
+    /// empty stream so the engine completes the turn quickly.
+    #[derive(Debug)]
+    struct CapturingProvider {
+        captured: Arc<Mutex<Option<StreamRequest>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for CapturingProvider {
+        fn id(&self) -> &str {
+            "capturing"
+        }
+        fn capabilities(&self) -> crate::provider::ProviderCapabilities {
+            crate::provider::ProviderCapabilities {
+                supports_tool_use: true,
+                ..Default::default()
+            }
+        }
+        async fn stream(
+            &self,
+            req: StreamRequest,
+            _abort: AbortController,
+        ) -> Result<Box<dyn EventStream>, AgentError> {
+            if let Ok(mut g) = self.captured.lock() {
+                *g = Some(req);
+            }
+            Ok(Box::new(futures::stream::empty()))
+        }
+    }
+
+    #[test]
+    fn engine_forwards_registered_tools_to_provider() {
+        use crate::testing::FakeTool;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let captured = Arc::new(Mutex::new(None::<StreamRequest>));
+            let provider = Arc::new(CapturingProvider {
+                captured: captured.clone(),
+            });
+
+            let mut registry = ToolRegistry::new();
+            registry.register(Arc::new(FakeTool::new(
+                "echo",
+                serde_json::json!({"ok": true}),
+            )));
+
+            let engine = QueryEngine::new(provider, "m").with_tools(registry);
+            let mut stream = engine.run("hi", AbortController::new()).await.unwrap();
+            // Drain the stream so the run completes.
+            while futures::StreamExt::next(&mut stream).await.is_some() {}
+
+            let req = captured.lock().unwrap().clone().expect("captured");
+            assert_eq!(req.tools.len(), 1, "tools should be forwarded");
+            assert_eq!(req.tools[0].name, "echo");
+        });
+    }
+
+    #[test]
+    fn engine_omits_tools_when_registry_is_empty() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let captured = Arc::new(Mutex::new(None::<StreamRequest>));
+            let provider = Arc::new(CapturingProvider {
+                captured: captured.clone(),
+            });
+            let engine = QueryEngine::new(provider, "m");
+            let mut stream = engine.run("hi", AbortController::new()).await.unwrap();
+            while futures::StreamExt::next(&mut stream).await.is_some() {}
+            let req = captured.lock().unwrap().clone().expect("captured");
+            assert!(req.tools.is_empty());
+        });
     }
 }

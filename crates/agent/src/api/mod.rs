@@ -29,7 +29,10 @@ pub mod logging;
 pub mod output;
 pub mod retry;
 
-pub use cache::{CacheBreakKind, CacheBreakObservation, PromptCacheState, PromptCacheTracker};
+pub use cache::{
+    fingerprint_string, fingerprint_tools, CacheBreakKind, CacheBreakObservation, PromptCacheState,
+    PromptCacheTracker,
+};
 pub use effort::{EffortBudget, EffortLevel};
 pub use errors::{parse_api_error, with_retry_after, ApiErrorKind, ParsedApiError};
 pub use logging::{redact_secrets, request_fingerprint, RequestFingerprint};
