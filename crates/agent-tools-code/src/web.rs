@@ -22,12 +22,15 @@
 //!
 //! 1. Resolve the host (`tokio::net::lookup_host`) and reject if any
 //!    returned IP falls in a blocked range.
-//! 2. **Pin** the resolved IP into the request via reqwest's
-//!    `Client::builder().resolve()` so the connect-time DNS lookup
-//!    can't swap to a private address (DNS rebinding mitigation).
+//! 2. **Pin** every pre-validated address into the request via
+//!    reqwest's `Client::builder().resolve_to_addrs(host, &addrs)`
+//!    so the connect-time DNS lookup can't swap to a private
+//!    address (DNS rebinding mitigation).
 //! 3. Disable reqwest auto-redirects (`Policy::none()`) and walk the
 //!    redirect chain manually, re-applying steps 1–2 on each
-//!    `Location:` header, capped at `MAX_REDIRECTS` hops.
+//!    `Location:` header, capped at `MAX_REDIRECTS` hops with a
+//!    single shared deadline so DNS + redirects can't bypass the
+//!    caller's timeout.
 //!
 //! Hosts that legitimately need to hit private networks (intranet
 //! docs, dev servers) pass `allow_private_networks: true`, which
@@ -344,7 +347,26 @@ async fn fetch_with_pinned_redirects(
             )));
         }
 
-        let (host, _port, addrs) = resolve_and_validate(&current).await?;
+        // DNS counts against the deadline. A slow lookup must not be
+        // free wall-clock; wrap in `tokio::time::timeout(remaining)`
+        // and recompute `remaining` after it returns so the request
+        // timeout reflects the budget actually left.
+        let (host, _port, addrs) = match timeout(remaining, resolve_and_validate(&current)).await {
+            Ok(Ok(triple)) => triple,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(AgentError::other(format!(
+                    "WebFetch '{initial_url}' DNS resolution exceeded {timeout_secs}s budget"
+                )));
+            }
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(AgentError::other(format!(
+                "WebFetch '{initial_url}' timed out after {timeout_secs}s (DNS consumed budget at hop {hops})"
+            )));
+        }
+
         // Single `resolve_to_addrs` call so all pre-validated IPs end
         // up in the dns_overrides entry — `resolve()` per-addr in a
         // loop would overwrite each prior pin, leaving only the last.
@@ -409,6 +431,11 @@ async fn fetch_with_pinned_redirects(
                     "WebFetch redirect '{next}' from '{current}' uses non-http scheme"
                 )));
             }
+            // Intermediate 3xx body is intentionally dropped without
+            // draining — each hop builds a fresh `reqwest::Client`
+            // so there's no shared connection pool that an undrained
+            // body could pollute.
+            drop(resp);
             current = next.to_string();
             hops += 1;
             continue;
