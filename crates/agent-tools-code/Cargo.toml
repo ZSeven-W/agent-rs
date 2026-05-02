@@ -30,9 +30,11 @@ shell = ["dep:shell-words"]
 # Search: Grep + Glob. Pulls regex (~5 MB) + ignore.
 search = ["dep:regex", "dep:ignore"]
 
-# Web: WebFetch (HTTP GET → text). Pulls reqwest with a thin
-# feature set.
-web = ["dep:reqwest"]
+# Web: WebFetch (HTTP GET → text). Pulls reqwest + futures for
+# streaming the response body so we can enforce the size cap
+# mid-stream rather than allocating the entire payload, plus url
+# for the SSRF guard's host parsing.
+web = ["dep:reqwest", "dep:futures", "dep:url"]
 
 # In-memory TodoWrite list. Pure logic, no extra deps.
 todo = []
@@ -59,6 +61,8 @@ regex = { workspace = true, optional = true }
 ignore = { workspace = true, optional = true }
 shell-words = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+url = { version = "2", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

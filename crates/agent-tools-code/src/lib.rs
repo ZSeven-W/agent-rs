@@ -60,6 +60,15 @@ pub mod fs;
 #[cfg(feature = "search")]
 pub mod search;
 
+#[cfg(feature = "shell")]
+pub mod shell;
+
+#[cfg(feature = "todo")]
+pub mod todo;
+
+#[cfg(feature = "web")]
+pub mod web;
+
 pub use discovery::ToolSearchTool;
 pub use policy::{PolicyError, WorkspacePolicy};
 
@@ -71,6 +80,15 @@ pub use fs::{
 #[cfg(feature = "search")]
 pub use search::{GlobTool, GrepTool};
 
+#[cfg(feature = "shell")]
+pub use shell::BashTool;
+
+#[cfg(feature = "todo")]
+pub use todo::{TodoItem, TodoState, TodoStatus, TodoWriteTool};
+
+#[cfg(feature = "web")]
+pub use web::WebFetchTool;
+
 use std::sync::Arc;
 
 use agent::tool::{Tool, ToolRegistry};
@@ -81,7 +99,35 @@ use agent::tool::{Tool, ToolRegistry};
 ///
 /// Tools are inserted under their canonical names (`FileRead`,
 /// `FileWrite`, …). Re-registering replaces.
+///
+/// **Note (todo):** when the `todo` feature is enabled, this
+/// helper creates a fresh [`todo::TodoState`] internally and the
+/// host loses the handle — that's fine if you only need the model
+/// to use the list to plan, but if you want to *read* the todos in
+/// your UI use [`register_default_with_todo`] instead and pass in
+/// a state you keep a handle to.
 pub fn register_default(registry: &mut ToolRegistry, policy: Arc<WorkspacePolicy>) {
+    register_inner(registry, policy, None);
+}
+
+/// Same as [`register_default`] but lets the host inject a
+/// [`todo::TodoState`] handle so it can read the todo list back.
+/// No-op for the todo state when the `todo` feature is disabled.
+#[cfg(feature = "todo")]
+pub fn register_default_with_todo(
+    registry: &mut ToolRegistry,
+    policy: Arc<WorkspacePolicy>,
+    todo_state: todo::TodoState,
+) {
+    register_inner(registry, policy, Some(todo_state));
+}
+
+fn register_inner(
+    registry: &mut ToolRegistry,
+    policy: Arc<WorkspacePolicy>,
+    #[cfg(feature = "todo")] todo_state: Option<todo::TodoState>,
+    #[cfg(not(feature = "todo"))] _todo_state: Option<()>,
+) {
     #[cfg(feature = "fs")]
     {
         registry.register(Arc::new(FileReadTool::new(policy.clone())) as Arc<dyn Tool>);
@@ -96,6 +142,19 @@ pub fn register_default(registry: &mut ToolRegistry, policy: Arc<WorkspacePolicy
     {
         registry.register(Arc::new(GrepTool::new(policy.clone())) as Arc<dyn Tool>);
         registry.register(Arc::new(GlobTool::new(policy.clone())) as Arc<dyn Tool>);
+    }
+    #[cfg(feature = "shell")]
+    {
+        registry.register(Arc::new(BashTool::new(policy.clone())) as Arc<dyn Tool>);
+    }
+    #[cfg(feature = "web")]
+    {
+        registry.register(Arc::new(WebFetchTool::new()) as Arc<dyn Tool>);
+    }
+    #[cfg(feature = "todo")]
+    {
+        let state = todo_state.unwrap_or_default();
+        registry.register(Arc::new(TodoWriteTool::new(state)) as Arc<dyn Tool>);
     }
     let _ = policy; // suppress unused when no features enabled
     let _ = registry;
