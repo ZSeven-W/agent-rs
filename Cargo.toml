@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/agent"]
+members = ["crates/agent", "crates/agent-tools-code"]
 
 [workspace.package]
 version = "0.1.0"
@@ -58,6 +58,11 @@ rand = "0.8"
 
 tempfile = "3"
 assert_fs = "1"
+
+# agent-tools-code feature deps
+regex = "1"
+ignore = "0.4"
+shell-words = "1"
 
 [profile.release]
 lto = "thin"
