@@ -5,7 +5,15 @@ all-features = false
 db-path = "$CARGO_HOME/advisory-dbs"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "warn"
-ignore = []
+ignore = [
+    # backoff 0.4.0 — unmaintained, pulled transitively by async-openai 0.36.
+    # No published successor; async-openai upstream tracking removal in 0.37+.
+    # Re-evaluate when async-openai bumps.
+    "RUSTSEC-2025-0012",
+    # instant 0.1.13 — unmaintained, pulled transitively by backoff 0.4 (and
+    # therefore async-openai). Same upstream removal path as RUSTSEC-2025-0012.
+    "RUSTSEC-2024-0384",
+]
 
 [licenses]
 allow = [
