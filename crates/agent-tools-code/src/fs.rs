@@ -212,14 +212,22 @@ impl Tool for FileWriteTool {
             .map_err(policy_to_agent_err)?;
         // Idempotency: skip the write if the existing file already
         // matches byte-for-byte. Saves churn + lets the model see
-        // "no-op" feedback when it re-emits the same content.
-        if let Ok(existing) = tokio::fs::read(&resolved).await {
-            if existing == bytes {
-                return Ok(json!({
-                    "path": resolved.display().to_string(),
-                    "status": "no_op_identical_content",
-                    "size_bytes": bytes.len(),
-                }));
+        // "no-op" feedback when it re-emits the same content. Stat
+        // first; only read when the existing size matches the new
+        // payload, so a 50 GiB file on disk can't OOM the no-op path.
+        if let Ok(meta) = tokio::fs::metadata(&resolved).await {
+            if meta.len() == bytes.len() as u64
+                && self.policy.check_size(meta.len()).is_ok()
+            {
+                if let Ok(existing) = tokio::fs::read(&resolved).await {
+                    if existing == bytes {
+                        return Ok(json!({
+                            "path": resolved.display().to_string(),
+                            "status": "no_op_identical_content",
+                            "size_bytes": bytes.len(),
+                        }));
+                    }
+                }
             }
         }
         tokio::fs::write(&resolved, &bytes)
@@ -301,9 +309,21 @@ impl Tool for FileEditTool {
             .policy
             .resolve(&parsed.path, true)
             .map_err(policy_to_agent_err)?;
+        // Stat-before-read so a multi-GB file doesn't get slurped into
+        // RAM only to be rejected by the size cap. Race with a concurrent
+        // truncate/grow is benign — the post-edit `check_size` below
+        // catches a TOCTOU grow.
+        let meta = tokio::fs::metadata(&resolved)
+            .await
+            .map_err(|e| io_to_agent_err("stat", &parsed.path, e))?;
+        self.policy
+            .check_size(meta.len())
+            .map_err(policy_to_agent_err)?;
         let bytes = tokio::fs::read(&resolved)
             .await
             .map_err(|e| io_to_agent_err("read", &parsed.path, e))?;
+        // Re-check after the actual read in case the file grew between
+        // stat and read (TOCTOU).
         self.policy
             .check_size(bytes.len() as u64)
             .map_err(policy_to_agent_err)?;

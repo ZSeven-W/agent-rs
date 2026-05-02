@@ -172,18 +172,32 @@ impl Tool for GrepTool {
                     Err(_) => continue,
                 };
                 let path = entry.path();
-                if !path.is_file() {
-                    continue;
+                // Skip non-files AND symlinks. `Path::is_file` follows
+                // symlinks via `metadata`, so a symlink in the
+                // workspace pointing to `/etc/passwd` would otherwise
+                // get read. With `follow_links(false)` on the walker,
+                // `entry.file_type()` returns the symlink's own type.
+                match entry.file_type() {
+                    Some(ft) if ft.is_file() => {}
+                    _ => continue,
                 }
                 if let Some(filter) = &include_filter {
                     if !path.to_string_lossy().contains(filter.as_str()) {
                         continue;
                     }
                 }
-                // Containment guard — `ignore` walks may pick up
-                // symlink targets outside our roots.
+                // Lexical containment + canonicalize-and-check. The
+                // canonicalize step defeats any symlinked file inside
+                // the tree that points outside the workspace; the
+                // file_type check above already filters most of those,
+                // but this is the belt-and-braces guarantee.
                 if policy.allowed_roots.iter().all(|r| !path.starts_with(r)) {
                     continue;
+                }
+                match std::fs::canonicalize(path) {
+                    Ok(canon)
+                        if policy.allowed_roots.iter().any(|r| canon.starts_with(r)) => {}
+                    _ => continue,
                 }
                 let meta = match std::fs::metadata(path) {
                     Ok(m) => m,
@@ -326,11 +340,19 @@ impl Tool for GlobTool {
                     Err(_) => continue,
                 };
                 let path = entry.path();
-                if !path.is_file() {
-                    continue;
+                // Same symlink/escape guards as Grep — see search.rs
+                // line ~175 for the rationale.
+                match entry.file_type() {
+                    Some(ft) if ft.is_file() => {}
+                    _ => continue,
                 }
                 if policy.allowed_roots.iter().all(|r| !path.starts_with(r)) {
                     continue;
+                }
+                match std::fs::canonicalize(path) {
+                    Ok(canon)
+                        if policy.allowed_roots.iter().any(|r| canon.starts_with(r)) => {}
+                    _ => continue,
                 }
                 // Match the pattern against the path relative to the
                 // search root — that's what shell-style globs assume.
@@ -705,6 +727,59 @@ mod tests {
             .await
             .expect_err("aborted");
         assert!(matches!(err, AgentError::Aborted(_)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grep_skips_symlinks_pointing_outside_workspace() {
+        // Plant a symlink inside the workspace whose target is a file
+        // OUTSIDE the workspace containing a needle. Grep must NOT
+        // surface the needle, since following the symlink would
+        // disclose data outside the policy roots.
+        let outside = TempDir::new().unwrap();
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "needle-outside\n").unwrap();
+        let inside = TempDir::new().unwrap();
+        std::fs::write(inside.path().join("regular.txt"), "needle-inside\n").unwrap();
+        std::os::unix::fs::symlink(&secret, inside.path().join("link.txt")).unwrap();
+        let tool = GrepTool::new(policy_for(inside.path()));
+        let out = tool
+            .call(&ctx(), json!({"pattern": "needle"}))
+            .await
+            .unwrap();
+        let matches = out["matches"].as_array().unwrap();
+        // Only the regular file matches, not the symlink-to-secret.
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0]["match_text"]
+            .as_str()
+            .unwrap()
+            .contains("inside"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn glob_skips_symlinks_pointing_outside_workspace() {
+        let outside = TempDir::new().unwrap();
+        let secret = outside.path().join("secret.rs");
+        std::fs::write(&secret, "fn x(){}").unwrap();
+        let inside = TempDir::new().unwrap();
+        std::fs::write(inside.path().join("regular.rs"), "fn y(){}").unwrap();
+        std::os::unix::fs::symlink(&secret, inside.path().join("escaped.rs")).unwrap();
+        let tool = GlobTool::new(policy_for(inside.path()));
+        let out = tool
+            .call(&ctx(), json!({"pattern": "*.rs"}))
+            .await
+            .unwrap();
+        let matches = out["matches"].as_array().unwrap();
+        let names: Vec<&str> = matches
+            .iter()
+            .map(|m| m["path"].as_str().unwrap())
+            .collect();
+        assert!(names.iter().any(|p| p.ends_with("regular.rs")));
+        assert!(
+            !names.iter().any(|p| p.ends_with("escaped.rs")),
+            "symlink escape leaked: {names:?}"
+        );
     }
 
     #[tokio::test]
