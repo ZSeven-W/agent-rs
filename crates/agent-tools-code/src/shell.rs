@@ -354,6 +354,11 @@ mod tests {
         assert!(out["stdout"].as_str().unwrap().is_empty());
     }
 
+    // `pwd` on Windows runners is Git-for-Windows' MSYS binary, which
+    // emits `/d/a/...`-style paths that `std::fs::canonicalize` can't
+    // parse as native Windows paths. The cwd-plumbing logic is OS-
+    // independent — coverage on Unix is sufficient.
+    #[cfg(unix)]
     #[tokio::test]
     async fn bash_runs_in_policy_cwd_by_default() {
         let dir = TempDir::new().unwrap();

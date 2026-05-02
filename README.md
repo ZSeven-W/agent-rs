@@ -260,25 +260,6 @@ A shared `WorkspacePolicy` enforces path containment, file-size caps, and symlin
 
 ---
 
-## Built under adversarial review
-
-Every meaningful diff goes through Codex (or equivalent) review **twice** — round 1 catches bugs in the new code, round 2 catches the regressions introduced by round 1's fixes. Roughly half of commit messages name the bug each round caught. A non-exhaustive list of what the process has caught so far:
-
-| Bug | Where | Caught |
-|---|---|---|
-| Async permission path silently ignored structured matchers | `permission/manager.rs` | round 1 |
-| `RmcpConnection::call_tool` held the service mutex across the network await — `close()` deadlocked during slow RPCs | `mcp/connector.rs` | round 1 |
-| `CostTracker::observe_event` double-counted cumulative `Usage` reports | `cost/tracker.rs` | round 1 |
-| Same fix introduced a warm-cache same-cumulative undercharge | `cost/tracker.rs` | round 2 |
-| Anthropic `ToolResult` rendering silently dropped `Document` blocks | `provider/anthropic.rs` | round 1 |
-| Glob matcher only split on `/`, breaking Windows paths | `agent-tools-code/search.rs` | round 1 |
-| Authorization header was unconditionally rewritten as Bearer auth | `mcp/connector.rs` | round 1 |
-| `(rate * 100.0).round() as u64` inflated `$0.075/MTok` rates by ~6.7% | `cost/prices.rs` | round 1 (unit changed: microcent → nanodollar) |
-
-Every entry above became a regression test. The cumulative result: the codebase reads as if it's been running in production for a year, even though it shipped over a single sprint.
-
----
-
 ## Testing
 
 ```sh
