@@ -1,89 +1,190 @@
-# agent-rs
+<div align="center">
 
-[![CI](https://github.com/ZSeven-W/agent-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/ZSeven-W/agent-rs/actions)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
-[![Rust 1.80+](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
+# `agent-rs`
 
-**A pure-Rust async runtime for building LLM agents.** Multi-provider, tool-capable, and built around a clear streaming `Event` vocabulary so you can drop it into a CLI, an IDE, a desktop app, or a server.
+### A pure-Rust async runtime for shipping LLM agents.
+
+Multi-provider · tool-capable end-to-end · structured permissions · real MCP · zero `unsafe`.
+
+[![CI](https://img.shields.io/github/actions/workflow/status/ZSeven-W/agent-rs/ci.yml?branch=main&style=for-the-badge&logo=github-actions&logoColor=white&label=CI)](https://github.com/ZSeven-W/agent-rs/actions)
+[![Tests](https://img.shields.io/badge/tests-837_passing-brightgreen?style=for-the-badge)](#testing)
+[![Rust](https://img.shields.io/badge/rust-1.80%2B-orange?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![Unsafe](https://img.shields.io/badge/unsafe-forbidden-success?style=for-the-badge&logo=rust&logoColor=white)](https://github.com/ZSeven-W/agent-rs/blob/main/crates/agent/src/lib.rs)
+[![License](https://img.shields.io/badge/license-MIT-blue?style=for-the-badge)](./LICENSE)
+
+```text
+┌─ user ──┐    ┌─── QueryLoop ───────────────────────────────────────┐
+│ prompt  │───▶│ Streaming → ToolDispatch → ToolCollecting → Yield │──▶ Event::*
+└─────────┘    │       ↑                                       │     │
+               │       └──── auto-compact / hooks / cost ◀─────┘     │
+               └─────────────────────────────────────────────────────┘
+                  │            │            │            │
+                  ▼            ▼            ▼            ▼
+              Anthropic    OpenAI-*       Ollama         MCP servers
+              (SSE)        (compat)       (local)        (stdio / HTTP)
+```
+
+</div>
+
+---
+
+## TL;DR
 
 ```rust
 use agent::prelude::*;
 use std::sync::Arc;
 
 let provider = Arc::new(AnthropicProvider::new(std::env::var("ANTHROPIC_API_KEY")?));
-let engine = QueryEngine::new(provider, "claude-opus-4-7")
-    .with_system("Be concise.");
+let engine = QueryEngine::new(provider, "claude-opus-4-7").with_system("Be concise.");
 
 let mut stream = engine.run("Summarize Rust's borrow checker in two lines.", AbortController::new()).await?;
 while let Some(event) = futures::StreamExt::next(&mut stream).await {
+    if let Event::TextDelta { delta } = event? { print!("{delta}") }
+}
+```
+
+That's a complete agent — provider streaming, tool dispatch, hooks, permissions, auto-compaction, USD cost tracking — all wired up. Drop in Files API attachments, MCP servers, or the bundled coding tool pack with one extra line each.
+
+---
+
+## Why agent-rs?
+
+- **🦀 Rust-native, library-only.** No `tokio::main` hijack, no global state, no `panic!` on bad input. `#![forbid(unsafe_code)]` in every crate. Drop it into a CLI, an IDE plugin, a desktop app, or a server — the runtime doesn't care.
+- **🔌 Three providers, one event vocabulary.** Anthropic Messages (hand-rolled SSE — full prompt-cache + extended-thinking betas, **no SDK dep**), `async-openai` 0.36 (DeepSeek / Moonshot / Groq / OpenRouter / LM Studio), and local Ollama. Stream `Event::TextDelta`, `ToolUse`, `Usage`, `Result` — same shape from every backend.
+- **🛠 Tool-capable end-to-end.** Define a tool, register it, the runtime wires the JSON Schema into the request body, dispatches `ToolUse` events to your code, feeds results back. Multi-turn loop with a phase machine. Receipt-order concurrent execution. **Permissions and cost tracking are wired through**, not bolted on.
+- **🛡 Structured permissions that fail safe.** A 7-step decision chain (deny / ask / callback / bypass / allow / default-ask / dont_ask), composable `PermissionMatcher` rules over tool input shapes (JSON-pointer fields, glob/prefix/regex patterns, AnyOf / AllOf / Not), and a 4-level `SafetyClass` lattice where `Unknown ≡ Destructive` for gating — so unclassified tools never slip through.
+- **🔗 MCP that actually plugs in.** Full Model Context Protocol client lifecycle: stdio child processes, streamable HTTP, OAuth 2.0 + PKCE, server-initiated elicitation, channel permissions, stale-handle reconnect repair. Tool calls don't serialize on a mutex. `close()` doesn't deadlock during slow RPCs.
+- **💸 Cost accounting in nanodollar precision.** `Event::Usage` flows into a `CostTracker` with a model-price catalog (Anthropic + GPT defaults, BYO entries trivially). `u128` integer accumulator — no f64 drift across long sessions.
+- **📎 Files API for big attachments.** `FilesClient` trait + `AnthropicFilesClient`. Smart helpers auto-route between inline base64 and uploaded `file_id` references based on size. Beta header gets added automatically when any block (including those nested in tool results) carries a `file_id`.
+- **♻️ Reactive auto-compaction.** Token estimator + LLM-driven `<analysis>` / `<summary>` summarization, microcompact, session memory, post-cleanup file restoration. Long sessions stay inside the context window without losing critical state.
+- **📦 Optional batteries.** Companion `agent-tools-code` crate ships generic FileRead/Write/Edit, Grep/Glob (gitignore-aware via `ignore`), Bash, WebFetch, TodoWrite, and `ToolSearch` for deferred-tool discovery. Every tool declares its `SafetyClass`; a `WorkspacePolicy` enforces path containment + size caps + symlink rules. Pull only the features you want.
+
+---
+
+## Architecture
+
+```mermaid
+flowchart TB
+    subgraph User["Host application"]
+        H[ToolRegistry registration]
+        Q[QueryEngine / QueryLoop]
+    end
+    subgraph Runtime["agent crate"]
+        Prov[provider/<br/>Anthropic · OpenAI · Ollama]
+        QL[query/ phase machine]
+        Tool[tool/ trait + registry]
+        Perm[permission/ 7-step chain<br/>+ matchers]
+        Hook[hook/ 27 typed events]
+        Comp[compact/ reactive auto-compact]
+        Cost[cost/ USD accounting]
+        Sess[session/ JSONL persistence]
+        Atch[attachments/ Files API]
+        MCP[mcp/ rmcp connector]
+    end
+    subgraph Optional["agent-tools-code (companion crate)"]
+        FS[FileRead / Write / Edit ...]
+        Search[Grep · Glob · ToolSearch]
+        Shell[Bash]
+        Web[WebFetch]
+        Todo[TodoWrite]
+    end
+    Models[("Anthropic · OpenAI<br/>Ollama · MCP")]
+
+    User --> Runtime
+    Q --> QL
+    QL <--> Prov
+    QL <--> Tool
+    QL --> Hook
+    QL --> Perm
+    QL --> Comp
+    Perm -.gates.-> Tool
+    Cost <-- "Event::Usage" --- QL
+    Sess -.persists.-> QL
+    Atch -.→ tool inputs.-> Tool
+    Tool <-- registers --> Optional
+    Prov --> Models
+    MCP --> Models
+```
+
+Streaming Events are the universal language: every provider emits the same `Event` taxonomy, so swap providers without touching tool code.
+
+---
+
+## Install
+
+Two crates, both versioned together. Pull only what you need.
+
+```toml
+[dependencies]
+# Runtime — always
+agent = { git = "https://github.com/ZSeven-W/agent-rs", default-features = false, features = ["anthropic", "session-jsonl"] }
+
+# Optional: ready-made coding tool pack (FileRead/Write/Edit, Grep/Glob, Bash, WebFetch, TodoWrite, ToolSearch)
+agent-tools-code = { git = "https://github.com/ZSeven-W/agent-rs", default-features = false, features = ["fs", "search"] }
+```
+
+### `agent` features
+
+| Flag | Pulls in | Notes |
+|---|---|---|
+| **`anthropic`** *(default)* | `reqwest` + `eventsource-stream` | Hand-rolled Anthropic SSE — no SDK dep. |
+| `openai` | `async-openai` 0.36 | OpenAI-compatible providers. |
+| `ollama` | `ollama-rs` 0.3 | Local models. |
+| `mcp` | `rmcp` 1.5 | MCP client + production stdio/HTTP connector + OAuth/PKCE. |
+| `session-jsonl` | `fs4` | JSONL persistence with file lock. |
+| `swarm` | `fs4` + `notify` | Sub-agents, mailbox, teams. |
+| `full` | all of the above | |
+
+### `agent-tools-code` features
+
+| Flag | Pulls in | Tools |
+|---|---|---|
+| **`fs`** *(default)* | (none) | FileRead / Write / Edit / ListDir / Mkdir / Move / Remove |
+| **`search`** *(default)* | `regex` + `ignore` | Grep · Glob *(gitignore-aware)* |
+| `shell` | `shell-words` | Bash *(timeout, abort, output cap)* |
+| `web` | `reqwest` + `futures` | WebFetch *(HTML→text, size cap)* |
+| `todo` | (none) | TodoWrite *(in-memory shared state)* |
+| `all` | all of the above | |
+
+`ToolSearch` is always-on (no feature flag) and lets you expose 50+ MCP tools without flooding the model's tool list — it picks them up via `select:Name1,Name2` or keyword search.
+
+---
+
+## Quickstart with bundled tools
+
+```rust
+use agent::prelude::*;
+use agent_tools_code::{register_default, WorkspacePolicy};
+use std::sync::Arc;
+
+let policy = WorkspacePolicy::new(std::env::current_dir()?)?.into_arc();
+let mut tools = ToolRegistry::new();
+register_default(&mut tools, policy);   // FileRead, Write, Edit, ListDir,
+                                        // Mkdir, Move, Remove, Grep, Glob
+
+let provider = Arc::new(AnthropicProvider::new(std::env::var("ANTHROPIC_API_KEY")?));
+let qloop = QueryLoop::builder(provider, "claude-opus-4-7")
+    .tools(Arc::new(tools))
+    .build();
+
+let mut stream = qloop.run("List the .rs files in src/, then summarize main.rs.", AbortController::new()).await?;
+while let Some(event) = futures::StreamExt::next(&mut stream).await {
     match event? {
         Event::TextDelta { delta } => print!("{delta}"),
-        Event::Result { .. } => println!(),
+        Event::ToolUse { name, .. } => eprintln!("\n→ calling {name}"),
         _ => {}
     }
 }
 ```
 
-## Highlights
+That's the full picture: registry → provider → loop. The runtime handles tool dispatch, permission gating, hooks, cost tracking, and auto-compaction without you wiring anything else.
 
-- **Three providers, one event stream** — Anthropic Messages (hand-rolled SSE, full prompt-cache + extended-thinking betas), OpenAI-compatible (`async-openai` 0.36, covers DeepSeek / Moonshot / Groq / OpenRouter / LM Studio), and local Ollama.
-- **Tool-capable end-to-end** — define a tool, register it, the runtime wires the JSON Schema into the request body, dispatches `ToolUse` events to your code, feeds results back. Multi-turn loop with phase machine; receipt-order concurrent execution.
-- **Structured permission system** — 7-step decision chain (deny / ask / callback / bypass / allow / default-ask / dont_ask), composable `PermissionMatcher` rules over tool input shapes (JSON-pointer fields, glob/prefix/regex-style patterns, AnyOf / AllOf / Not), and a four-level `SafetyClass` lattice that fails safe for unclassified tools.
-- **Real MCP support** — full Model Context Protocol client lifecycle: stdio child processes, streamable HTTP, OAuth 2.0 + PKCE, server-initiated elicitation, channel permissions, stale-handle reconnect repair.
-- **Cost accounting in nanodollar precision** — `Event::Usage` flows into a `CostTracker` with a model-price catalog (Claude + GPT defaults, BYO entries trivially). Integer accumulator, no f64 drift.
-- **Files API for large attachments** — `FilesClient` trait + `AnthropicFilesClient`. Smart helpers auto-route between inline base64 and uploaded `file_id` references based on size.
-- **Reactive auto-compaction** — token estimator + LLM-driven `<analysis>`/`<summary>` summarization, microcompact, session memory, post-cleanup file restoration. Keeps long sessions inside the context window without losing critical state.
-- **Optional coding tool pack** — companion crate `agent-tools-code` ships generic FileRead/Write/Edit, Grep/Glob (gitignore-aware), and a `ToolSearch` for deferred-tool discovery. Each tool declares its `SafetyClass`; a `WorkspacePolicy` enforces path containment + size caps + symlink rules.
-- **Built for embedding** — library-only, no panics on bad input, no `unsafe`, no `tokio::main`, every async surface respects an `AbortController`. Default features stay slim; opt in to providers / persistence / MCP / swarm via Cargo features.
+---
 
-## Workspace layout
+## Module surface
 
-```text
-agent-rs/
-├── Cargo.toml                       # workspace root
-└── crates/
-    ├── agent/                       # the runtime library
-    └── agent-tools-code/            # optional coding tool pack
-```
-
-The two crates are versioned together, but you only need to depend on the ones you use.
-
-## Install
-
-```toml
-[dependencies]
-agent = { git = "https://github.com/ZSeven-W/agent-rs", default-features = false, features = ["anthropic", "session-jsonl"] }
-
-# Optional: ready-made coding tool pack (FileRead/Write/Edit, Grep/Glob, ToolSearch)
-agent-tools-code = { git = "https://github.com/ZSeven-W/agent-rs", default-features = false, features = ["fs", "search"] }
-```
-
-Vendored installs (submodule under `vendor/agent-rs/`) work the same way with `path = "vendor/agent-rs/crates/agent"`.
-
-### Feature flags — `agent`
-
-| Flag | Pulls in | Notes |
-|---|---|---|
-| `anthropic` *(default)* | `reqwest` + `eventsource-stream` | Hand-rolled Anthropic SSE — no SDK dep. |
-| `openai` | `async-openai` 0.36 | OpenAI-compatible providers. |
-| `ollama` | `ollama-rs` 0.3 | Local models. |
-| `mcp` | `rmcp` 1.5 + `reqwest` + `http` | MCP client lifecycle + production stdio/HTTP connector + OAuth/PKCE. |
-| `session-jsonl` | `fs4` | JSONL session persistence with file lock. |
-| `swarm` | `fs4` + `notify` | Sub-agents, mailbox, teams. |
-| `full` | all of the above | |
-
-### Feature flags — `agent-tools-code`
-
-| Flag | Pulls in | Notes |
-|---|---|---|
-| `fs` *(default)* | (none — uses `tokio::fs`) | FileRead/Write/Edit, ListDir, Mkdir, Move, Remove. |
-| `search` *(default)* | `regex` + `ignore` | Grep + Glob with gitignore-aware traversal. |
-| `shell` | `shell-words` | Bash *(planned)*. |
-| `web` | `reqwest` | WebFetch *(planned)*. |
-| `todo` | (none) | TodoWrite *(planned)*. |
-| `all` | all of the above | |
-
-## Module surface — `agent`
+<details>
+<summary><b><code>agent</code> crate</b> — runtime (15+ modules)</summary>
 
 ### Foundation
 
@@ -91,90 +192,133 @@ Vendored installs (submodule under `vendor/agent-rs/`) work the same way with `p
 |---|---|
 | `provider/` | Multi-provider LLM client. Tool definitions wired into request bodies; capability flags + streaming `Event` vocabulary. |
 | `query/` | `QueryLoop` multi-turn phase machine. Reactive auto-compaction wired in. |
-| `tool/` | `Tool` trait, `ToolRegistry`, `ToolUseContext`, `SafetyClass` lattice. Receipt-order concurrent execution via `ToolExecutor`. |
-| `permission/` | 7-step chain + structured `PermissionMatcher` (Always / Field / ExactJson / AnyOf / AllOf / Not) + `StringPattern`. External-queue async approval flow. |
-| `hook/` | 27 typed `HookEvent` variants — Before/AfterToolUse, Pre/PostCompact, OnSession*. |
-| `message/` | `Message` enum + DAG-aware `MessageStore`. `ContentBlock::Document` for PDFs / large text; `ImageSource::File` for Files-API references. |
-| `stream/` | `Event` taxonomy (TextDelta / Thinking / ToolUse / ToolResult / Result / Usage / Error / Notice). |
-| `session/` | JSONL persistence (schema v1) with atomic-rename + `fs4` file lock. |
-| `swarm/` | Sub-agents / teams — file-locked mailbox, leader-worker permission sync, in-process / tmux / iTerm2 backends. |
-| `compact/` | Token estimator + reactive auto-compaction. LLM-driven summarization, partial directions, microcompact, session-memory store. |
+| `tool/` | `Tool` trait, `ToolRegistry`, `SafetyClass` lattice. Receipt-order concurrent execution via `ToolExecutor`. |
+| `permission/` | 7-step chain + structured `PermissionMatcher` (Always / Field / ExactJson / AnyOf / AllOf / Not) + `StringPattern`. External-queue async approval. |
+| `hook/` | 27 typed `HookEvent` variants. |
+| `message/` | DAG-aware `MessageStore`. `ContentBlock::Document` for PDFs; `ImageSource::File` for Files-API references. |
+| `stream/` | `Event` taxonomy: TextDelta / Thinking / ToolUse / ToolResult / Result / Usage / Error / Notice. |
+| `session/` | JSONL persistence (schema v1) with atomic-rename + file lock. |
+| `swarm/` | Sub-agents / teams. File-locked mailbox, in-process / tmux / iTerm2 backends. |
+| `compact/` | Reactive auto-compaction. LLM-driven summarization, partial directions, microcompact, session memory. |
 | `context/` | Sliding-window trim. |
 
 ### Service layer
 
 | Module | Purpose |
 |---|---|
-| `api/` | Retry policy with decorrelated jitter, error classification, prompt-cache-break detection (with tool-schema fingerprints), effort/output config, request-fingerprint logging, secret redaction. |
-| `cost/` | Model-price-aware USD accounting. `ModelPriceCatalog` (Anthropic + OpenAI defaults), `CostTracker` consumes `Event::Usage`, `CostSnapshot` in `u128` nanodollars. |
-| `attachments/` | Image + document helpers. Magic-byte mime sniff, inline base64, URL-source images, `FilesClient` trait + `AnthropicFilesClient`, smart size-aware routing. |
-| `tokenizer/` | Pluggable trait + `HeuristicTokenizer` / `WordSplitTokenizer` defaults. Real tiktoken plugs in via the trait. |
+| `api/` | Retry with decorrelated jitter, error classification, prompt-cache-break detection, secret redaction. |
+| `cost/` | Model-price-aware USD accounting. `u128` nanodollars — no f64 drift. |
+| `attachments/` | `FilesClient` + `AnthropicFilesClient`, smart size-aware routing. |
+| `tokenizer/` | Pluggable trait. Real tiktoken plugs in via the trait. |
 
 ### Discovery + extensibility
 
 | Module | Purpose |
 |---|---|
-| `mcp/` *(feature `mcp`)* | Full MCP client lifecycle + production `RmcpConnector` (stdio + HTTP/SSE), OAuth 2.0 + PKCE, channel permissions, server-initiated elicitation. |
-| `memdir/` | `MEMORY.md` directory loader — YAML-subset frontmatter, 4-type taxonomy, age-bucket relevance scoring. |
-| `skills/` | Frontmatter-loaded prompt templates + input-schema validation + optional model override / tool allowlist. |
-| `plugins/` | Plugin trait + registry. Native plugins are Rust trait objects; third-party plugins run in WASM via the `WasmPluginHost` trait. |
-| `state/` | `AppStateStore` — typed transient runtime state with broadcast subscribers + `Selector` projection. |
-| `bootstrap/` | Schema-versioned migration runner. |
-| `context_analysis/` | Inspect a `MessageStore`: token totals by role, top-N largest messages, tool-call breakdown. |
-| `tasks/` | Planning task graph — cycle-checked dependencies, status transitions, ready-task query. |
-| `memory_extract/` | Heuristic background extractor for `DECISION:` / `User prefers …` / URL-bearing patterns. |
-| `remote/` | JSON-RPC-2.0 line-delimited protocol for external hosts driving the agent in a separate process. |
+| `mcp/` *(feature `mcp`)* | Full MCP client + production `RmcpConnector`. |
+| `memdir/` | `MEMORY.md` directory loader with frontmatter + relevance scoring. |
+| `skills/` · `plugins/` · `state/` · `bootstrap/` · `context_analysis/` · `tasks/` · `memory_extract/` · `remote/` | See [`crates/agent/src/`](./crates/agent/src/). |
 
-## Module surface — `agent-tools-code`
+</details>
 
-Optional companion crate. Every tool implements `agent::tool::Tool` with a proper `SafetyClass`.
+<details>
+<summary><b><code>agent-tools-code</code> crate</b> — optional coding tool pack</summary>
 
 | Tool | Class | Feature |
 |---|---|---|
-| `FileReadTool` | ReadOnly | `fs` |
-| `FileWriteTool` | Mutating | `fs` |
-| `FileEditTool` | Mutating | `fs` |
-| `ListDirTool` | ReadOnly | `fs` |
-| `MkdirTool` | Mutating | `fs` |
-| `MoveTool` | Mutating | `fs` |
-| `RemoveTool` | Destructive | `fs` |
-| `GrepTool` | ReadOnly | `search` |
-| `GlobTool` | ReadOnly | `search` |
-| `ToolSearchTool` | ReadOnly | (always) |
+| `FileReadTool` | `ReadOnly` | `fs` |
+| `FileWriteTool` | `Mutating` | `fs` |
+| `FileEditTool` | `Mutating` | `fs` |
+| `ListDirTool` | `ReadOnly` | `fs` |
+| `MkdirTool` | `Mutating` | `fs` |
+| `MoveTool` | `Mutating` | `fs` |
+| `RemoveTool` | **`Destructive`** | `fs` |
+| `GrepTool` | `ReadOnly` | `search` |
+| `GlobTool` | `ReadOnly` | `search` |
+| `BashTool` | `Mutating` | `shell` |
+| `WebFetchTool` | `ReadOnly` | `web` |
+| `TodoWriteTool` | `Mutating` | `todo` |
+| `ToolSearchTool` | `ReadOnly` | (always) |
 
 A shared `WorkspacePolicy` enforces path containment, file-size caps, and symlink rules. `register_default(registry, policy)` bulk-registers every enabled tool.
 
-`ToolSearchTool` lets a host expose 50+ candidate tools without flooding the model's tool list — register them on a separate registry and the model uses `select:Name1,Name2` or keyword search to surface the few it needs.
+</details>
+
+---
 
 ## Design principles
 
-1. **Library-only.** No global state, no `tokio::main`, no `panic!` on bad input — every error path is a typed `AgentError`.
-2. **Product-agnostic.** Concrete tools live outside the runtime crate. The `agent` crate defines the trait; `agent-tools-code` ships generic implementations; product-specific tools live in product crates.
-3. **Streaming first.** Every provider is a streaming source. Multi-turn / tool dispatch / compaction are coordinated through one `Event` vocabulary, no polling.
-4. **Cancellation everywhere.** Every async surface honors an `AbortController` — including the `tokio::task::spawn_blocking` workers used by Grep / Glob.
-5. **No `unsafe`.** `#![forbid(unsafe_code)]` in both crates.
-6. **Defensive against the model.** Permissions fail safe (Unknown ≡ Destructive for gating). Tool schemas validated before reaching the wire. Path operations canonicalize before any I/O. Idempotent writes detect no-ops.
-7. **Cost-aware.** Tool schemas, prompt cache, and token usage feed an integer-precision USD accumulator. Long-running sessions don't drift.
+> **Library-only.** No global state, no `tokio::main`, no `panic!` on bad input — every error path is a typed `AgentError`.
+>
+> **Provider-agnostic at the runtime layer.** Concrete tools live outside the `agent` crate. The runtime defines the trait; companions ship implementations.
+>
+> **Streaming first.** Every provider is a streaming source. Multi-turn / tool dispatch / compaction are coordinated through one `Event` vocabulary, no polling.
+>
+> **Cancellation everywhere.** Every async surface honors an `AbortController` — including the `tokio::task::spawn_blocking` workers used by Grep / Glob.
+>
+> **No `unsafe`.** `#![forbid(unsafe_code)]` in both crates.
+>
+> **Defensive against the model.** Permissions fail safe (Unknown ≡ Destructive for gating). Tool schemas validated before reaching the wire. Path operations canonicalize before any I/O. Idempotent writes detect no-ops.
+>
+> **Cost-aware.** Tool schemas, prompt cache, and token usage feed an integer-precision USD accumulator. Long-running sessions don't drift.
+
+---
+
+## Built under adversarial review
+
+Every meaningful diff goes through Codex (or equivalent) review **twice** — round 1 catches bugs in the new code, round 2 catches the regressions introduced by round 1's fixes. Roughly half of commit messages name the bug each round caught. A non-exhaustive list of what the process has caught so far:
+
+| Bug | Where | Caught |
+|---|---|---|
+| Async permission path silently ignored structured matchers | `permission/manager.rs` | round 1 |
+| `RmcpConnection::call_tool` held the service mutex across the network await — `close()` deadlocked during slow RPCs | `mcp/connector.rs` | round 1 |
+| `CostTracker::observe_event` double-counted cumulative `Usage` reports | `cost/tracker.rs` | round 1 |
+| Same fix introduced a warm-cache same-cumulative undercharge | `cost/tracker.rs` | round 2 |
+| Anthropic `ToolResult` rendering silently dropped `Document` blocks | `provider/anthropic.rs` | round 1 |
+| Glob matcher only split on `/`, breaking Windows paths | `agent-tools-code/search.rs` | round 1 |
+| Authorization header was unconditionally rewritten as Bearer auth | `mcp/connector.rs` | round 1 |
+| `(rate * 100.0).round() as u64` inflated `$0.075/MTok` rates by ~6.7% | `cost/prices.rs` | round 1 (unit changed: microcent → nanodollar) |
+
+Every entry above became a regression test. The cumulative result: the codebase reads as if it's been running in production for a year, even though it shipped over a single sprint.
+
+---
 
 ## Testing
 
 ```sh
-cargo test --workspace --all-features        # 743 + 61 unit + 14 integration + 5 doc tests, 4 ignored (real-API gates)
+cargo test --workspace --all-features
+# 837 passing · 14 integration · 5 doc · 4 ignored (real-API gates)
+
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
+cargo deny --all-features check
 ```
 
 The 4 `#[ignore]`-gated tests hit real APIs (Anthropic / OpenAI / Ollama / Anthropic Files) when their environment variables are set. CI runs the full suite with mocks; real-API runs are manual.
+
+---
+
+## Status
+
+This is a **pre-release** project — every change lives under `Unreleased` in [`CHANGELOG.md`](./CHANGELOG.md) until `0.1.0` ships. The runtime API surface has stabilized and 837 tests guard it; the open work is wiring more tools into the optional companion crate and tagging a release.
+
+See [`openpencil-docs/agent-rs/notes/2026-05-02-claude-code-non-tui-gaps.md`](https://github.com/ZSeven-W/openpencil-docs/blob/main/agent-rs/notes/2026-05-02-claude-code-non-tui-gaps.md) for what's intentionally host-side vs. what's pending.
+
+---
 
 ## Contributing
 
 PRs welcome. Two ground rules:
 
-1. **No product-specific imports in the `agent` crate.** Generic concepts only.
-2. **Adversarial review every change.** This codebase is reviewed by Codex (or equivalent) on every meaningful diff — round 1 catches bugs, round 2 catches the regressions introduced by round 1's fixes. Roughly half of the commit messages name the bug each round caught.
+1. **No product-specific imports in the `agent` crate.** Generic concepts only — anything tied to a specific app belongs in a downstream crate.
+2. **Adversarial review every change.** Open an issue first for anything bigger than a small fix so we can align on direction.
 
-Open an issue first for anything bigger than a small fix so we can align on direction.
+---
 
-## License
+<div align="center">
 
-MIT — see [LICENSE](./LICENSE).
+**MIT licensed.** See [LICENSE](./LICENSE).
+
+Built with caffeine, codex review, and an unreasonable number of tests.
+
+</div>
