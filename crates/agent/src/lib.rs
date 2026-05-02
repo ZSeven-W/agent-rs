@@ -9,8 +9,10 @@
 
 pub mod abort;
 pub mod api;
+pub mod bootstrap;
 pub mod compact;
 pub mod context;
+pub mod context_analysis;
 pub mod error;
 pub mod file_cache;
 pub mod hook;
@@ -24,6 +26,7 @@ pub mod prelude;
 pub mod provider;
 pub mod query;
 pub mod session;
+pub mod state;
 pub mod stream;
 #[cfg(feature = "swarm")]
 pub mod swarm;
