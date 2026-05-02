@@ -9,6 +9,7 @@
 
 pub mod abort;
 pub mod api;
+pub mod attachments;
 pub mod bootstrap;
 pub mod compact;
 pub mod context;
@@ -36,6 +37,7 @@ pub mod stream;
 pub mod swarm;
 pub mod tasks;
 pub mod testing;
+pub mod tokenizer;
 pub mod tool;
 
 /// Crate version, sourced from `Cargo.toml`.
