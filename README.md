@@ -8,7 +8,7 @@ Cross-product Rust agent runtime — embedded by [OpenPencil](https://github.com
 
 A pure-Rust async agent runtime that hosts multi-turn LLM conversations end-to-end. The `agent` crate is product-agnostic; product-specific tools (canvas ops, terminal I/O, file edits, etc.) are registered into its `ToolRegistry` by the consumer.
 
-Design parity target: [Anthropic's Claude Code TS source](https://docs.anthropic.com/en/docs/claude-code) — feature mapping in `notes/2026-05-02-claude-code-completeness-audit.md`. As of `e23f767`, every Tier 1–4 item from that audit has shipped.
+Design parity target: [Anthropic's Claude Code TS source](https://docs.anthropic.com/en/docs/claude-code) — feature mapping in [`openpencil-docs/agent-rs/notes/2026-05-02-claude-code-completeness-audit.md`](../openpencil-docs/agent-rs/notes/2026-05-02-claude-code-completeness-audit.md). As of `e23f767`, every Tier 1–4 item from that audit has shipped.
 
 This is the **Rust rewrite of the Zig codebase at `github.com/ZSeven-W/agent`**. The Zig repo stays as a reference; agent-rs is opt-in via `OPENPENCIL_AGENT_BACKEND=rust` (and Zode equivalent) until Phase 7 cuts over.
 
@@ -91,7 +91,7 @@ agent = { path = "vendor/agent/crates/agent", default-features = false, features
 - **Phase 5 (session):** JSONL persistence + MCP type wiring. ✅
 - **Phase 6 (swarm):** mailbox, sub_agent, team, coordinator, permission sync, backends. ✅
 
-### Tiers (claude-code parity audit — `notes/2026-05-02-claude-code-completeness-audit.md`)
+### Tiers (claude-code parity audit — [`openpencil-docs/agent-rs/notes/2026-05-02-claude-code-completeness-audit.md`](../openpencil-docs/agent-rs/notes/2026-05-02-claude-code-completeness-audit.md))
 
 - **Tier 1 — Compaction (Q-α/β/γ/δ):** LLM summarization, auto-trigger, microcompact, session memory, post-cleanup, grouping, QueryLoop integration. ✅
 - **Tier 1 — API service layer:** retry, prompt-cache-break, effort, output, errors, logging. ✅ (`f53d5a7`)
@@ -125,13 +125,21 @@ Per the project decision (memory entry `project_plugins_wasm_third_party.md`, 20
 agent-rs/
 ├── Cargo.toml             # workspace root
 ├── deny.toml              # cargo-deny advisory + license policy
-├── crates/
-│   └── agent/             # the library crate
-├── notes/                 # research notes, audits, plan deliverables
-└── docs/                  # architecture, migration, swarm-format docs
+└── crates/
+    └── agent/             # the library crate
 ```
 
 The crate name is `agent`. Consumers add it as a `vendor/agent` submodule pointing at this repo, then depend on it via `path = "vendor/agent/crates/agent"`.
+
+## Documentation
+
+Architecture, migration plan, and research notes live in the central docs repo, **not** in this code repo (kept code-only on purpose):
+
+- [`openpencil-docs/agent-rs/docs/architecture.md`](../openpencil-docs/agent-rs/docs/architecture.md) — module map, async runtime model, cross-product API rule.
+- [`openpencil-docs/agent-rs/docs/migration.md`](../openpencil-docs/agent-rs/docs/migration.md) — Zig → Rust migration plan.
+- [`openpencil-docs/agent-rs/notes/`](../openpencil-docs/agent-rs/notes/) — claude-code parity audits, SDK maturity research, Zig skeleton audit, non-TUI gap analysis.
+
+History note: prior to `git filter-branch` on 2026-05-02, these directories lived in-tree at `agent-rs/docs/` and `agent-rs/notes/`. They were moved to consolidate documentation across the OpenPencil + Zode + agent-rs ecosystem.
 
 ## Building + testing
 
