@@ -38,6 +38,21 @@ fn io_to_agent_err(action: &str, path: &str, e: std::io::Error) -> AgentError {
     AgentError::other(format!("{action} '{path}' failed: {e}"))
 }
 
+/// Read up to `cap + 1` bytes from `path`. Caller compares the
+/// resulting buffer length against `cap` to detect overflow:
+/// `out.len() > cap` means the file grew past the cap. Bounding
+/// the read defends against a TOCTOU race where the file is
+/// stat'd small but grows before we read.
+async fn read_with_cap(path: &std::path::Path, cap: u64) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let f = tokio::fs::File::open(path).await?;
+    let limit = cap.saturating_add(1);
+    let cap_usize = usize::try_from(cap).unwrap_or(usize::MAX);
+    let mut buf = Vec::with_capacity(cap_usize.min(64 * 1024));
+    f.take(limit).read_to_end(&mut buf).await?;
+    Ok(buf)
+}
+
 // =========================================================================
 // FileRead
 // =========================================================================
@@ -211,15 +226,17 @@ impl Tool for FileWriteTool {
             .check_size(bytes.len() as u64)
             .map_err(policy_to_agent_err)?;
         // Idempotency: skip the write if the existing file already
-        // matches byte-for-byte. Saves churn + lets the model see
-        // "no-op" feedback when it re-emits the same content. Stat
-        // first; only read when the existing size matches the new
-        // payload, so a 50 GiB file on disk can't OOM the no-op path.
+        // matches byte-for-byte. Stat first; only attempt the
+        // comparison when the existing size matches the new payload
+        // AND fits within the cap. The bounded `read_with_cap` then
+        // makes the read TOCTOU-safe — even if the file grows
+        // between stat and read, we never allocate more than
+        // `bytes.len() + 1` bytes; a grown file fails `existing ==
+        // bytes` and the no-op short-circuit doesn't fire.
         if let Ok(meta) = tokio::fs::metadata(&resolved).await {
-            if meta.len() == bytes.len() as u64
-                && self.policy.check_size(meta.len()).is_ok()
-            {
-                if let Ok(existing) = tokio::fs::read(&resolved).await {
+            let new_len = bytes.len() as u64;
+            if meta.len() == new_len && self.policy.check_size(meta.len()).is_ok() {
+                if let Ok(existing) = read_with_cap(&resolved, new_len).await {
                     if existing == bytes {
                         return Ok(json!({
                             "path": resolved.display().to_string(),
@@ -310,20 +327,20 @@ impl Tool for FileEditTool {
             .resolve(&parsed.path, true)
             .map_err(policy_to_agent_err)?;
         // Stat-before-read so a multi-GB file doesn't get slurped into
-        // RAM only to be rejected by the size cap. Race with a concurrent
-        // truncate/grow is benign — the post-edit `check_size` below
-        // catches a TOCTOU grow.
+        // RAM only to be rejected by the size cap. The bounded
+        // `read_with_cap` then defends against a TOCTOU race: even if
+        // the file grows between stat and read, we never allocate
+        // more than `cap + 1` bytes; the `check_size` below trips on
+        // any grow past the cap.
         let meta = tokio::fs::metadata(&resolved)
             .await
             .map_err(|e| io_to_agent_err("stat", &parsed.path, e))?;
         self.policy
             .check_size(meta.len())
             .map_err(policy_to_agent_err)?;
-        let bytes = tokio::fs::read(&resolved)
+        let bytes = read_with_cap(&resolved, self.policy.max_file_size_bytes)
             .await
             .map_err(|e| io_to_agent_err("read", &parsed.path, e))?;
-        // Re-check after the actual read in case the file grew between
-        // stat and read (TOCTOU).
         self.policy
             .check_size(bytes.len() as u64)
             .map_err(policy_to_agent_err)?;
@@ -843,6 +860,30 @@ mod tests {
         assert_eq!(out["replacements"], 3);
         let read = std::fs::read_to_string(dir.path().join("a.txt")).unwrap();
         assert_eq!(read, "y y y");
+    }
+
+    #[tokio::test]
+    async fn file_edit_refuses_when_pre_read_size_exceeds_policy_cap() {
+        // Pre-read stat must reject a too-big file BEFORE any read
+        // happens. We can't observe "no read" directly, but we can
+        // assert the error message and that the cap is enforced
+        // even when the file is already huge.
+        let dir = TempDir::new().unwrap();
+        let big = "x".repeat(2000);
+        std::fs::write(dir.path().join("big.txt"), &big).unwrap();
+        let policy = WorkspacePolicy::new(dir.path())
+            .unwrap()
+            .with_max_file_size(1024)
+            .into_arc();
+        let tool = FileEditTool::new(policy);
+        let err = tool
+            .call(
+                &ctx_for(&dir),
+                json!({"path": "big.txt", "old_string": "x", "new_string": "y"}),
+            )
+            .await
+            .expect_err("should fail");
+        assert!(err.to_string().contains("too large"), "got {err}");
     }
 
     #[tokio::test]

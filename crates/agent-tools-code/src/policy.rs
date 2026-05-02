@@ -134,6 +134,20 @@ impl WorkspacePolicy {
                     "no ancestor of the path exists; cannot resolve",
                 ),
             })?;
+        // The reattached tail must contain only `Normal` components.
+        // `Path::file_name` shouldn't ever return Some("..") per
+        // std's contract, but defense in depth: reject anything but
+        // a plain segment so `..` / `.` / prefix / root-dir can
+        // never sneak through to a recursive `mkdir` and create a
+        // path that looks inside via `starts_with` but resolves
+        // outside.
+        for c in missing_tail.components() {
+            if !matches!(c, Component::Normal(_)) {
+                return Err(PolicyError::OutsideWorkspace {
+                    path: raw.to_string(),
+                });
+            }
+        }
         let ancestor_canonical = canonicalize(&existing_ancestor)?;
         // Avoid `join("")` — `PathBuf::join` with an empty path
         // appends a trailing separator, which makes downstream
@@ -320,6 +334,16 @@ mod tests {
             .into_arc();
         let resolved = extended.resolve(f.to_str().unwrap(), true).unwrap();
         assert!(resolved.ends_with("y.txt"));
+    }
+
+    #[test]
+    fn resolve_non_strict_normal_components_only() {
+        // Sanity: a clean missing tail with only normal components
+        // resolves to ancestor + tail.
+        let (dir, policy) = temp_policy();
+        let target = dir.path().join("a/b/c.txt");
+        let resolved = policy.resolve(target.to_str().unwrap(), false).unwrap();
+        assert!(resolved.ends_with("a/b/c.txt"));
     }
 
     #[cfg(unix)]
