@@ -6,11 +6,11 @@
 
 Multi-provider · tool-capable end-to-end · structured permissions · real MCP · zero `unsafe`.
 
-[![CI](https://img.shields.io/github/actions/workflow/status/ZSeven-W/agent-rs/ci.yml?branch=main&style=for-the-badge&logo=github-actions&logoColor=white&label=CI)](https://github.com/ZSeven-W/agent-rs/actions)
-[![Tests](https://img.shields.io/badge/tests-837_passing-brightgreen?style=for-the-badge)](#testing)
-[![Rust](https://img.shields.io/badge/rust-1.80%2B-orange?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org)
-[![Unsafe](https://img.shields.io/badge/unsafe-forbidden-success?style=for-the-badge&logo=rust&logoColor=white)](https://github.com/ZSeven-W/agent-rs/blob/main/crates/agent/src/lib.rs)
-[![License](https://img.shields.io/badge/license-MIT-blue?style=for-the-badge)](./LICENSE)
+[![CI](https://img.shields.io/github/actions/workflow/status/ZSeven-W/agent-rs/ci.yml?branch=main&style=flat-square&logo=github-actions&logoColor=white&label=CI)](https://github.com/ZSeven-W/agent-rs/actions)
+[![Tests](https://img.shields.io/badge/tests-837_passing-brightgreen?style=flat-square)](#testing)
+[![Rust](https://img.shields.io/badge/rust-1.80%2B-orange?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![Unsafe](https://img.shields.io/badge/unsafe-forbidden-success?style=flat-square&logo=rust&logoColor=white)](https://github.com/ZSeven-W/agent-rs/blob/main/crates/agent/src/lib.rs)
+[![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](./LICENSE)
 
 ```text
 ┌─ user ──┐    ┌─── QueryLoop ───────────────────────────────────────┐
@@ -65,43 +65,39 @@ That's a complete agent — provider streaming, tool dispatch, hooks, permission
 
 ```mermaid
 flowchart TB
-    subgraph User["Host application"]
-        H[ToolRegistry registration]
-        Q[QueryEngine / QueryLoop]
+    Host[Host application]
+    subgraph Runtime[agent crate]
+        QL[query - phase machine]
+        Prov[provider - Anthropic / OpenAI / Ollama]
+        Tool[tool trait + registry]
+        Perm[permission - 7-step chain + matchers]
+        Hook[hook - 27 typed events]
+        Comp[compact - reactive auto-compact]
+        Cost[cost - USD accounting]
+        Sess[session - JSONL persistence]
+        Atch[attachments - Files API]
+        MCP[mcp - rmcp connector]
     end
-    subgraph Runtime["agent crate"]
-        Prov[provider/<br/>Anthropic · OpenAI · Ollama]
-        QL[query/ phase machine]
-        Tool[tool/ trait + registry]
-        Perm[permission/ 7-step chain<br/>+ matchers]
-        Hook[hook/ 27 typed events]
-        Comp[compact/ reactive auto-compact]
-        Cost[cost/ USD accounting]
-        Sess[session/ JSONL persistence]
-        Atch[attachments/ Files API]
-        MCP[mcp/ rmcp connector]
-    end
-    subgraph Optional["agent-tools-code (companion crate)"]
-        FS[FileRead / Write / Edit ...]
-        Search[Grep · Glob · ToolSearch]
+    subgraph Optional[agent-tools-code]
+        FS[FileRead / Write / Edit / ...]
+        Search[Grep / Glob / ToolSearch]
         Shell[Bash]
         Web[WebFetch]
         Todo[TodoWrite]
     end
-    Models[("Anthropic · OpenAI<br/>Ollama · MCP")]
+    Models[Models - Anthropic / OpenAI / Ollama / MCP]
 
-    User --> Runtime
-    Q --> QL
-    QL <--> Prov
-    QL <--> Tool
+    Host --> QL
+    QL --> Prov
+    QL --> Tool
     QL --> Hook
     QL --> Perm
     QL --> Comp
-    Perm -.gates.-> Tool
-    Cost <-- "Event::Usage" --- QL
-    Sess -.persists.-> QL
-    Atch -.→ tool inputs.-> Tool
-    Tool <-- registers --> Optional
+    QL --> Cost
+    QL --> Sess
+    Perm --> Tool
+    Atch --> Tool
+    Tool --> Optional
     Prov --> Models
     MCP --> Models
 ```
