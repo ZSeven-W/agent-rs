@@ -14,6 +14,7 @@ pub mod bootstrap;
 pub mod compact;
 pub mod context;
 pub mod context_analysis;
+pub mod cost;
 pub mod error;
 pub mod file_cache;
 pub mod hook;

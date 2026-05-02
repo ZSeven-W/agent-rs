@@ -7,6 +7,7 @@ pub use crate::compact::{estimate_text_tokens, estimate_tokens, insert_boundary_
 pub use crate::context::{
     estimate_total_tokens, ContextStrategy, PassThroughStrategy, SlidingWindowStrategy,
 };
+pub use crate::cost::{CostSnapshot, CostTracker, ModelCost, ModelPriceCatalog, ModelPrices};
 pub use crate::error::AgentError;
 pub use crate::file_cache::FileStateCache;
 pub use crate::hook::{HookEvent, HookHandler, HookOutcome, HookRunner, RustHookHandler};
