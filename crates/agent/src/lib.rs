@@ -22,10 +22,12 @@ pub mod mcp;
 pub mod memdir;
 pub mod message;
 pub mod permission;
+pub mod plugins;
 pub mod prelude;
 pub mod provider;
 pub mod query;
 pub mod session;
+pub mod skills;
 pub mod state;
 pub mod stream;
 #[cfg(feature = "swarm")]
