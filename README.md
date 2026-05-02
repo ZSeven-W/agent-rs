@@ -1,155 +1,179 @@
 # agent-rs
 
-Cross-product Rust agent runtime — embedded by [OpenPencil](https://github.com/ZSeven-W/openpencil) and [Zode](https://github.com/ZSeven-W/zode).
+[![CI](https://github.com/ZSeven-W/agent-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/ZSeven-W/agent-rs/actions)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+[![Rust 1.80+](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 
-> **Status:** Phases 1–6 + Tier 1–4 of the claude-code completeness audit shipped. Library-only — TUI / IDE bridges live in Zode, canvas chrome lives in OpenPencil. Cross-product cutover (Phase 7, OP+Zode) pending.
+**A pure-Rust async runtime for building LLM agents.** Multi-provider, tool-capable, and built around a clear streaming `Event` vocabulary so you can drop it into a CLI, an IDE, a desktop app, or a server.
 
-## What this is
+```rust
+use agent::prelude::*;
+use std::sync::Arc;
 
-A pure-Rust async agent runtime that hosts multi-turn LLM conversations end-to-end. The `agent` crate is product-agnostic; product-specific tools (canvas ops, terminal I/O, file edits, etc.) are registered into its `ToolRegistry` by the consumer.
+let provider = Arc::new(AnthropicProvider::new(std::env::var("ANTHROPIC_API_KEY")?));
+let engine = QueryEngine::new(provider, "claude-opus-4-7")
+    .with_system("Be concise.");
 
-Design parity target: [Anthropic's Claude Code TS source](https://docs.anthropic.com/en/docs/claude-code) — feature mapping in [`openpencil-docs/agent-rs/notes/2026-05-02-claude-code-completeness-audit.md`](../openpencil-docs/agent-rs/notes/2026-05-02-claude-code-completeness-audit.md). As of `e23f767`, every Tier 1–4 item from that audit has shipped.
+let mut stream = engine.run("Summarize Rust's borrow checker in two lines.", AbortController::new()).await?;
+while let Some(event) = futures::StreamExt::next(&mut stream).await {
+    match event? {
+        Event::TextDelta { delta } => print!("{delta}"),
+        Event::Result { .. } => println!(),
+        _ => {}
+    }
+}
+```
 
-This is the **Rust rewrite of the Zig codebase at `github.com/ZSeven-W/agent`**. The Zig repo stays as a reference; agent-rs is opt-in via `OPENPENCIL_AGENT_BACKEND=rust` (and Zode equivalent) until Phase 7 cuts over.
+## Highlights
 
-## Module surface
+- **Three providers, one event stream** — Anthropic Messages (hand-rolled SSE, full prompt-cache + extended-thinking betas), OpenAI-compatible (`async-openai` 0.36, covers DeepSeek / Moonshot / Groq / OpenRouter / LM Studio), and local Ollama.
+- **Tool-capable end-to-end** — define a tool, register it, the runtime wires the JSON Schema into the request body, dispatches `ToolUse` events to your code, feeds results back. Multi-turn loop with phase machine; receipt-order concurrent execution.
+- **Structured permission system** — 7-step decision chain (deny / ask / callback / bypass / allow / default-ask / dont_ask), composable `PermissionMatcher` rules over tool input shapes (JSON-pointer fields, glob/prefix/regex-style patterns, AnyOf / AllOf / Not), and a four-level `SafetyClass` lattice that fails safe for unclassified tools.
+- **Real MCP support** — full Model Context Protocol client lifecycle: stdio child processes, streamable HTTP, OAuth 2.0 + PKCE, server-initiated elicitation, channel permissions, stale-handle reconnect repair.
+- **Cost accounting in nanodollar precision** — `Event::Usage` flows into a `CostTracker` with a model-price catalog (Claude + GPT defaults, BYO entries trivially). Integer accumulator, no f64 drift.
+- **Files API for large attachments** — `FilesClient` trait + `AnthropicFilesClient`. Smart helpers auto-route between inline base64 and uploaded `file_id` references based on size.
+- **Reactive auto-compaction** — token estimator + LLM-driven `<analysis>`/`<summary>` summarization, microcompact, session memory, post-cleanup file restoration. Keeps long sessions inside the context window without losing critical state.
+- **Optional coding tool pack** — companion crate `agent-tools-code` ships generic FileRead/Write/Edit, Grep/Glob (gitignore-aware), and a `ToolSearch` for deferred-tool discovery. Each tool declares its `SafetyClass`; a `WorkspacePolicy` enforces path containment + size caps + symlink rules.
+- **Built for embedding** — library-only, no panics on bad input, no `unsafe`, no `tokio::main`, every async surface respects an `AbortController`. Default features stay slim; opt in to providers / persistence / MCP / swarm via Cargo features.
+
+## Workspace layout
+
+```text
+agent-rs/
+├── Cargo.toml                       # workspace root
+└── crates/
+    ├── agent/                       # the runtime library
+    └── agent-tools-code/            # optional coding tool pack
+```
+
+The two crates are versioned together, but you only need to depend on the ones you use.
+
+## Install
+
+```toml
+[dependencies]
+agent = { git = "https://github.com/ZSeven-W/agent-rs", default-features = false, features = ["anthropic", "session-jsonl"] }
+
+# Optional: ready-made coding tool pack (FileRead/Write/Edit, Grep/Glob, ToolSearch)
+agent-tools-code = { git = "https://github.com/ZSeven-W/agent-rs", default-features = false, features = ["fs", "search"] }
+```
+
+Vendored installs (submodule under `vendor/agent-rs/`) work the same way with `path = "vendor/agent-rs/crates/agent"`.
+
+### Feature flags — `agent`
+
+| Flag | Pulls in | Notes |
+|---|---|---|
+| `anthropic` *(default)* | `reqwest` + `eventsource-stream` | Hand-rolled Anthropic SSE — no SDK dep. |
+| `openai` | `async-openai` 0.36 | OpenAI-compatible providers. |
+| `ollama` | `ollama-rs` 0.3 | Local models. |
+| `mcp` | `rmcp` 1.5 + `reqwest` + `http` | MCP client lifecycle + production stdio/HTTP connector + OAuth/PKCE. |
+| `session-jsonl` | `fs4` | JSONL session persistence with file lock. |
+| `swarm` | `fs4` + `notify` | Sub-agents, mailbox, teams. |
+| `full` | all of the above | |
+
+### Feature flags — `agent-tools-code`
+
+| Flag | Pulls in | Notes |
+|---|---|---|
+| `fs` *(default)* | (none — uses `tokio::fs`) | FileRead/Write/Edit, ListDir, Mkdir, Move, Remove. |
+| `search` *(default)* | `regex` + `ignore` | Grep + Glob with gitignore-aware traversal. |
+| `shell` | `shell-words` | Bash *(planned)*. |
+| `web` | `reqwest` | WebFetch *(planned)*. |
+| `todo` | (none) | TodoWrite *(planned)*. |
+| `all` | all of the above | |
+
+## Module surface — `agent`
 
 ### Foundation
 
 | Module | Purpose |
 |---|---|
-| `provider/` | Multi-provider LLM client. Hand-rolled Anthropic Messages SSE, `async-openai` 0.36, `ollama-rs` 0.3. Capability flags + streaming `Event` vocabulary. |
-| `query/` | `QueryLoop` — multi-turn phase machine (Streaming → ToolDispatch → ToolCollecting → YieldingResult → Done). Reactive auto-compaction wired in. |
-| `tool/` | `Tool` trait + `ToolRegistry` + `ToolUseContext`. Receipt-order concurrent execution via `ToolExecutor::buffered`. |
-| `permission/` | 7-step chain (deny → ask → callback → bypass → allow → default-ask → dont_ask). External-queue async ask/approve flow. |
-| `hook/` | 27 typed `HookEvent` variants — Before/AfterToolUse, Pre/PostCompact, OnSession*, etc. Block / Ok outcomes. |
-| `message/` | `Message` enum (User/Assistant/System/Progress/Tombstone) + DAG-aware `MessageStore`. |
-| `stream/` | `Event` taxonomy (TextDelta / Thinking / ToolUse / ToolResult / Result / Usage / Error / **Notice**) and `EventStream` blanket impl. |
-| `session/` | JSONL persistence (schema v1) with atomic-rename + fs4 file lock. |
+| `provider/` | Multi-provider LLM client. Tool definitions wired into request bodies; capability flags + streaming `Event` vocabulary. |
+| `query/` | `QueryLoop` multi-turn phase machine. Reactive auto-compaction wired in. |
+| `tool/` | `Tool` trait, `ToolRegistry`, `ToolUseContext`, `SafetyClass` lattice. Receipt-order concurrent execution via `ToolExecutor`. |
+| `permission/` | 7-step chain + structured `PermissionMatcher` (Always / Field / ExactJson / AnyOf / AllOf / Not) + `StringPattern`. External-queue async approval flow. |
+| `hook/` | 27 typed `HookEvent` variants — Before/AfterToolUse, Pre/PostCompact, OnSession*. |
+| `message/` | `Message` enum + DAG-aware `MessageStore`. `ContentBlock::Document` for PDFs / large text; `ImageSource::File` for Files-API references. |
+| `stream/` | `Event` taxonomy (TextDelta / Thinking / ToolUse / ToolResult / Result / Usage / Error / Notice). |
+| `session/` | JSONL persistence (schema v1) with atomic-rename + `fs4` file lock. |
 | `swarm/` | Sub-agents / teams — file-locked mailbox, leader-worker permission sync, in-process / tmux / iTerm2 backends. |
-| `compact/` | Token estimator + reactive auto-compaction (Tier 1 parity). LLM-driven `<analysis>`/`<summary>` summarization, partial directions (Earliest/Latest Half), microcompact, session-memory store, post-cleanup file restoration, grouping with safe-split. |
+| `compact/` | Token estimator + reactive auto-compaction. LLM-driven summarization, partial directions, microcompact, session-memory store. |
 | `context/` | Sliding-window trim. |
 
-### Tier 1 (claude-code parity)
+### Service layer
 
 | Module | Purpose |
 |---|---|
-| `api/` | Cross-cutting API service layer — retry policy with decorrelated jitter, error classification, prompt-cache-break detection, effort/output config, request-fingerprint logging, secret redaction. |
-| `memdir/` | MEMORY.md directory loader — YAML-subset frontmatter, 4-type taxonomy (User/Feedback/Project/Reference), age-bucket relevance scoring, deterministic file scan. |
-| `mcp/` | Full MCP client lifecycle — server registry with state tracking, OAuth 2.0 + PKCE auth, channel permissions, server-initiated elicitation, async per-server connect locks, stale-handle reconnect repair. (feature `mcp`) |
+| `api/` | Retry policy with decorrelated jitter, error classification, prompt-cache-break detection (with tool-schema fingerprints), effort/output config, request-fingerprint logging, secret redaction. |
+| `cost/` | Model-price-aware USD accounting. `ModelPriceCatalog` (Anthropic + OpenAI defaults), `CostTracker` consumes `Event::Usage`, `CostSnapshot` in `u128` nanodollars. |
+| `attachments/` | Image + document helpers. Magic-byte mime sniff, inline base64, URL-source images, `FilesClient` trait + `AnthropicFilesClient`, smart size-aware routing. |
+| `tokenizer/` | Pluggable trait + `HeuristicTokenizer` / `WordSplitTokenizer` defaults. Real tiktoken plugs in via the trait. |
 
-### Tier 2
-
-| Module | Purpose |
-|---|---|
-| `state/` | `AppStateStore` — typed transient runtime state (session id, mode, queued messages, running tool, last error) with broadcast subscribers + projected `Selector`. |
-| `bootstrap/` | Schema-versioned migration runner. Refuses to downgrade. Idempotent. |
-| `context_analysis/` | Inspect a `MessageStore`: token totals by role, top-N largest messages, tool-call breakdown. UI cost-tracking. |
-| `skills/` | Skill registry + invocation — frontmatter-loaded prompt templates with input-schema validation, optional model override, optional tool allowlist. |
-| `plugins/` | Plugin trait + registry. Native plugins are full Rust trait objects; **third-party plugins run in WASM** via the `WasmPluginHost` trait (host plugs in wasmtime/wasmer in their own crate). |
-
-### Tier 3
+### Discovery + extensibility
 
 | Module | Purpose |
 |---|---|
-| `remote/` | JSON-RPC-2.0 line-delimited protocol for external hosts driving the agent in a separate process. Codec + dispatcher + stable method namespace. |
-| `tasks/` | High-level planning task graph — distinct from `swarm::task` (which is the swarm execution side). Cycle-checked dependencies, status auto-transitions on completion, ready-task query. |
-| `memory_extract/` | Heuristic background extractor — pulls `DECISION:`/`User prefers …`/URL-bearing/etc. patterns from text into `MemoryCandidate { kind, body, confidence }` for promotion to `memdir`. |
+| `mcp/` *(feature `mcp`)* | Full MCP client lifecycle + production `RmcpConnector` (stdio + HTTP/SSE), OAuth 2.0 + PKCE, channel permissions, server-initiated elicitation. |
+| `memdir/` | `MEMORY.md` directory loader — YAML-subset frontmatter, 4-type taxonomy, age-bucket relevance scoring. |
+| `skills/` | Frontmatter-loaded prompt templates + input-schema validation + optional model override / tool allowlist. |
+| `plugins/` | Plugin trait + registry. Native plugins are Rust trait objects; third-party plugins run in WASM via the `WasmPluginHost` trait. |
+| `state/` | `AppStateStore` — typed transient runtime state with broadcast subscribers + `Selector` projection. |
+| `bootstrap/` | Schema-versioned migration runner. |
+| `context_analysis/` | Inspect a `MessageStore`: token totals by role, top-N largest messages, tool-call breakdown. |
+| `tasks/` | Planning task graph — cycle-checked dependencies, status transitions, ready-task query. |
+| `memory_extract/` | Heuristic background extractor for `DECISION:` / `User prefers …` / URL-bearing patterns. |
+| `remote/` | JSON-RPC-2.0 line-delimited protocol for external hosts driving the agent in a separate process. |
 
-### Tier 4
+## Module surface — `agent-tools-code`
 
-| Module | Purpose |
-|---|---|
-| `tokenizer/` | Pluggable `Tokenizer` trait. `HeuristicTokenizer` (4-ASCII/1-CJK), `WordSplitTokenizer` (closer-to-BPE for English). Real tiktoken plugs in via the trait without dep-tree bloat. |
-| `attachments/` | Image attachment helpers — magic-byte mime sniff, inline-base64 image blocks, URL-source images, `[file: <path>]`-prefixed text attachments. |
+Optional companion crate. Every tool implements `agent::tool::Tool` with a proper `SafetyClass`.
 
-## Feature flags
-
-```toml
-[dependencies]
-agent = { path = "vendor/agent/crates/agent", default-features = false, features = ["anthropic", "session-jsonl"] }
-```
-
-| Flag | Pulls in | Notes |
+| Tool | Class | Feature |
 |---|---|---|
-| `anthropic` (default) | `reqwest` + `eventsource-stream` + `bytes` | Hand-rolled SSE; no SDK dep. |
-| `openai` | `async-openai` 0.36 | OpenAI-compatible providers. |
-| `ollama` | `ollama-rs` 0.3 | Local models. |
-| `mcp` | `rmcp` 1.5 + `reqwest` + `bytes` | Full MCP client lifecycle + OAuth. |
-| `session-jsonl` | `fs4` | JSONL session persistence. |
-| `swarm` | `fs4` + `notify` | Mailbox + teams. |
-| `full` | all of the above | Used by OP today; Zode tomorrow. |
+| `FileReadTool` | ReadOnly | `fs` |
+| `FileWriteTool` | Mutating | `fs` |
+| `FileEditTool` | Mutating | `fs` |
+| `ListDirTool` | ReadOnly | `fs` |
+| `MkdirTool` | Mutating | `fs` |
+| `MoveTool` | Mutating | `fs` |
+| `RemoveTool` | Destructive | `fs` |
+| `GrepTool` | ReadOnly | `search` |
+| `GlobTool` | ReadOnly | `search` |
+| `ToolSearchTool` | ReadOnly | (always) |
 
-## Status by phase + tier
+A shared `WorkspacePolicy` enforces path containment, file-size caps, and symlink rules. `register_default(registry, policy)` bulk-registers every enabled tool.
 
-### Phases (foundation work)
+`ToolSearchTool` lets a host expose 50+ candidate tools without flooding the model's tool list — register them on a separate registry and the model uses `select:Name1,Name2` or keyword search to surface the few it needs.
 
-- **Phase 1 (foundation):** message DAG, store, abort, error taxonomy. ✅
-- **Phase 2 (providers):** Anthropic + OpenAI-compat + Ollama. ✅
-- **Phase 3 (query loop):** multi-turn, tool dispatch, hooks, permissions. ✅
-- **Phase 4 (context):** sliding window, token estimator, boundary marker. ✅
-- **Phase 5 (session):** JSONL persistence + MCP type wiring. ✅
-- **Phase 6 (swarm):** mailbox, sub_agent, team, coordinator, permission sync, backends. ✅
+## Design principles
 
-### Tiers (claude-code parity audit — [`openpencil-docs/agent-rs/notes/2026-05-02-claude-code-completeness-audit.md`](../openpencil-docs/agent-rs/notes/2026-05-02-claude-code-completeness-audit.md))
+1. **Library-only.** No global state, no `tokio::main`, no `panic!` on bad input — every error path is a typed `AgentError`.
+2. **Product-agnostic.** Concrete tools live outside the runtime crate. The `agent` crate defines the trait; `agent-tools-code` ships generic implementations; product-specific tools live in product crates.
+3. **Streaming first.** Every provider is a streaming source. Multi-turn / tool dispatch / compaction are coordinated through one `Event` vocabulary, no polling.
+4. **Cancellation everywhere.** Every async surface honors an `AbortController` — including the `tokio::task::spawn_blocking` workers used by Grep / Glob.
+5. **No `unsafe`.** `#![forbid(unsafe_code)]` in both crates.
+6. **Defensive against the model.** Permissions fail safe (Unknown ≡ Destructive for gating). Tool schemas validated before reaching the wire. Path operations canonicalize before any I/O. Idempotent writes detect no-ops.
+7. **Cost-aware.** Tool schemas, prompt cache, and token usage feed an integer-precision USD accumulator. Long-running sessions don't drift.
 
-- **Tier 1 — Compaction (Q-α/β/γ/δ):** LLM summarization, auto-trigger, microcompact, session memory, post-cleanup, grouping, QueryLoop integration. ✅
-- **Tier 1 — API service layer:** retry, prompt-cache-break, effort, output, errors, logging. ✅ (`f53d5a7`)
-- **Tier 1 — MEMORY.md loader:** frontmatter, 4-type taxonomy, paths, scan, age, relevance. ✅ (`9ad5a11`)
-- **Tier 1 — MCP client:** config, registry, permissions, elicitation, OAuth, lifecycle. ✅ (`01163c8`)
-- **Tier 2 — State store + Bootstrap + Context analysis.** ✅ (`6cb6a35`)
-- **Tier 2 — Skills + Plugins (WASM-3rd-party).** ✅ (`07970b1`)
-- **Tier 3 — Remote protocol + Tasks + Memory extraction.** ✅ (`17e6acb`)
-- **Tier 4 — Tokenizer trait + Attachments.** ✅ (`e23f767`)
-
-### Phase 7 — cross-repo cutover (pending)
-
-OP + Zode swap from Zig agent to agent-rs. Tier 1–4 surface is now feature-complete relative to the audit; Phase 7 work is wiring `agent` crate into the consumer build configs.
-
-## Cross-product API rule
-
-The `agent` crate must NOT import or reference product-specific concepts. No `openpencil_*`, no `zode_*`. Domain tools (canvas ops, terminal I/O, file edits, grep, etc.) are implemented per-product in their own crates and registered into agent's `ToolRegistry`. TUI / terminal control / IDE bridges belong to Zode; canvas chrome belongs to `openpencil-shell`.
-
-## Plugin architecture
-
-agent-rs hosts both flavors of plugin uniformly through the same `Plugin` trait:
-
-- **Native (built-in)** plugins are full Rust trait objects — direct dispatch, no sandboxing overhead. Implement `Plugin` in your own crate.
-- **Third-party** plugins run in a WASM sandbox. agent-rs deliberately does NOT pull `wasmtime` / `wasmer` into the dep tree; it ships the `WasmPluginHost` trait + a no-op default. Consumers wire a wasmtime-backed host into the registry.
-
-Per the project decision (memory entry `project_plugins_wasm_third_party.md`, 2026-05-02): WASM only for untrusted third-party code; built-ins stay native.
-
-## Layout
-
-```text
-agent-rs/
-├── Cargo.toml             # workspace root
-├── deny.toml              # cargo-deny advisory + license policy
-└── crates/
-    └── agent/             # the library crate
-```
-
-The crate name is `agent`. Consumers add it as a `vendor/agent` submodule pointing at this repo, then depend on it via `path = "vendor/agent/crates/agent"`.
-
-## Documentation
-
-Architecture, migration plan, and research notes live in the central docs repo, **not** in this code repo (kept code-only on purpose):
-
-- [`openpencil-docs/agent-rs/docs/architecture.md`](../openpencil-docs/agent-rs/docs/architecture.md) — module map, async runtime model, cross-product API rule.
-- [`openpencil-docs/agent-rs/docs/migration.md`](../openpencil-docs/agent-rs/docs/migration.md) — Zig → Rust migration plan.
-- [`openpencil-docs/agent-rs/notes/`](../openpencil-docs/agent-rs/notes/) — claude-code parity audits, SDK maturity research, Zig skeleton audit, non-TUI gap analysis.
-
-History note: prior to `git filter-branch` on 2026-05-02, these directories lived in-tree at `agent-rs/docs/` and `agent-rs/notes/`. They were moved to consolidate documentation across the OpenPencil + Zode + agent-rs ecosystem.
-
-## Building + testing
+## Testing
 
 ```sh
-cargo build --all-features
-cargo test --workspace --all-features      # 610 unit + 13 integration + 5 doc tests, 3 ignored (real-API gates)
+cargo test --workspace --all-features        # 743 + 61 unit + 14 integration + 5 doc tests, 4 ignored (real-API gates)
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
-cargo deny --all-features check            # CI gate
 ```
+
+The 4 `#[ignore]`-gated tests hit real APIs (Anthropic / OpenAI / Ollama / Anthropic Files) when their environment variables are set. CI runs the full suite with mocks; real-API runs are manual.
+
+## Contributing
+
+PRs welcome. Two ground rules:
+
+1. **No product-specific imports in the `agent` crate.** Generic concepts only.
+2. **Adversarial review every change.** This codebase is reviewed by Codex (or equivalent) on every meaningful diff — round 1 catches bugs, round 2 catches the regressions introduced by round 1's fixes. Roughly half of the commit messages name the bug each round caught.
+
+Open an issue first for anything bigger than a small fix so we can align on direction.
 
 ## License
 
