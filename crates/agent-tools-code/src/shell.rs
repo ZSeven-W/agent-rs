@@ -272,10 +272,14 @@ where
 /// When tail-truncation cuts mid-codepoint, `String::from_utf8_lossy`
 /// inserts a U+FFFD at the prefix. Trim the leading bytes to the
 /// next valid UTF-8 boundary so output starts on a real character.
+///
+/// In well-formed UTF-8 every codepoint is at most 4 bytes, so at
+/// most 3 leading continuation bytes (top two bits == `10`) can
+/// follow a cut. We scan up to 4 bytes; pathological non-UTF-8
+/// streams may still surface U+FFFDs via `from_utf8_lossy`, which
+/// is acceptable — the function only promises a best-effort fix
+/// for clean UTF-8 inputs that happened to be cut mid-character.
 fn trim_to_utf8_boundary(bytes: Vec<u8>) -> Vec<u8> {
-    // Walk forward looking for a byte that isn't a UTF-8 continuation
-    // (top two bits != 10). Up to 3 leading bytes can be invalid
-    // continuations after a tail cut.
     for (i, &b) in bytes.iter().take(4).enumerate() {
         if b & 0b1100_0000 != 0b1000_0000 {
             return if i == 0 { bytes } else { bytes[i..].to_vec() };

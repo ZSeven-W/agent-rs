@@ -35,7 +35,7 @@
 //! injected `with_client` is then used).
 
 use std::net::{IpAddr, SocketAddr};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agent::error::AgentError;
 use agent::tool::{SafetyClass, Tool, ToolUseContext};
@@ -320,32 +320,46 @@ fn host_port_of(url: &str) -> Result<(String, u16), AgentError> {
 /// Fetch a URL with the SSRF guard applied at every redirect hop.
 /// Disables reqwest auto-redirects, then for each hop:
 /// 1. Resolves + validates the host's IP(s).
-/// 2. Builds a fresh `reqwest::Client` with `resolve()` pinning the
-///    pre-validated addresses, defeating connect-time DNS rebinding.
-/// 3. Sends the GET; on 30x, parses `Location:` and loops.
+/// 2. Builds a fresh `reqwest::Client` with `resolve_to_addrs()`
+///    pinning **all** pre-validated addresses in one call so multi-
+///    address (dual-stack) responses survive intact, defeating
+///    connect-time DNS rebinding.
+/// 3. Sends the GET; on 30x, parses `Location:` and loops, but the
+///    total wall-time is bounded by a single shared deadline so a
+///    chain of slow hops can't bypass the caller's timeout.
 async fn fetch_with_pinned_redirects(
     initial_url: &str,
     timeout_secs: u64,
     abort: &agent::abort::AbortController,
 ) -> Result<reqwest::Response, AgentError> {
+    let total_budget = Duration::from_secs(timeout_secs);
+    let deadline = Instant::now() + total_budget;
     let mut current = initial_url.to_string();
     let mut hops = 0usize;
     loop {
-        let (host, _port, addrs) = resolve_and_validate(&current).await?;
-        let mut builder = reqwest::Client::builder()
-            .redirect(Policy::none())
-            .user_agent(format!("agent-tools-code/{}", env!("CARGO_PKG_VERSION")));
-        for addr in &addrs {
-            // `Client::builder().resolve()` ignores the port in the
-            // SocketAddr; the URL's port is what reqwest will use.
-            builder = builder.resolve(&host, *addr);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(AgentError::other(format!(
+                "WebFetch '{initial_url}' timed out after {timeout_secs}s (across {hops} redirect hop(s))"
+            )));
         }
-        let client = builder
+
+        let (host, _port, addrs) = resolve_and_validate(&current).await?;
+        // Single `resolve_to_addrs` call so all pre-validated IPs end
+        // up in the dns_overrides entry — `resolve()` per-addr in a
+        // loop would overwrite each prior pin, leaving only the last.
+        let client = reqwest::Client::builder()
+            .redirect(Policy::none())
+            .user_agent(format!("agent-tools-code/{}", env!("CARGO_PKG_VERSION")))
+            .resolve_to_addrs(&host, &addrs)
             .build()
             .map_err(|e| AgentError::other(format!("WebFetch client build failed: {e}")))?;
-        let request = client
-            .get(&current)
-            .timeout(Duration::from_secs(timeout_secs));
+
+        // Per-hop request timeout = remaining budget. We add a small
+        // grace to the outer `tokio::time::timeout` so the inner
+        // request timeout fires first with a clearer error.
+        let request = client.get(&current).timeout(remaining);
+        let outer = remaining + Duration::from_secs(5);
 
         let resp = tokio::select! {
             biased;
@@ -354,12 +368,12 @@ async fn fetch_with_pinned_redirects(
                     abort.reason().unwrap_or_else(|| "aborted".into()),
                 ));
             }
-            r = timeout(Duration::from_secs(timeout_secs + 5), request.send()) => {
+            r = timeout(outer, request.send()) => {
                 match r {
                     Ok(Ok(resp)) => resp,
                     Ok(Err(e)) => return Err(AgentError::other(format!("WebFetch '{current}' failed: {e}"))),
                     Err(_) => return Err(AgentError::other(format!(
-                        "WebFetch '{current}' timed out after {timeout_secs}s"
+                        "WebFetch '{current}' timed out (budget exhausted)"
                     ))),
                 }
             }
