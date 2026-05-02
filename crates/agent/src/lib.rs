@@ -15,6 +15,8 @@ pub mod error;
 pub mod file_cache;
 pub mod hook;
 pub mod json;
+#[cfg(feature = "mcp")]
+pub mod mcp;
 pub mod memdir;
 pub mod message;
 pub mod permission;
