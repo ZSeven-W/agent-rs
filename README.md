@@ -6,11 +6,11 @@
 
 Multi-provider · tool-capable end-to-end · structured permissions · real MCP · zero `unsafe`.
 
-[![CI](https://img.shields.io/github/actions/workflow/status/ZSeven-W/agent-rs/ci.yml?branch=main&style=flat-square&logo=github-actions&logoColor=white&label=CI)](https://github.com/ZSeven-W/agent-rs/actions)
-[![Tests](https://img.shields.io/badge/tests-837_passing-brightgreen?style=flat-square)](#testing)
-[![Rust](https://img.shields.io/badge/rust-1.80%2B-orange?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
-[![Unsafe](https://img.shields.io/badge/unsafe-forbidden-success?style=flat-square&logo=rust&logoColor=white)](https://github.com/ZSeven-W/agent-rs/blob/main/crates/agent/src/lib.rs)
-[![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](./LICENSE)
+[![CI](https://img.shields.io/github/actions/workflow/status/ZSeven-W/agent-rs/ci.yml?branch=main&style=flat&logo=github-actions&logoColor=white&label=CI)](https://github.com/ZSeven-W/agent-rs/actions)
+[![Tests](https://img.shields.io/badge/tests-837_passing-brightgreen?style=flat)](#testing)
+[![Rust](https://img.shields.io/badge/rust-1.80%2B-orange?style=flat&logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![Unsafe](https://img.shields.io/badge/unsafe-forbidden-success?style=flat&logo=rust&logoColor=white)](https://github.com/ZSeven-W/agent-rs/blob/main/crates/agent/src/lib.rs)
+[![License](https://img.shields.io/badge/license-MIT-blue?style=flat)](./LICENSE)
 
 ```text
 ┌─ user ──┐    ┌─── QueryLoop ───────────────────────────────────────┐
