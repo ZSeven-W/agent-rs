@@ -41,7 +41,10 @@ todo = []
 all = ["fs", "shell", "search", "web", "todo"]
 
 [dependencies]
-agent = { path = "../agent", default-features = false }
+# Path + version: path wins for in-workspace builds; version pin keeps
+# cargo-deny's wildcard-dependency lint quiet for downstream consumers
+# who add this crate via `git`/`path` overrides.
+agent = { path = "../agent", version = "0.1.0", default-features = false }
 
 tokio = { workspace = true }
 async-trait = { workspace = true }
