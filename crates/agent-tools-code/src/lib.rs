@@ -44,6 +44,7 @@
 //! | Bash      | `Mutating`    | Caller can gate Destructive shell      |
 //! |           |               | shapes via PermissionMatcher.          |
 //! | NotebookEdit | `Mutating` | Cell-level Jupyter .ipynb edits.       |
+//! | WebSearch | `ReadOnly`    | Pluggable backend (Tavily default).    |
 //! | Remove    | `Destructive` | Irreversible.                          |
 //!
 //! Hosts compose these with [`agent::permission::PermissionMatcher`]
@@ -73,6 +74,9 @@ pub mod todo;
 #[cfg(feature = "web")]
 pub mod web;
 
+#[cfg(feature = "web-search")]
+pub mod web_search;
+
 pub use discovery::ToolSearchTool;
 pub use policy::{PolicyError, WorkspacePolicy};
 
@@ -95,6 +99,11 @@ pub use todo::{TodoItem, TodoState, TodoStatus, TodoWriteTool};
 
 #[cfg(feature = "web")]
 pub use web::WebFetchTool;
+
+#[cfg(feature = "web-search")]
+pub use web_search::{
+    SearchResponse, SearchResult, TavilyBackend, WebSearchBackend, WebSearchError, WebSearchTool,
+};
 
 use std::sync::Arc;
 

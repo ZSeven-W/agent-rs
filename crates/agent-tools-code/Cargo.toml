@@ -36,6 +36,12 @@ search = ["dep:regex", "dep:ignore"]
 # for the SSRF guard's host parsing.
 web = ["dep:reqwest", "dep:futures", "dep:url"]
 
+# WebSearch tool with pluggable backends. Ships a Tavily impl as
+# the default; hosts can implement `WebSearchBackend` for Brave /
+# Bing / Kagi / SerpAPI / a private corpus. Reuses the `web`
+# feature's reqwest dep — no extra deps of its own.
+web-search = ["web"]
+
 # In-memory TodoWrite list. Pure logic, no extra deps.
 todo = []
 
@@ -45,7 +51,7 @@ todo = []
 notebook = []
 
 # Convenience: every tool flag on.
-all = ["fs", "shell", "search", "web", "todo", "notebook"]
+all = ["fs", "shell", "search", "web", "web-search", "todo", "notebook"]
 
 [dependencies]
 # Path + version: path wins for in-workspace builds; version pin keeps

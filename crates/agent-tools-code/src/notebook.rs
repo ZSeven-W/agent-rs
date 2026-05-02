@@ -5,9 +5,9 @@
 //! and chooses one of three modes:
 //!
 //! - `replace` — overwrite the cell's `source` with `new_source`.
-//! - `insert`  — insert a new cell at the position; the existing
-//!               cell at that index is pushed down.
-//! - `delete`  — remove the cell entirely.
+//! - `insert` — insert a new cell at the position; the existing
+//!   cell at that index is pushed down.
+//! - `delete` — remove the cell entirely.
 //!
 //! Cell type defaults to `code`; pass `cell_type: "markdown"` to
 //! create / convert to a markdown cell. `raw` is also accepted.

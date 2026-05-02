@@ -172,6 +172,16 @@ versions when `0.1.0` ships.
   `<style>` / `<noscript>` and decodes named + numeric entities.
   `allow_private_networks: true` opts out of the guard for hosts
   that legitimately need intranet access.
+- Web-search pack *(feature `web-search`)*: `WebSearchTool` with a
+  pluggable `WebSearchBackend` trait. Ships `TavilyBackend` as the
+  default impl (Tavily Search API, `POST
+  https://api.tavily.com/search`); hosts can implement Brave / Bing
+  / Kagi / SerpAPI / a private corpus by implementing the trait.
+  Output `[{title, url, snippet}]` plus optional aggregated `answer`
+  field. Default 5 results / 20 s timeout (hard ceilings 20 / 60).
+  Honors `ctx.abort` via `tokio::select!`. Models can pipe each
+  result URL into `WebFetchTool` for full-page reading — the
+  canonical `WebSearch → WebFetch` pair.
 - Notebook pack *(feature `notebook`)*: `NotebookEditTool` —
   cell-level Jupyter `.ipynb` edits. Modes: `replace` (default) /
   `insert` / `delete`. Locate by stable `cell_id` (preferred) or

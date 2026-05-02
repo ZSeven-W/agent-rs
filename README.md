@@ -139,6 +139,7 @@ agent-tools-code = { git = "https://github.com/ZSeven-W/agent-rs", default-featu
 | **`search`** *(default)* | `regex` + `ignore` | Grep · Glob *(gitignore-aware)* |
 | `shell` | `shell-words` | Bash *(timeout, abort, output cap)* |
 | `web` | `reqwest` + `futures` | WebFetch *(HTML→text, size cap)* |
+| `web-search` | `web` | WebSearch *(pluggable backend, ships Tavily)* |
 | `todo` | (none) | TodoWrite *(in-memory shared state)* |
 | `notebook` | (none) | NotebookEdit *(Jupyter .ipynb cell-level edits)* |
 | `all` | all of the above | |
@@ -234,6 +235,7 @@ That's the full picture: registry → provider → loop. The runtime handles too
 | `GlobTool` | `ReadOnly` | `search` |
 | `BashTool` | `Mutating` | `shell` |
 | `WebFetchTool` | `ReadOnly` | `web` |
+| `WebSearchTool` | `ReadOnly` | `web-search` |
 | `TodoWriteTool` | `Mutating` | `todo` |
 | `NotebookEditTool` | `Mutating` | `notebook` |
 | `ToolSearchTool` | `ReadOnly` | (always) |
