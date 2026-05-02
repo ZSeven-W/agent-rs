@@ -22,6 +22,7 @@
 
 pub mod auth;
 pub mod config;
+pub mod connector;
 pub mod elicitation;
 pub mod lifecycle;
 pub mod permissions;
@@ -29,6 +30,7 @@ pub mod registry;
 
 pub use auth::{AuthError, OauthClient, PendingAuthorization, Tokens};
 pub use config::{parse_json, parse_json_str, ConfigError, McpConfig, McpServerConfig};
+pub use connector::{RmcpConnection, RmcpConnector};
 pub use elicitation::{
     AutoConfirmElicitationHandler, ElicitationHandler, ElicitationHandlerRef, ElicitationRequest,
     ElicitationResponse, NoopElicitationHandler,

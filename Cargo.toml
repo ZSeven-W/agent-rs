@@ -30,13 +30,20 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 uuid = { version = "1", features = ["v4", "serde"] }
 
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream", "charset", "form", "http2"] }
 eventsource-stream = "0.2"
 
 # LLM SDK crates (per notes/2026-05-01-sdk-maturity-research.md verdict)
 async-openai = { version = "0.36", default-features = false, features = ["chat-completion"] }
 ollama-rs = { version = "0.3", features = ["stream"] }
-rmcp = "1.5"
+rmcp = { version = "1.5", default-features = false, features = [
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client",
+    "transport-streamable-http-client-reqwest",
+    "client-side-sse",
+    "macros",
+] }
 
 lru = "0.18"  # bumped from 0.12 to avoid RUSTSEC-2026-0002 (IterMut unsoundness in 0.12.x)
 fs4 = "0.9"  # sync API only; lock+IO ops are wrapped in tokio::task::spawn_blocking by callers
