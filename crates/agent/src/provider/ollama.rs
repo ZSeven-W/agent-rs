@@ -337,9 +337,19 @@ fn content_to_plain_text(blocks: &[ContentBlock]) -> String {
                 }
                 buf.push_str(thinking);
             }
-            ContentBlock::ToolUse { .. }
-            | ContentBlock::Image { .. }
-            | ContentBlock::ToolResult { .. } => {
+            ContentBlock::Image { .. } => {
+                if !buf.is_empty() {
+                    buf.push('\n');
+                }
+                buf.push_str("[image attachment]");
+            }
+            ContentBlock::Document { .. } => {
+                if !buf.is_empty() {
+                    buf.push('\n');
+                }
+                buf.push_str("[document attachment]");
+            }
+            ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => {
                 // ToolUse: render via tool_calls when wired (skipped now).
                 // Image: Ollama supports vision via message.images Vec<Image>;
                 //   not yet threaded.
@@ -534,6 +544,28 @@ mod tests {
             },
         ];
         assert_eq!(content_to_plain_text(&blocks), "first\nsecond");
+    }
+
+    #[test]
+    fn content_to_plain_text_surfaces_image_and_document_placeholders() {
+        use crate::message::DocumentSource;
+        let blocks = vec![
+            ContentBlock::Text { text: "hi".into() },
+            ContentBlock::Image {
+                source: crate::message::ImageSource::File {
+                    file_id: "file_a".into(),
+                },
+            },
+            ContentBlock::Document {
+                source: DocumentSource::File {
+                    file_id: "file_b".into(),
+                },
+            },
+        ];
+        let out = content_to_plain_text(&blocks);
+        assert!(out.contains("hi"));
+        assert!(out.contains("[image attachment]"), "got {out}");
+        assert!(out.contains("[document attachment]"), "got {out}");
     }
 
     /// Real-Ollama integration test, gated by OLLAMA_TEST_MODEL env

@@ -98,6 +98,25 @@ fn estimate_block_tokens(block: &ContentBlock) -> u32 {
                 ((data.len() as u32) / 4).saturating_add(8)
             }
             ImageSource::Url { url } => estimate_text_tokens(url).saturating_add(8),
+            // File-id references are tiny strings on the wire; the
+            // server fetches the actual bytes so we don't bill them
+            // against this turn's context window.
+            ImageSource::File { file_id } => estimate_text_tokens(file_id).saturating_add(8),
+        },
+        // Document blocks travel as either inline base64 or file
+        // references. Same byte-rate heuristic as images, plus a
+        // slightly larger overhead because document handling on
+        // Anthropic's side adds OCR / parse metadata.
+        ContentBlock::Document { source } => match source {
+            crate::message::DocumentSource::Base64 { data, .. } => {
+                ((data.len() as u32) / 4).saturating_add(16)
+            }
+            crate::message::DocumentSource::Url { url } => {
+                estimate_text_tokens(url).saturating_add(16)
+            }
+            crate::message::DocumentSource::File { file_id } => {
+                estimate_text_tokens(file_id).saturating_add(16)
+            }
         },
         ContentBlock::ToolUse { id, name, input } => {
             let json_len = serde_json::to_string(input).map(|s| s.len()).unwrap_or(0);

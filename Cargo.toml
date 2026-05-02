@@ -30,7 +30,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 uuid = { version = "1", features = ["v4", "serde"] }
 
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream", "charset", "form", "http2"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream", "charset", "form", "multipart", "http2"] }
 eventsource-stream = "0.2"
 
 # LLM SDK crates (per notes/2026-05-01-sdk-maturity-research.md verdict)

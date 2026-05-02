@@ -495,9 +495,26 @@ fn content_to_plain_text(blocks: &[ContentBlock]) -> String {
                 }
                 buf.push_str(thinking);
             }
-            ContentBlock::ToolUse { .. }
-            | ContentBlock::Image { .. }
-            | ContentBlock::ToolResult { .. } => {
+            // Make the presence of a non-text block visible so the
+            // model isn't confused by an empty user message when
+            // the host attached an image / document. OpenAI's
+            // chat-completions API does support multimodal content
+            // arrays, but our renderer falls back to a plain-text
+            // join for now; surface a marker rather than silently
+            // dropping.
+            ContentBlock::Image { .. } => {
+                if !buf.is_empty() {
+                    buf.push('\n');
+                }
+                buf.push_str("[image attachment]");
+            }
+            ContentBlock::Document { .. } => {
+                if !buf.is_empty() {
+                    buf.push('\n');
+                }
+                buf.push_str("[document attachment]");
+            }
+            ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => {
                 // ToolUse on assistant messages is rendered as
                 // structured `tool_calls` in the assistant builder
                 // (see render_messages), NOT as plain text — that
@@ -747,6 +764,32 @@ mod tests {
             },
         ];
         assert_eq!(content_to_plain_text(&blocks), "first\nsecond");
+    }
+
+    #[test]
+    fn content_to_plain_text_surfaces_image_and_document_placeholders() {
+        // Codex round-2 finding (f): silent dropping was the wrong
+        // failure mode. Multimodal blocks now show up as visible
+        // markers in the plain-text fallback so the model isn't
+        // surprised by a "missing" attachment.
+        use crate::message::DocumentSource;
+        let blocks = vec![
+            ContentBlock::Text { text: "hi".into() },
+            ContentBlock::Image {
+                source: crate::message::ImageSource::File {
+                    file_id: "file_a".into(),
+                },
+            },
+            ContentBlock::Document {
+                source: DocumentSource::File {
+                    file_id: "file_b".into(),
+                },
+            },
+        ];
+        let out = content_to_plain_text(&blocks);
+        assert!(out.contains("hi"));
+        assert!(out.contains("[image attachment]"), "got {out}");
+        assert!(out.contains("[document attachment]"), "got {out}");
     }
 
     #[test]

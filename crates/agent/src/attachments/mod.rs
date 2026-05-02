@@ -10,13 +10,36 @@
 //!   `ContentBlock::Image { source: ImageSource::Base64 { ... } }`.
 //! - Anthropic + OpenAI also accept image URLs via
 //!   `ImageSource::Url { url }`.
+//! - Anthropic supports referencing previously-uploaded Files API
+//!   blobs via `ImageSource::File { file_id }` /
+//!   `DocumentSource::File { file_id }` — this module's
+//!   [`files::FilesClient`] trait abstracts the upload transport and
+//!   [`smart::image_smart`] / [`smart::pdf_attachment`] auto-route
+//!   between inline and uploaded forms based on payload size.
 //! - For "large text" attachments (long file contents the user
 //!   pastes), we fold them into a `ContentBlock::Text` with a clear
 //!   `[file: <path>]` header so the model can identify the source.
 //!
-//! Functions here are pure — no I/O. Hosts read the file/buffer
-//! themselves and call [`image_from_bytes`], [`image_from_url`], or
-//! [`text_attachment`] to build the right block.
+//! Pure helpers (no I/O) live at the top level. The async
+//! [`files::FilesClient`] trait + [`smart`] helpers do I/O and live
+//! in submodules so a host that doesn't need uploads stays free of
+//! the `async-trait` dep cone.
+
+#[cfg(feature = "anthropic")]
+pub mod anthropic_client;
+pub mod files;
+pub mod smart;
+
+pub use files::{
+    FilesClient, FilesError, InMemoryFilesClient, UploadedFile, ANTHROPIC_FILES_MAX_BYTES,
+};
+pub use smart::{
+    image_smart, pdf_attachment, text_attachment_via_files, AttachmentDestination,
+    MAX_INLINE_PDF_BYTES,
+};
+
+#[cfg(feature = "anthropic")]
+pub use anthropic_client::AnthropicFilesClient;
 
 use serde::{Deserialize, Serialize};
 
@@ -72,8 +95,8 @@ pub enum AttachmentError {
 }
 
 /// Maximum inline-base64 image size accepted by the Anthropic
-/// Messages API. Files above this limit must be uploaded via the
-/// Files API and referenced by id (not yet implemented).
+/// Messages API. Images above this limit upload via the Files API
+/// (see [`smart::image_smart`] for the auto-routing helper).
 pub const MAX_INLINE_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 
 /// Build an inline image content block from raw bytes. Sniffs the
@@ -116,7 +139,7 @@ pub fn text_attachment(path: &str, content: &str) -> ContentBlock {
 /// Standard base64 (RFC 4648) WITH padding, no line breaks. Inline
 /// implementation to avoid pulling a base64 crate just for image
 /// uploads.
-fn base64_encode(bytes: &[u8]) -> String {
+pub(crate) fn base64_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     let chunks = bytes.chunks(3);

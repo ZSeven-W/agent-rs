@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::abort::AbortController;
 use crate::error::AgentError;
-use crate::message::{ContentBlock, ImageSource, Message, ToolResultContent};
+use crate::message::{ContentBlock, DocumentSource, ImageSource, Message, ToolResultContent};
 use crate::provider::{Provider, ProviderCapabilities, StreamRequest, ToolChoice, ToolDefinition};
 use crate::stream::{Event, EventStream, ResultData};
 
@@ -27,6 +27,11 @@ const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const PROMPT_CACHING_BETA: &str = "prompt-caching-2024-07-31";
 const EXTENDED_THINKING_BETA: &str = "extended-thinking-2025-05-01";
+/// Required to reference Files API uploads (`file_id` sources) from
+/// Messages requests. We send it whenever any block in the request
+/// uses a `File` source; sending it spuriously is harmless on
+/// Anthropic's side but adds a header byte.
+const FILES_API_BETA: &str = "files-api-2025-04-14";
 
 #[derive(Debug, Clone)]
 pub struct AnthropicProvider {
@@ -104,6 +109,9 @@ impl Provider for AnthropicProvider {
         if req.thinking.is_some() {
             betas.push(EXTENDED_THINKING_BETA);
         }
+        if request_uses_file_sources(&req) {
+            betas.push(FILES_API_BETA);
+        }
         if !betas.is_empty() {
             headers.insert(
                 "anthropic-beta",
@@ -138,6 +146,40 @@ impl Provider for AnthropicProvider {
 
         Ok(Box::new(rx))
     }
+}
+
+/// `true` if any content block in the request references a Files
+/// API upload (`ImageSource::File` or `DocumentSource::File`),
+/// including blocks nested inside `ToolResultContent::Blocks`.
+/// Triggers the `anthropic-beta: files-api-...` header — without
+/// it Anthropic 400s on `file_id` sources, and we'd silently miss
+/// the requirement for tool_results that carry an image file ref.
+fn request_uses_file_sources(req: &StreamRequest) -> bool {
+    fn block_uses_file(block: &ContentBlock) -> bool {
+        match block {
+            ContentBlock::Image {
+                source: ImageSource::File { .. },
+            } => true,
+            ContentBlock::Document {
+                source: DocumentSource::File { .. },
+            } => true,
+            ContentBlock::ToolResult { content, .. } => match content {
+                ToolResultContent::Blocks(bs) => bs.iter().any(block_uses_file),
+                ToolResultContent::Text(_) => false,
+            },
+            _ => false,
+        }
+    }
+    for m in &req.messages {
+        let content = match m {
+            Message::User { content, .. } | Message::Assistant { content, .. } => content,
+            _ => continue,
+        };
+        if content.iter().any(block_uses_file) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Build the JSON body for `POST /v1/messages`.
@@ -274,6 +316,24 @@ fn render_block(b: &ContentBlock) -> serde_json::Value {
                 "type": "image",
                 "source": {"type": "url", "url": url},
             }),
+            ImageSource::File { file_id } => serde_json::json!({
+                "type": "image",
+                "source": {"type": "file", "file_id": file_id},
+            }),
+        },
+        ContentBlock::Document { source } => match source {
+            DocumentSource::Base64 { media_type, data } => serde_json::json!({
+                "type": "document",
+                "source": {"type": "base64", "media_type": media_type, "data": data},
+            }),
+            DocumentSource::Url { url } => serde_json::json!({
+                "type": "document",
+                "source": {"type": "url", "url": url},
+            }),
+            DocumentSource::File { file_id } => serde_json::json!({
+                "type": "document",
+                "source": {"type": "file", "file_id": file_id},
+            }),
         },
         ContentBlock::ToolUse { id, name, input } => serde_json::json!({
             "type": "tool_use",
@@ -289,19 +349,34 @@ fn render_block(b: &ContentBlock) -> serde_json::Value {
             let inner = match content {
                 ToolResultContent::Text(t) => serde_json::json!(t),
                 ToolResultContent::Blocks(bs) => {
-                    // Anthropic's tool_result content array only accepts
-                    // `text` and `image` blocks. Filter anything else
-                    // (tool_use / tool_result / thinking would be rejected
-                    // by the API) so we degrade gracefully instead of
-                    // sending an invalid payload.
-                    let filtered: Vec<serde_json::Value> = bs
+                    // Anthropic's tool_result content array only
+                    // accepts `text` and `image` blocks. Other blocks
+                    // (tool_use / tool_result / thinking / document)
+                    // would be wire-rejected. Render text/image
+                    // blocks as-is; surface other variants as a
+                    // visible text placeholder so the model still
+                    // sees that something was returned (silent
+                    // dropping was the wrong failure mode — the
+                    // model would refer to a missing attachment).
+                    let mapped: Vec<serde_json::Value> = bs
                         .iter()
-                        .filter(|b| {
-                            matches!(b, ContentBlock::Text { .. } | ContentBlock::Image { .. })
+                        .map(|b| match b {
+                            ContentBlock::Text { .. } | ContentBlock::Image { .. } => {
+                                render_block(b)
+                            }
+                            ContentBlock::Document { .. } => serde_json::json!({
+                                "type": "text",
+                                "text": "[document attachment elided — Anthropic tool_result blocks accept only text/image]",
+                            }),
+                            ContentBlock::ToolUse { .. }
+                            | ContentBlock::ToolResult { .. }
+                            | ContentBlock::Thinking { .. } => serde_json::json!({
+                                "type": "text",
+                                "text": "[non-text/image block elided from tool_result]",
+                            }),
                         })
-                        .map(render_block)
                         .collect();
-                    serde_json::json!(filtered)
+                    serde_json::json!(mapped)
                 }
             };
             let mut obj = serde_json::json!({
@@ -824,10 +899,172 @@ mod tests {
     }
 
     #[test]
-    fn render_block_filters_non_text_image_inside_tool_result() {
+    fn request_uses_file_sources_detects_image_and_document_refs() {
+        use crate::message::{ContentBlock, DocumentSource, Header, ImageSource, Message};
+        // No file refs.
+        let plain = StreamRequest::new(
+            "m",
+            vec![Message::User {
+                header: Header::new(),
+                content: vec![ContentBlock::Text { text: "hi".into() }],
+            }],
+        );
+        assert!(!request_uses_file_sources(&plain));
+        // Image file ref.
+        let img_ref = StreamRequest::new(
+            "m",
+            vec![Message::User {
+                header: Header::new(),
+                content: vec![ContentBlock::Image {
+                    source: ImageSource::File {
+                        file_id: "file_a".into(),
+                    },
+                }],
+            }],
+        );
+        assert!(request_uses_file_sources(&img_ref));
+        // Document file ref.
+        let doc_ref = StreamRequest::new(
+            "m",
+            vec![Message::User {
+                header: Header::new(),
+                content: vec![ContentBlock::Document {
+                    source: DocumentSource::File {
+                        file_id: "file_b".into(),
+                    },
+                }],
+            }],
+        );
+        assert!(request_uses_file_sources(&doc_ref));
+        // URL-source images should NOT trigger the beta.
+        let url_img = StreamRequest::new(
+            "m",
+            vec![Message::User {
+                header: Header::new(),
+                content: vec![ContentBlock::Image {
+                    source: ImageSource::Url {
+                        url: "https://example.com/x.png".into(),
+                    },
+                }],
+            }],
+        );
+        assert!(!request_uses_file_sources(&url_img));
+    }
+
+    #[test]
+    fn request_uses_file_sources_recurses_into_tool_result_blocks() {
+        // Codex round-2 finding (k): a tool_result returning an
+        // image-file-ref must still trigger the Files beta header
+        // on the outer Messages request.
+        use crate::message::{ContentBlock, Header, ImageSource, Message, ToolResultContent};
+        let req = StreamRequest::new(
+            "m",
+            vec![Message::User {
+                header: Header::new(),
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "tu_1".into(),
+                    content: ToolResultContent::Blocks(vec![ContentBlock::Image {
+                        source: ImageSource::File {
+                            file_id: "file_inside_tool_result".into(),
+                        },
+                    }]),
+                    is_error: false,
+                }],
+            }],
+        );
+        assert!(request_uses_file_sources(&req));
+    }
+
+    #[test]
+    fn render_block_image_file_ref() {
+        let block = ContentBlock::Image {
+            source: ImageSource::File {
+                file_id: "file_abc".into(),
+            },
+        };
+        let v = render_block(&block);
+        assert_eq!(v["type"], "image");
+        assert_eq!(v["source"]["type"], "file");
+        assert_eq!(v["source"]["file_id"], "file_abc");
+    }
+
+    #[test]
+    fn render_block_document_variants() {
+        // Base64 PDF
+        let inline = ContentBlock::Document {
+            source: DocumentSource::Base64 {
+                media_type: "application/pdf".into(),
+                data: "JVBERi0xLjc=".into(),
+            },
+        };
+        let v = render_block(&inline);
+        assert_eq!(v["type"], "document");
+        assert_eq!(v["source"]["type"], "base64");
+        assert_eq!(v["source"]["media_type"], "application/pdf");
+
+        // File-id reference
+        let by_ref = ContentBlock::Document {
+            source: DocumentSource::File {
+                file_id: "file_doc".into(),
+            },
+        };
+        let v = render_block(&by_ref);
+        assert_eq!(v["type"], "document");
+        assert_eq!(v["source"]["type"], "file");
+        assert_eq!(v["source"]["file_id"], "file_doc");
+
+        // URL
+        let url = ContentBlock::Document {
+            source: DocumentSource::Url {
+                url: "https://example.com/x.pdf".into(),
+            },
+        };
+        let v = render_block(&url);
+        assert_eq!(v["source"]["type"], "url");
+        assert_eq!(v["source"]["url"], "https://example.com/x.pdf");
+    }
+
+    #[test]
+    fn tool_result_document_block_surfaces_placeholder() {
+        // Anthropic wire-rejects non-text/image inside tool_result.
+        // Round-1 codex flagged silently dropping Document blocks
+        // here — they now produce a visible text placeholder so the
+        // model still sees that something was returned.
+        let block = ContentBlock::ToolResult {
+            tool_use_id: "tu_1".into(),
+            content: ToolResultContent::Blocks(vec![
+                ContentBlock::Text { text: "ok".into() },
+                ContentBlock::Document {
+                    source: DocumentSource::File {
+                        file_id: "file_doc".into(),
+                    },
+                },
+            ]),
+            is_error: false,
+        };
+        let v = render_block(&block);
+        let arr = v["content"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["type"], "text");
+        assert_eq!(arr[0]["text"], "ok");
+        assert_eq!(arr[1]["type"], "text");
+        assert!(
+            arr[1]["text"]
+                .as_str()
+                .unwrap()
+                .contains("document attachment elided"),
+            "got {}",
+            arr[1]["text"]
+        );
+    }
+
+    #[test]
+    fn render_block_replaces_unsupported_inside_tool_result_with_placeholder() {
         // Anthropic only accepts text/image inside tool_result content;
-        // anything else (tool_use, tool_result, thinking) must be dropped
-        // — otherwise the API rejects the request.
+        // anything else (tool_use, tool_result, thinking, document)
+        // is replaced with a visible text placeholder so the model
+        // sees that something existed there. Silent dropping was the
+        // wrong failure mode (codex round-1 finding).
         let block = ContentBlock::ToolResult {
             tool_use_id: "tu_1".into(),
             content: ToolResultContent::Blocks(vec![
@@ -851,10 +1088,15 @@ mod tests {
         };
         let v = render_block(&block);
         let arr = v["content"].as_array().unwrap();
-        // Only the Text and Image blocks survive.
-        assert_eq!(arr.len(), 2);
+        // Text + placeholder(ToolUse) + placeholder(Thinking) + Image
+        assert_eq!(arr.len(), 4);
         assert_eq!(arr[0]["type"], "text");
-        assert_eq!(arr[1]["type"], "image");
+        assert_eq!(arr[0]["text"], "ok");
+        assert_eq!(arr[1]["type"], "text");
+        assert!(arr[1]["text"].as_str().unwrap().contains("elided"));
+        assert_eq!(arr[2]["type"], "text");
+        assert!(arr[2]["text"].as_str().unwrap().contains("elided"));
+        assert_eq!(arr[3]["type"], "image");
     }
 
     /// Real-API integration test, gated by ANTHROPIC_API_KEY env var.

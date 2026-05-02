@@ -70,6 +70,13 @@ pub enum ContentBlock {
     Image {
         source: ImageSource,
     },
+    /// Non-image attachment — currently used for PDF / docx / large
+    /// text bundles uploaded via the Files API. Anthropic accepts
+    /// `{"type":"document","source":{"type":"file","file_id":"..."}}`
+    /// and treats the file as a citation-eligible document.
+    Document {
+        source: DocumentSource,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -95,8 +102,32 @@ fn is_false(b: &bool) -> bool {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ImageSource {
+    Base64 {
+        media_type: String,
+        data: String,
+    },
+    Url {
+        url: String,
+    },
+    /// Reference to a file already uploaded via the Files API. The
+    /// provider fetches the bytes server-side, so the request body
+    /// stays small. Use this for any image >5 MiB or any image that
+    /// will be reused across turns.
+    File {
+        file_id: String,
+    },
+}
+
+/// Source for a [`ContentBlock::Document`]. PDFs and large text
+/// bundles always go through the Files API (`File`); inline-base64
+/// is supported for cases where the host already has the bytes
+/// available and the document is small enough.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DocumentSource {
     Base64 { media_type: String, data: String },
     Url { url: String },
+    File { file_id: String },
 }
 
 /// Tool-result content can be a single string OR a list of content blocks

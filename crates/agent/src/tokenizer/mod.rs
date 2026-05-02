@@ -43,6 +43,20 @@ pub trait Tokenizer: std::fmt::Debug + Send + Sync {
                     ((data.len() as u32) / 4).saturating_add(8)
                 }
                 crate::message::ImageSource::Url { url } => self.count_text(url).saturating_add(8),
+                crate::message::ImageSource::File { file_id } => {
+                    self.count_text(file_id).saturating_add(8)
+                }
+            },
+            ContentBlock::Document { source } => match source {
+                crate::message::DocumentSource::Base64 { data, .. } => {
+                    ((data.len() as u32) / 4).saturating_add(16)
+                }
+                crate::message::DocumentSource::Url { url } => {
+                    self.count_text(url).saturating_add(16)
+                }
+                crate::message::DocumentSource::File { file_id } => {
+                    self.count_text(file_id).saturating_add(16)
+                }
             },
             ContentBlock::ToolUse { id, name, input } => {
                 let json_len = serde_json::to_string(input).map(|s| s.len()).unwrap_or(0);
