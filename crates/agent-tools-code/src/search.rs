@@ -210,8 +210,7 @@ impl Tool for GrepTool {
                     continue;
                 }
                 match std::fs::canonicalize(path) {
-                    Ok(canon)
-                        if policy.allowed_roots.iter().any(|r| canon.starts_with(r)) => {}
+                    Ok(canon) if policy.allowed_roots.iter().any(|r| canon.starts_with(r)) => {}
                     _ => continue,
                 }
                 let meta = match std::fs::metadata(path) {
@@ -369,8 +368,7 @@ impl Tool for GlobTool {
                     continue;
                 }
                 match std::fs::canonicalize(path) {
-                    Ok(canon)
-                        if policy.allowed_roots.iter().any(|r| canon.starts_with(r)) => {}
+                    Ok(canon) if policy.allowed_roots.iter().any(|r| canon.starts_with(r)) => {}
                     _ => continue,
                 }
                 // Match the pattern against the path relative to the
@@ -785,10 +783,7 @@ mod tests {
         std::fs::write(inside.path().join("regular.rs"), "fn y(){}").unwrap();
         std::os::unix::fs::symlink(&secret, inside.path().join("escaped.rs")).unwrap();
         let tool = GlobTool::new(policy_for(inside.path()));
-        let out = tool
-            .call(&ctx(), json!({"pattern": "*.rs"}))
-            .await
-            .unwrap();
+        let out = tool.call(&ctx(), json!({"pattern": "*.rs"})).await.unwrap();
         let matches = out["matches"].as_array().unwrap();
         let names: Vec<&str> = matches
             .iter()
