@@ -51,17 +51,25 @@
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations, rust_2018_idioms)]
 
+pub mod discovery;
 pub mod policy;
 
 #[cfg(feature = "fs")]
 pub mod fs;
 
+#[cfg(feature = "search")]
+pub mod search;
+
+pub use discovery::ToolSearchTool;
 pub use policy::{PolicyError, WorkspacePolicy};
 
 #[cfg(feature = "fs")]
 pub use fs::{
     FileEditTool, FileReadTool, FileWriteTool, ListDirTool, MkdirTool, MoveTool, RemoveTool,
 };
+
+#[cfg(feature = "search")]
+pub use search::{GlobTool, GrepTool};
 
 use std::sync::Arc;
 
@@ -83,6 +91,11 @@ pub fn register_default(registry: &mut ToolRegistry, policy: Arc<WorkspacePolicy
         registry.register(Arc::new(MkdirTool::new(policy.clone())) as Arc<dyn Tool>);
         registry.register(Arc::new(MoveTool::new(policy.clone())) as Arc<dyn Tool>);
         registry.register(Arc::new(RemoveTool::new(policy.clone())) as Arc<dyn Tool>);
+    }
+    #[cfg(feature = "search")]
+    {
+        registry.register(Arc::new(GrepTool::new(policy.clone())) as Arc<dyn Tool>);
+        registry.register(Arc::new(GlobTool::new(policy.clone())) as Arc<dyn Tool>);
     }
     let _ = policy; // suppress unused when no features enabled
     let _ = registry;
