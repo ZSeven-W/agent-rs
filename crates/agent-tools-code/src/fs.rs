@@ -327,6 +327,14 @@ impl Tool for FileEditTool {
         } else {
             text.replacen(&parsed.old_string, &parsed.new_string, 1)
         };
+        // Re-apply the policy size cap on the post-edit content. The
+        // pre-read check covers the original file, but a replacement
+        // can grow the file (e.g. `replace_all` with a longer
+        // `new_string` doubling every match) and would otherwise
+        // bypass the cap.
+        self.policy
+            .check_size(new_text.len() as u64)
+            .map_err(policy_to_agent_err)?;
         tokio::fs::write(&resolved, new_text.as_bytes())
             .await
             .map_err(|e| io_to_agent_err("write", &parsed.path, e))?;
@@ -815,6 +823,36 @@ mod tests {
         assert_eq!(out["replacements"], 3);
         let read = std::fs::read_to_string(dir.path().join("a.txt")).unwrap();
         assert_eq!(read, "y y y");
+    }
+
+    #[tokio::test]
+    async fn file_edit_refuses_when_post_edit_size_exceeds_policy_cap() {
+        // Pre-edit file fits under the cap, but `replace_all` with a
+        // longer `new_string` would balloon it past the cap. The
+        // post-edit size check must catch this before write.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "x".repeat(800)).unwrap();
+        let policy = WorkspacePolicy::new(dir.path())
+            .unwrap()
+            .with_max_file_size(1024)
+            .into_arc();
+        let tool = FileEditTool::new(policy);
+        let err = tool
+            .call(
+                &ctx_for(&dir),
+                json!({
+                    "path": "a.txt",
+                    "old_string": "x",
+                    "new_string": "yy", // doubles each match → 1600 bytes
+                    "replace_all": true,
+                }),
+            )
+            .await
+            .expect_err("should fail");
+        assert!(err.to_string().contains("too large"), "got {err}");
+        // File on disk must be unchanged.
+        let read = std::fs::read_to_string(dir.path().join("a.txt")).unwrap();
+        assert_eq!(read.len(), 800);
     }
 
     #[tokio::test]
