@@ -43,6 +43,7 @@
 //! | Move      | `Mutating`    | File system mutation.                  |
 //! | Bash      | `Mutating`    | Caller can gate Destructive shell      |
 //! |           |               | shapes via PermissionMatcher.          |
+//! | NotebookEdit | `Mutating` | Cell-level Jupyter .ipynb edits.       |
 //! | Remove    | `Destructive` | Irreversible.                          |
 //!
 //! Hosts compose these with [`agent::permission::PermissionMatcher`]
@@ -62,6 +63,9 @@ pub mod search;
 
 #[cfg(feature = "shell")]
 pub mod shell;
+
+#[cfg(feature = "notebook")]
+pub mod notebook;
 
 #[cfg(feature = "todo")]
 pub mod todo;
@@ -83,6 +87,9 @@ pub use search::{GlobTool, GrepTool};
 #[cfg(feature = "shell")]
 pub use shell::BashTool;
 
+#[cfg(feature = "notebook")]
+pub use notebook::NotebookEditTool;
+
 #[cfg(feature = "todo")]
 pub use todo::{TodoItem, TodoState, TodoStatus, TodoWriteTool};
 
@@ -96,7 +103,8 @@ use std::sync::Arc;
     feature = "search",
     feature = "shell",
     feature = "web",
-    feature = "todo"
+    feature = "todo",
+    feature = "notebook"
 ))]
 use agent::tool::Tool;
 use agent::tool::ToolRegistry;
@@ -158,6 +166,10 @@ fn register_inner(
     #[cfg(feature = "web")]
     {
         registry.register(Arc::new(WebFetchTool::new()) as Arc<dyn Tool>);
+    }
+    #[cfg(feature = "notebook")]
+    {
+        registry.register(Arc::new(NotebookEditTool::new(policy.clone())) as Arc<dyn Tool>);
     }
     #[cfg(feature = "todo")]
     {

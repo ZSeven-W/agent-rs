@@ -172,6 +172,15 @@ versions when `0.1.0` ships.
   `<style>` / `<noscript>` and decodes named + numeric entities.
   `allow_private_networks: true` opts out of the guard for hosts
   that legitimately need intranet access.
+- Notebook pack *(feature `notebook`)*: `NotebookEditTool` —
+  cell-level Jupyter `.ipynb` edits. Modes: `replace` (default) /
+  `insert` / `delete`. Locate by stable `cell_id` (preferred) or
+  zero-based `cell_index`. Round-trips through `serde_json::Value`
+  so unknown notebook fields (custom tooling metadata, papermill
+  params, etc.) are preserved. Code cells reset
+  `outputs` / `execution_count` on replace; markdown / raw cells
+  must not carry those fields. Same stat-then-bounded-read +
+  WorkspacePolicy size cap as `FileEdit`.
 - Todo pack *(feature `todo`)*: `TodoWriteTool` — in-memory shared
   planning list with the same surface as Claude Code's TodoWrite.
   Replaces the list wholesale on each call; emits per-status

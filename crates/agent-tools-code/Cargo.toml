@@ -39,8 +39,13 @@ web = ["dep:reqwest", "dep:futures", "dep:url"]
 # In-memory TodoWrite list. Pure logic, no extra deps.
 todo = []
 
+# Jupyter notebook editing: NotebookEdit. Parses .ipynb (JSON) and
+# applies cell-level insert / replace / delete edits. Pure logic
+# on top of `serde_json` (already a workspace dep), no extras.
+notebook = []
+
 # Convenience: every tool flag on.
-all = ["fs", "shell", "search", "web", "todo"]
+all = ["fs", "shell", "search", "web", "todo", "notebook"]
 
 [dependencies]
 # Path + version: path wins for in-workspace builds; version pin keeps

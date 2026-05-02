@@ -78,6 +78,7 @@ jobs:
       - run: cargo check -p agent-tools-code --no-default-features --features shell
       - run: cargo check -p agent-tools-code --no-default-features --features web
       - run: cargo check -p agent-tools-code --no-default-features --features todo
+      - run: cargo check -p agent-tools-code --no-default-features --features notebook
       - run: cargo check -p agent-tools-code --no-default-features --features all
 
   deny:

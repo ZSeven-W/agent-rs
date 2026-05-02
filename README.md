@@ -57,7 +57,7 @@ That's a complete agent — provider streaming, tool dispatch, hooks, permission
 - **💸 Cost accounting in nanodollar precision.** `Event::Usage` flows into a `CostTracker` with a model-price catalog (Anthropic + GPT defaults, BYO entries trivially). `u128` integer accumulator — no f64 drift across long sessions.
 - **📎 Files API for big attachments.** `FilesClient` trait + `AnthropicFilesClient`. Smart helpers auto-route between inline base64 and uploaded `file_id` references based on size. Beta header gets added automatically when any block (including those nested in tool results) carries a `file_id`.
 - **♻️ Reactive auto-compaction.** Token estimator + LLM-driven `<analysis>` / `<summary>` summarization, microcompact, session memory, post-cleanup file restoration. Long sessions stay inside the context window without losing critical state.
-- **📦 Optional batteries.** Companion `agent-tools-code` crate ships generic FileRead/Write/Edit, Grep/Glob (gitignore-aware via `ignore`), Bash, WebFetch, TodoWrite, and `ToolSearch` for deferred-tool discovery. Every tool declares its `SafetyClass`; a `WorkspacePolicy` enforces path containment + size caps + symlink rules. Pull only the features you want.
+- **📦 Optional batteries.** Companion `agent-tools-code` crate ships generic FileRead/Write/Edit, Grep/Glob (gitignore-aware via `ignore`), Bash, WebFetch, TodoWrite, NotebookEdit (Jupyter .ipynb cells), and `ToolSearch` for deferred-tool discovery. Every tool declares its `SafetyClass`; a `WorkspacePolicy` enforces path containment + size caps + symlink rules. Pull only the features you want.
 
 ---
 
@@ -140,6 +140,7 @@ agent-tools-code = { git = "https://github.com/ZSeven-W/agent-rs", default-featu
 | `shell` | `shell-words` | Bash *(timeout, abort, output cap)* |
 | `web` | `reqwest` + `futures` | WebFetch *(HTML→text, size cap)* |
 | `todo` | (none) | TodoWrite *(in-memory shared state)* |
+| `notebook` | (none) | NotebookEdit *(Jupyter .ipynb cell-level edits)* |
 | `all` | all of the above | |
 
 `ToolSearch` is always-on (no feature flag) and lets you expose 50+ MCP tools without flooding the model's tool list — it picks them up via `select:Name1,Name2` or keyword search.
@@ -234,6 +235,7 @@ That's the full picture: registry → provider → loop. The runtime handles too
 | `BashTool` | `Mutating` | `shell` |
 | `WebFetchTool` | `ReadOnly` | `web` |
 | `TodoWriteTool` | `Mutating` | `todo` |
+| `NotebookEditTool` | `Mutating` | `notebook` |
 | `ToolSearchTool` | `ReadOnly` | (always) |
 
 A shared `WorkspacePolicy` enforces path containment, file-size caps, and symlink rules. `register_default(registry, policy)` bulk-registers every enabled tool.
