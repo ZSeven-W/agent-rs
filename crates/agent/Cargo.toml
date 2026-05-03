@@ -85,7 +85,8 @@ tempfile = { workspace = true }
 assert_fs = { workspace = true }
 # Dev-only dep for the `with_tools` example. The prod runtime does
 # NOT depend on the tool pack — that stays in agent-tools-code.
-agent-tools-code = { path = "../agent-tools-code" }
+# Version pin keeps cargo-deny's wildcard-dependency lint quiet.
+agent-tools-code = { path = "../agent-tools-code", version = "0.1.0" }
 futures = { workspace = true }
 
 [[example]]
