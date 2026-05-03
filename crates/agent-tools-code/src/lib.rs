@@ -65,6 +65,9 @@ pub mod search;
 #[cfg(feature = "shell")]
 pub mod shell;
 
+#[cfg(feature = "task")]
+pub mod task;
+
 #[cfg(feature = "notebook")]
 pub mod notebook;
 
@@ -91,6 +94,11 @@ pub use search::{GlobTool, GrepTool};
 #[cfg(feature = "shell")]
 pub use shell::BashTool;
 
+#[cfg(feature = "task")]
+pub use task::{
+    TaskAgentConfig, TaskAgentFactory, TaskTool, DEFAULT_MAX_DEPTH as TASK_DEFAULT_MAX_DEPTH,
+};
+
 #[cfg(feature = "notebook")]
 pub use notebook::NotebookEditTool;
 
@@ -113,7 +121,8 @@ use std::sync::Arc;
     feature = "shell",
     feature = "web",
     feature = "todo",
-    feature = "notebook"
+    feature = "notebook",
+    feature = "task"
 ))]
 use agent::tool::Tool;
 use agent::tool::ToolRegistry;

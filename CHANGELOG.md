@@ -182,6 +182,17 @@ versions when `0.1.0` ships.
   `<style>` / `<noscript>` and decodes named + numeric entities.
   `allow_private_networks: true` opts out of the guard for hosts
   that legitimately need intranet access.
+- Task pack *(feature `task`)*: `TaskTool` lets the model spawn a
+  child `QueryLoop` for sub-task delegation. Hosts implement
+  `TaskAgentFactory` to enumerate which "agent shapes" the model
+  may summon (researcher / reviewer / planner — each can have its
+  own provider, model, system prompt, tool registry,
+  permissions). The child runs to completion and the aggregated
+  assistant text is returned as the tool result, matching Claude
+  Code's `Task` semantics. Recursion guard via thread-local depth
+  counter (default cap 3, override via `with_max_depth`); abort
+  forwarded so cancelling the parent loop short-circuits the
+  child.
 - Web-search pack *(feature `web-search`)*: `WebSearchTool` with a
   pluggable `WebSearchBackend` trait. Ships `TavilyBackend` as the
   default impl (Tavily Search API, `POST
