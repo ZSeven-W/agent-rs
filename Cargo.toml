@@ -64,6 +64,12 @@ regex = "1"
 ignore = "0.4"
 shell-words = "1"
 
+# Real BPE tokenizer for the optional `tiktoken` feature on `agent`.
+# Pulls a multi-MB byte-pair-encoding vocabulary blob, so it stays
+# off by default — hosts opt in when they need exact token counts
+# (cost projection, sliding-window trim, prompt-size precheck).
+tiktoken-rs = "0.6"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

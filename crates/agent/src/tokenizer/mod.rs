@@ -17,6 +17,12 @@
 //! Real tiktoken-style tokenizers are pluggable: implement
 //! [`Tokenizer`] and pass it to anywhere that takes a `&dyn Tokenizer`.
 
+#[cfg(feature = "tiktoken")]
+mod tiktoken_impl;
+
+#[cfg(feature = "tiktoken")]
+pub use tiktoken_impl::{TiktokenEncoding, TiktokenError, TiktokenTokenizer};
+
 use crate::message::{ContentBlock, Message, ToolResultContent};
 
 /// Pluggable tokenizer surface.

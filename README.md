@@ -129,6 +129,7 @@ agent-tools-code = { git = "https://github.com/ZSeven-W/agent-rs", default-featu
 | `mcp` | `rmcp` 1.5 | MCP client + production stdio/HTTP connector + OAuth/PKCE. |
 | `session-jsonl` | `fs4` | JSONL persistence with file lock. |
 | `swarm` | `fs4` + `notify` | Sub-agents, mailbox, teams. |
+| `tiktoken` | `tiktoken-rs` | Real BPE token counts (cl100k / o200k / p50k / r50k). |
 | `full` | all of the above | |
 
 ### `agent-tools-code` features

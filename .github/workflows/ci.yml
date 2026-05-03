@@ -68,6 +68,7 @@ jobs:
       - run: cargo check -p agent --no-default-features --features mcp
       - run: cargo check -p agent --no-default-features --features session-jsonl
       - run: cargo check -p agent --no-default-features --features swarm
+      - run: cargo check -p agent --no-default-features --features tiktoken
       - run: cargo check -p agent --no-default-features --features full
       # `agent-tools-code` companion features — make sure each pack
       # builds in isolation so a host that only opts into `shell` or

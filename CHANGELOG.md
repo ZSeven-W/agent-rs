@@ -76,10 +76,20 @@ versions when `0.1.0` ships.
   uploaded file refs based on size. The Anthropic provider auto-adds
   the Files beta header when any block (including those nested in
   `ToolResult`) carries a `file_id`.
-- `tokenizer/` — pluggable `Tokenizer` trait. `HeuristicTokenizer`
-  (4-ASCII / 1-CJK), `WordSplitTokenizer` (closer-to-BPE for
-  English). Real tiktoken plugs in via the trait without dep-tree
-  bloat.
+- `tokenizer/` — pluggable `Tokenizer` trait. Three impls ship in
+  the crate. `HeuristicTokenizer` (4-ASCII / 1-CJK) — default,
+  zero-dep. `WordSplitTokenizer` — closer-to-BPE for English, no
+  fixtures. `TiktokenTokenizer` *(feature `tiktoken`)* — real BPE
+  via `tiktoken-rs`, supporting `cl100k_base` (GPT-3.5/4 & Claude
+  approximation), `o200k_base` (GPT-4o family / o1), `p50k_base`,
+  `r50k_base`. `TiktokenTokenizer::for_model(model_id)` picks the
+  encoding heuristically. Off by default — pulls a multi-MB BPE
+  vocabulary blob — so hosts opt in only when they need exact
+  counts (cost projection, sliding-window trim, prompt precheck).
+  For Claude in particular, prefer Anthropic's
+  `messages/count_tokens` API for production accounting; the
+  `cl100k_base` mapping overestimates by ~5–10% but is fine for
+  budgeting.
 - `memdir/` — `MEMORY.md` directory loader. YAML-subset frontmatter,
   4-type taxonomy (User / Feedback / Project / Reference),
   age-bucket relevance scoring, deterministic file scan.
