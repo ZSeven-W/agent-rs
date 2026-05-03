@@ -43,6 +43,9 @@
 //! | Move      | `Mutating`    | File system mutation.                  |
 //! | Bash      | `Mutating`    | Caller can gate Destructive shell      |
 //! |           |               | shapes via PermissionMatcher.          |
+//! | BashRun   | `Mutating`    | Spawn long-running shell (registry).   |
+//! | BashOutput | `ReadOnly`   | Drain background-shell output.         |
+//! | KillShell | `Mutating`    | Terminate background shell.            |
 //! | NotebookEdit | `Mutating` | Cell-level Jupyter .ipynb edits.       |
 //! | WebSearch | `ReadOnly`    | Pluggable backend (Tavily default).    |
 //! | Remove    | `Destructive` | Irreversible.                          |
@@ -64,6 +67,9 @@ pub mod search;
 
 #[cfg(feature = "shell")]
 pub mod shell;
+
+#[cfg(feature = "bash-async")]
+pub mod bash_async;
 
 #[cfg(feature = "task")]
 pub mod task;
@@ -94,6 +100,9 @@ pub use search::{GlobTool, GrepTool};
 #[cfg(feature = "shell")]
 pub use shell::BashTool;
 
+#[cfg(feature = "bash-async")]
+pub use bash_async::{BashOutputTool, BashRunTool, BashSessionRegistry, KillShellTool};
+
 #[cfg(feature = "task")]
 pub use task::{
     TaskAgentConfig, TaskAgentFactory, TaskTool, DEFAULT_MAX_DEPTH as TASK_DEFAULT_MAX_DEPTH,
@@ -122,7 +131,8 @@ use std::sync::Arc;
     feature = "web",
     feature = "todo",
     feature = "notebook",
-    feature = "task"
+    feature = "task",
+    feature = "bash-async"
 ))]
 use agent::tool::Tool;
 use agent::tool::ToolRegistry;

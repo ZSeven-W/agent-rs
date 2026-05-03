@@ -27,6 +27,11 @@ fs = []
 # Shell execution: Bash. Pulls shell-words for argv parsing.
 shell = ["dep:shell-words"]
 
+# Background shells: BashRun + BashOutput + KillShell. Shares the
+# ring-buffer + process-group-kill machinery from `shell` but
+# spawns + polls instead of blocking. No extra deps; all tokio.
+bash-async = []
+
 # Search: Grep + Glob. Pulls regex (~5 MB) + ignore.
 search = ["dep:regex", "dep:ignore"]
 
@@ -55,7 +60,7 @@ todo = []
 notebook = []
 
 # Convenience: every tool flag on.
-all = ["fs", "shell", "search", "web", "web-search", "todo", "notebook", "task"]
+all = ["fs", "shell", "bash-async", "search", "web", "web-search", "todo", "notebook", "task"]
 
 [dependencies]
 # Path + version: path wins for in-workspace builds; version pin keeps

@@ -139,6 +139,7 @@ agent-tools-code = { git = "https://github.com/ZSeven-W/agent-rs", default-featu
 | **`fs`** *(default)* | (none) | FileRead / Write / Edit / ListDir / Mkdir / Move / Remove |
 | **`search`** *(default)* | `regex` + `ignore` | Grep · Glob *(gitignore-aware)* |
 | `shell` | `shell-words` | Bash *(timeout, abort, output cap)* |
+| `bash-async` | (none) | BashRun + BashOutput + KillShell *(background shells, ring-buffer poll)* |
 | `web` | `reqwest` + `futures` | WebFetch *(HTML→text, size cap)* |
 | `web-search` | `web` | WebSearch *(pluggable backend, ships Tavily)* |
 | `task` | `futures` | Task *(spawn a child `QueryLoop`)* |
@@ -236,6 +237,9 @@ That's the full picture: registry → provider → loop. The runtime handles too
 | `GrepTool` | `ReadOnly` | `search` |
 | `GlobTool` | `ReadOnly` | `search` |
 | `BashTool` | `Mutating` | `shell` |
+| `BashRunTool` | `Mutating` | `bash-async` |
+| `BashOutputTool` | `ReadOnly` | `bash-async` |
+| `KillShellTool` | `Mutating` | `bash-async` |
 | `WebFetchTool` | `ReadOnly` | `web` |
 | `WebSearchTool` | `ReadOnly` | `web-search` |
 | `TaskTool` | `Mutating` | `task` |

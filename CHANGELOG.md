@@ -203,6 +203,17 @@ versions when `0.1.0` ships.
   Honors `ctx.abort` via `tokio::select!`. Models can pipe each
   result URL into `WebFetchTool` for full-page reading — the
   canonical `WebSearch → WebFetch` pair.
+- Async-shell pack *(feature `bash-async`)*: trio of
+  `BashRunTool` + `BashOutputTool` + `KillShellTool` for
+  long-running commands (build / watcher / tail) where blocking
+  the tool dispatcher for minutes isn't acceptable. Hosts
+  construct one `BashSessionRegistry` per session and pass it to
+  all three tools. `BashRun` spawns and returns a `shell_id`
+  immediately; `BashOutput` drains accumulated stdout/stderr
+  read-then-clear with optional wait window (max 10 s); `KillShell`
+  removes the session and on Unix `kill -9 -<pgid>`s the whole
+  process group. Same ring-buffer + tail-preservation as `BashTool`
+  (1 MiB per stream); concurrent-session cap (32) per registry.
 - Notebook pack *(feature `notebook`)*: `NotebookEditTool` —
   cell-level Jupyter `.ipynb` edits. Modes: `replace` (default) /
   `insert` / `delete`. Locate by stable `cell_id` (preferred) or

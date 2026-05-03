@@ -77,6 +77,7 @@ jobs:
       - run: cargo check -p agent-tools-code --no-default-features --features fs
       - run: cargo check -p agent-tools-code --no-default-features --features search
       - run: cargo check -p agent-tools-code --no-default-features --features shell
+      - run: cargo check -p agent-tools-code --no-default-features --features bash-async
       - run: cargo check -p agent-tools-code --no-default-features --features web
       - run: cargo check -p agent-tools-code --no-default-features --features web-search
       - run: cargo check -p agent-tools-code --no-default-features --features task
