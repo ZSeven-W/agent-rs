@@ -6,6 +6,7 @@ version = 3
 name = "agent"
 version = "0.1.0"
 dependencies = [
+ "agent-tools-code",
  "assert_fs",
  "async-openai",
  "async-trait",

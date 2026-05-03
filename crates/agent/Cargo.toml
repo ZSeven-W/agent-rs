@@ -83,3 +83,15 @@ tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
 tempfile = { workspace = true }
 assert_fs = { workspace = true }
+# Dev-only dep for the `with_tools` example. The prod runtime does
+# NOT depend on the tool pack — that stays in agent-tools-code.
+agent-tools-code = { path = "../agent-tools-code" }
+futures = { workspace = true }
+
+[[example]]
+name = "anthropic_basic"
+required-features = ["anthropic"]
+
+[[example]]
+name = "with_tools"
+required-features = ["anthropic"]

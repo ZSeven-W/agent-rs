@@ -85,6 +85,21 @@ jobs:
       - run: cargo check -p agent-tools-code --no-default-features --features notebook
       - run: cargo check -p agent-tools-code --no-default-features --features all
 
+  examples:
+    name: examples
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # `cargo build --examples` per crate so each example only
+      # asks for the features it needs (per `[[example]] required-
+      # features`). Catches example-only API drift without making
+      # a real network call (the examples themselves bail without
+      # their env vars).
+      - run: cargo build -p agent --examples --features anthropic
+      - run: cargo build -p agent-tools-code --examples --features all
+
   deny:
     name: cargo deny
     runs-on: ubuntu-latest

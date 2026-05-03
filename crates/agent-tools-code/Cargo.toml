@@ -88,3 +88,11 @@ url = { version = "2", optional = true }
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tempfile = { workspace = true }
 assert_fs = { workspace = true }
+
+[[example]]
+name = "notebook_edit"
+required-features = ["notebook"]
+
+[[example]]
+name = "web_search_tavily"
+required-features = ["web-search"]

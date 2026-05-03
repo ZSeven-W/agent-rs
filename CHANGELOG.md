@@ -250,6 +250,21 @@ versions when `0.1.0` ships.
   for the existing prefix and refusing `..` smuggling through the
   unresolved tail.
 
+#### Examples
+
+- `crates/agent/examples/anthropic_basic.rs` — minimal provider +
+  `QueryLoop` + stream loop. The README TL;DR as a real binary.
+- `crates/agent/examples/with_tools.rs` — wires `agent-tools-code`'s
+  `register_default` into the loop and asks the model to grep +
+  read the workspace.
+- `crates/agent-tools-code/examples/notebook_edit.rs` — calls
+  `NotebookEditTool` directly (no LLM) on a synthesized `.ipynb`.
+- `crates/agent-tools-code/examples/web_search_tavily.rs` — Tavily
+  Search via `WebSearchTool::new(TavilyBackend::from_env()?)`.
+
+CI gates a `cargo build --examples` per crate so example-only API
+drift gets caught.
+
 #### Repo + tooling
 
 - Workspace scaffold: `Cargo.toml`, `rust-toolchain.toml`,

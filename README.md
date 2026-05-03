@@ -151,6 +151,26 @@ agent-tools-code = { git = "https://github.com/ZSeven-W/agent-rs", default-featu
 
 ---
 
+## Examples
+
+Runnable examples live under each crate's `examples/` directory:
+
+| Example | Crate | What it shows |
+|---|---|---|
+| `anthropic_basic` | `agent` | Minimal provider + `QueryLoop` + stream — the README TL;DR as a real binary. |
+| `with_tools` | `agent` | Wires the bundled coding tool pack into the loop and asks the model to grep + read the workspace. |
+| `notebook_edit` | `agent-tools-code` | Calls `NotebookEditTool` directly (no LLM) to edit a synthesized `.ipynb`. |
+| `web_search_tavily` | `agent-tools-code` | Tavily Search via `WebSearchTool`. Needs `TAVILY_API_KEY`. |
+
+```sh
+ANTHROPIC_API_KEY=sk-... cargo run --example anthropic_basic --features anthropic -p agent
+ANTHROPIC_API_KEY=sk-... cargo run --example with_tools --features anthropic -p agent
+cargo run --example notebook_edit --features notebook -p agent-tools-code
+TAVILY_API_KEY=tv-... cargo run --example web_search_tavily --features web-search -p agent-tools-code
+```
+
+---
+
 ## Quickstart with bundled tools
 
 ```rust
