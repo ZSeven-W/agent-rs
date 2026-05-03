@@ -314,14 +314,21 @@ where
 }
 
 fn random_id() -> String {
-    // Same approach as TodoWrite ids — nanos-since-epoch makes a
-    // collision-resistant id without pulling a uuid dep.
+    // Nanos-since-epoch + a process-global counter so back-to-back
+    // calls (e.g. a test that inserts 32 ids in a tight loop) can't
+    // collide on systems where the clock resolution is coarser than
+    // one call's worth of work. Without the counter, two `now()`
+    // calls within the same nanosecond produce the same id and the
+    // HashMap dedupes them silently.
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::SystemTime;
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let n = SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    format!("{n:x}")
+    let s = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{n:x}_{s:x}")
 }
 
 // =====================================================================
