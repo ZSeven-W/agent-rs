@@ -6,29 +6,29 @@ db-path = "$CARGO_HOME/advisory-dbs"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "warn"
 ignore = [
-    # backoff 0.4.0 — unmaintained, pulled transitively by async-openai 0.36.
-    # No published successor; async-openai upstream tracking removal in 0.37+.
-    # Re-evaluate when async-openai bumps.
-    "RUSTSEC-2025-0012",
-    # instant 0.1.13 — unmaintained, pulled transitively by backoff 0.4 (and
-    # therefore async-openai). Same upstream removal path as RUSTSEC-2025-0012.
-    "RUSTSEC-2024-0384",
+  # backoff 0.4.0 — unmaintained, pulled transitively by async-openai 0.36.
+  # No published successor; async-openai upstream tracking removal in 0.37+.
+  # Re-evaluate when async-openai bumps.
+  "RUSTSEC-2025-0012",
+  # instant 0.1.13 — unmaintained, pulled transitively by backoff 0.4 (and
+  # therefore async-openai). Same upstream removal path as RUSTSEC-2025-0012.
+  "RUSTSEC-2024-0384",
 ]
 
 [licenses]
 allow = [
-    "Apache-2.0",
-    "MIT",
-    "BSD-2-Clause",
-    "BSD-3-Clause",
-    "ISC",
-    "Zlib",
-    "Unicode-3.0",
-    "Unicode-DFS-2016",
-    "MPL-2.0",
-    "CC0-1.0",
-    "OpenSSL",
-    "CDLA-Permissive-2.0",  # webpki-root-certs (transitive via reqwest/rustls)
+  "Apache-2.0",
+  "MIT",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "MPL-2.0",
+  "CC0-1.0",
+  "OpenSSL",
+  "CDLA-Permissive-2.0", # webpki-root-certs (transitive via reqwest/rustls)
 ]
 confidence-threshold = 0.93
 

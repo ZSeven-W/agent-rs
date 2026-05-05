@@ -37,7 +37,7 @@ versions when `0.1.0` ships.
   `StringPattern` (Exact / Prefix / Suffix / Contains / Glob).
   Hand-rolled glob, no regex dep.
 - `hook/` — 27 typed `HookEvent` variants — Before/AfterToolUse,
-  Pre/PostCompact, OnSession*, etc. — with Block / Ok outcomes.
+  Pre/PostCompact, OnSession\*, etc. — with Block / Ok outcomes.
 - `message/` — `Message` enum (User / Assistant / System / Progress /
   Tombstone), DAG-aware `MessageStore`, `ContentBlock::Document` for
   PDFs / large text, `ImageSource::File` for Files API references.
@@ -79,7 +79,7 @@ versions when `0.1.0` ships.
 - `tokenizer/` — pluggable `Tokenizer` trait. Three impls ship in
   the crate. `HeuristicTokenizer` (4-ASCII / 1-CJK) — default,
   zero-dep. `WordSplitTokenizer` — closer-to-BPE for English, no
-  fixtures. `TiktokenTokenizer` *(feature `tiktoken`)* — real BPE
+  fixtures. `TiktokenTokenizer` _(feature `tiktoken`)_ — real BPE
   via `tiktoken-rs`, supporting `cl100k_base` (GPT-3.5/4 & Claude
   approximation), `o200k_base` (GPT-4o family / o1), `p50k_base`,
   `r50k_base`. `TiktokenTokenizer::for_model(model_id)` picks the
@@ -93,7 +93,7 @@ versions when `0.1.0` ships.
 - `memdir/` — `MEMORY.md` directory loader. YAML-subset frontmatter,
   4-type taxonomy (User / Feedback / Project / Reference),
   age-bucket relevance scoring, deterministic file scan.
-- `mcp/` *(feature `mcp`)* — full Model Context Protocol client
+- `mcp/` _(feature `mcp`)_ — full Model Context Protocol client
   lifecycle. Server registry, OAuth 2.0 + PKCE, channel permissions,
   server-initiated elicitation, async per-server connect locks,
   stale-handle reconnect repair. Production `RmcpConnector` plugs
@@ -120,7 +120,7 @@ versions when `0.1.0` ships.
   wasmtime/wasmer in their own crate.
 - `remote/` — JSON-RPC 2.0 over line-delimited frames for external
   hosts driving the agent in a separate process. Codec + dispatcher
-  + stable method namespace.
+  - stable method namespace.
 - `tasks/` — high-level planning task graph. Cycle-checked
   dependencies, status auto-transitions on completion, ready-task
   query.
@@ -136,7 +136,7 @@ versions when `0.1.0` ships.
   Feature-gated: `fs` (default) / `search` (default) / `shell` /
   `web` / `todo` / `all`. Default features pull only `tokio::fs` +
   `regex` + `ignore`.
-- FS pack *(feature `fs`)*: `FileReadTool` (cat -n style line
+- FS pack _(feature `fs`)_: `FileReadTool` (cat -n style line
   numbers, offset/limit defaults 1/2000), `FileWriteTool`
   (idempotent on identical content; bounded read on the no-op
   comparison), `FileEditTool` (refuses ambiguous matches unless
@@ -144,7 +144,7 @@ versions when `0.1.0` ships.
   `MkdirTool`, `MoveTool` (refuses to clobber unless `overwrite`),
   `RemoveTool` (`Destructive`). All read paths bounded by
   `read_with_cap` so a TOCTOU file grow can't OOM the process.
-- Search pack *(feature `search`)*: `GrepTool` — regex over file
+- Search pack _(feature `search`)_: `GrepTool` — regex over file
   contents, `ignore::WalkBuilder` for gitignore-aware traversal.
   `RegexBuilder::size_limit` cap (10 MiB) rejects pathological
   patterns at compile time. `tokio::task::spawn_blocking` worker
@@ -156,7 +156,7 @@ versions when `0.1.0` ships.
   `\` so Windows paths match. Adjacent `**` segments are collapsed
   to bound otherwise-exponential backtracking. Same symlink-escape
   guard as `GrepTool`.
-- Shell pack *(feature `shell`)*: `BashTool` runs `/bin/sh -c`
+- Shell pack _(feature `shell`)_: `BashTool` runs `/bin/sh -c`
   (Unix) / `cmd /C` (Windows). Per-stream output capture via a
   `VecDeque<u8>` ring buffer (constant memory regardless of output
   size, tail preserved, `*_truncated` flags). Tail trimmed to a
@@ -165,7 +165,7 @@ versions when `0.1.0` ships.
   group (`Command::process_group(0)`) so a `/bin/kill -9 -<pgid>`
   on timeout / abort kills descendants too — `kill_on_drop(true)`
   alone wouldn't.
-- Web pack *(feature `web`)*: `WebFetchTool` HTTP GET → text /
+- Web pack _(feature `web`)_: `WebFetchTool` HTTP GET → text /
   HTML. SSRF guard with full DNS-rebinding mitigation: pre-flight
   `tokio::net::lookup_host`, every resolved address screened
   (loopback / RFC 1918 / IPv4 link-local incl. cloud metadata
@@ -182,7 +182,7 @@ versions when `0.1.0` ships.
   `<style>` / `<noscript>` and decodes named + numeric entities.
   `allow_private_networks: true` opts out of the guard for hosts
   that legitimately need intranet access.
-- Task pack *(feature `task`)*: `TaskTool` lets the model spawn a
+- Task pack _(feature `task`)_: `TaskTool` lets the model spawn a
   child `QueryLoop` for sub-task delegation. Hosts implement
   `TaskAgentFactory` to enumerate which "agent shapes" the model
   may summon (researcher / reviewer / planner — each can have its
@@ -193,17 +193,17 @@ versions when `0.1.0` ships.
   counter (default cap 3, override via `with_max_depth`); abort
   forwarded so cancelling the parent loop short-circuits the
   child.
-- Web-search pack *(feature `web-search`)*: `WebSearchTool` with a
+- Web-search pack _(feature `web-search`)_: `WebSearchTool` with a
   pluggable `WebSearchBackend` trait. Ships `TavilyBackend` as the
   default impl (Tavily Search API, `POST
-  https://api.tavily.com/search`); hosts can implement Brave / Bing
+https://api.tavily.com/search`); hosts can implement Brave / Bing
   / Kagi / SerpAPI / a private corpus by implementing the trait.
   Output `[{title, url, snippet}]` plus optional aggregated `answer`
   field. Default 5 results / 20 s timeout (hard ceilings 20 / 60).
   Honors `ctx.abort` via `tokio::select!`. Models can pipe each
   result URL into `WebFetchTool` for full-page reading — the
   canonical `WebSearch → WebFetch` pair.
-- Async-shell pack *(feature `bash-async`)*: trio of
+- Async-shell pack _(feature `bash-async`)_: trio of
   `BashRunTool` + `BashOutputTool` + `KillShellTool` for
   long-running commands (build / watcher / tail) where blocking
   the tool dispatcher for minutes isn't acceptable. Hosts
@@ -214,7 +214,7 @@ versions when `0.1.0` ships.
   removes the session and on Unix `kill -9 -<pgid>`s the whole
   process group. Same ring-buffer + tail-preservation as `BashTool`
   (1 MiB per stream); concurrent-session cap (32) per registry.
-- Notebook pack *(feature `notebook`)*: `NotebookEditTool` —
+- Notebook pack _(feature `notebook`)_: `NotebookEditTool` —
   cell-level Jupyter `.ipynb` edits. Modes: `replace` (default) /
   `insert` / `delete`. Locate by stable `cell_id` (preferred) or
   zero-based `cell_index`. Round-trips through `serde_json::Value`
@@ -223,7 +223,7 @@ versions when `0.1.0` ships.
   `outputs` / `execution_count` on replace; markdown / raw cells
   must not carry those fields. Same stat-then-bounded-read +
   WorkspacePolicy size cap as `FileEdit`.
-- Todo pack *(feature `todo`)*: `TodoWriteTool` — in-memory shared
+- Todo pack _(feature `todo`)_: `TodoWriteTool` — in-memory shared
   planning list with the same surface as Claude Code's TodoWrite.
   Replaces the list wholesale on each call; emits per-status
   counts; synthesizes ids for items missing one; `with_fresh_state()`

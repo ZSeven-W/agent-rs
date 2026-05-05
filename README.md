@@ -121,31 +121,31 @@ agent-tools-code = { git = "https://github.com/ZSeven-W/agent-rs", default-featu
 
 ### `agent` features
 
-| Flag | Pulls in | Notes |
-|---|---|---|
-| **`anthropic`** *(default)* | `reqwest` + `eventsource-stream` | Hand-rolled Anthropic SSE — no SDK dep. |
-| `openai` | `async-openai` 0.36 | OpenAI-compatible providers. |
-| `ollama` | `ollama-rs` 0.3 | Local models. |
-| `mcp` | `rmcp` 1.5 | MCP client + production stdio/HTTP connector + OAuth/PKCE. |
-| `session-jsonl` | `fs4` | JSONL persistence with file lock. |
-| `swarm` | `fs4` + `notify` | Sub-agents, mailbox, teams. |
-| `tiktoken` | `tiktoken-rs` | Real BPE token counts (cl100k / o200k / p50k / r50k). |
-| `full` | all of the above | |
+| Flag                        | Pulls in                         | Notes                                                      |
+| --------------------------- | -------------------------------- | ---------------------------------------------------------- |
+| **`anthropic`** _(default)_ | `reqwest` + `eventsource-stream` | Hand-rolled Anthropic SSE — no SDK dep.                    |
+| `openai`                    | `async-openai` 0.36              | OpenAI-compatible providers.                               |
+| `ollama`                    | `ollama-rs` 0.3                  | Local models.                                              |
+| `mcp`                       | `rmcp` 1.5                       | MCP client + production stdio/HTTP connector + OAuth/PKCE. |
+| `session-jsonl`             | `fs4`                            | JSONL persistence with file lock.                          |
+| `swarm`                     | `fs4` + `notify`                 | Sub-agents, mailbox, teams.                                |
+| `tiktoken`                  | `tiktoken-rs`                    | Real BPE token counts (cl100k / o200k / p50k / r50k).      |
+| `full`                      | all of the above                 |                                                            |
 
 ### `agent-tools-code` features
 
-| Flag | Pulls in | Tools |
-|---|---|---|
-| **`fs`** *(default)* | (none) | FileRead / Write / Edit / ListDir / Mkdir / Move / Remove |
-| **`search`** *(default)* | `regex` + `ignore` | Grep · Glob *(gitignore-aware)* |
-| `shell` | `shell-words` | Bash *(timeout, abort, output cap)* |
-| `bash-async` | (none) | BashRun + BashOutput + KillShell *(background shells, ring-buffer poll)* |
-| `web` | `reqwest` + `futures` | WebFetch *(HTML→text, size cap)* |
-| `web-search` | `web` | WebSearch *(pluggable backend, ships Tavily)* |
-| `task` | `futures` | Task *(spawn a child `QueryLoop`)* |
-| `todo` | (none) | TodoWrite *(in-memory shared state)* |
-| `notebook` | (none) | NotebookEdit *(Jupyter .ipynb cell-level edits)* |
-| `all` | all of the above | |
+| Flag                     | Pulls in              | Tools                                                                    |
+| ------------------------ | --------------------- | ------------------------------------------------------------------------ |
+| **`fs`** _(default)_     | (none)                | FileRead / Write / Edit / ListDir / Mkdir / Move / Remove                |
+| **`search`** _(default)_ | `regex` + `ignore`    | Grep · Glob _(gitignore-aware)_                                          |
+| `shell`                  | `shell-words`         | Bash _(timeout, abort, output cap)_                                      |
+| `bash-async`             | (none)                | BashRun + BashOutput + KillShell _(background shells, ring-buffer poll)_ |
+| `web`                    | `reqwest` + `futures` | WebFetch _(HTML→text, size cap)_                                         |
+| `web-search`             | `web`                 | WebSearch _(pluggable backend, ships Tavily)_                            |
+| `task`                   | `futures`             | Task _(spawn a child `QueryLoop`)_                                       |
+| `todo`                   | (none)                | TodoWrite _(in-memory shared state)_                                     |
+| `notebook`               | (none)                | NotebookEdit _(Jupyter .ipynb cell-level edits)_                         |
+| `all`                    | all of the above      |                                                                          |
 
 `ToolSearch` is always-on (no feature flag) and lets you expose 50+ MCP tools without flooding the model's tool list — it picks them up via `select:Name1,Name2` or keyword search.
 
@@ -155,12 +155,12 @@ agent-tools-code = { git = "https://github.com/ZSeven-W/agent-rs", default-featu
 
 Runnable examples live under each crate's `examples/` directory:
 
-| Example | Crate | What it shows |
-|---|---|---|
-| `anthropic_basic` | `agent` | Minimal provider + `QueryLoop` + stream — the README TL;DR as a real binary. |
-| `with_tools` | `agent` | Wires the bundled coding tool pack into the loop and asks the model to grep + read the workspace. |
-| `notebook_edit` | `agent-tools-code` | Calls `NotebookEditTool` directly (no LLM) to edit a synthesized `.ipynb`. |
-| `web_search_tavily` | `agent-tools-code` | Tavily Search via `WebSearchTool`. Needs `TAVILY_API_KEY`. |
+| Example             | Crate              | What it shows                                                                                     |
+| ------------------- | ------------------ | ------------------------------------------------------------------------------------------------- |
+| `anthropic_basic`   | `agent`            | Minimal provider + `QueryLoop` + stream — the README TL;DR as a real binary.                      |
+| `with_tools`        | `agent`            | Wires the bundled coding tool pack into the loop and asks the model to grep + read the workspace. |
+| `notebook_edit`     | `agent-tools-code` | Calls `NotebookEditTool` directly (no LLM) to edit a synthesized `.ipynb`.                        |
+| `web_search_tavily` | `agent-tools-code` | Tavily Search via `WebSearchTool`. Needs `TAVILY_API_KEY`.                                        |
 
 ```sh
 ANTHROPIC_API_KEY=sk-... cargo run --example anthropic_basic --features anthropic -p agent
@@ -209,63 +209,63 @@ That's the full picture: registry → provider → loop. The runtime handles too
 
 ### Foundation
 
-| Module | Purpose |
-|---|---|
-| `provider/` | Multi-provider LLM client. Tool definitions wired into request bodies; capability flags + streaming `Event` vocabulary. |
-| `query/` | `QueryLoop` multi-turn phase machine. Reactive auto-compaction wired in. |
-| `tool/` | `Tool` trait, `ToolRegistry`, `SafetyClass` lattice. Receipt-order concurrent execution via `ToolExecutor`. |
+| Module        | Purpose                                                                                                                                            |
+| ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `provider/`   | Multi-provider LLM client. Tool definitions wired into request bodies; capability flags + streaming `Event` vocabulary.                            |
+| `query/`      | `QueryLoop` multi-turn phase machine. Reactive auto-compaction wired in.                                                                           |
+| `tool/`       | `Tool` trait, `ToolRegistry`, `SafetyClass` lattice. Receipt-order concurrent execution via `ToolExecutor`.                                        |
 | `permission/` | 7-step chain + structured `PermissionMatcher` (Always / Field / ExactJson / AnyOf / AllOf / Not) + `StringPattern`. External-queue async approval. |
-| `hook/` | 27 typed `HookEvent` variants. |
-| `message/` | DAG-aware `MessageStore`. `ContentBlock::Document` for PDFs; `ImageSource::File` for Files-API references. |
-| `stream/` | `Event` taxonomy: TextDelta / Thinking / ToolUse / ToolResult / Result / Usage / Error / Notice. |
-| `session/` | JSONL persistence (schema v1) with atomic-rename + file lock. |
-| `swarm/` | Sub-agents / teams. File-locked mailbox, in-process / tmux / iTerm2 backends. |
-| `compact/` | Reactive auto-compaction. LLM-driven summarization, partial directions, microcompact, session memory. |
-| `context/` | Sliding-window trim. |
+| `hook/`       | 27 typed `HookEvent` variants.                                                                                                                     |
+| `message/`    | DAG-aware `MessageStore`. `ContentBlock::Document` for PDFs; `ImageSource::File` for Files-API references.                                         |
+| `stream/`     | `Event` taxonomy: TextDelta / Thinking / ToolUse / ToolResult / Result / Usage / Error / Notice.                                                   |
+| `session/`    | JSONL persistence (schema v1) with atomic-rename + file lock.                                                                                      |
+| `swarm/`      | Sub-agents / teams. File-locked mailbox, in-process / tmux / iTerm2 backends.                                                                      |
+| `compact/`    | Reactive auto-compaction. LLM-driven summarization, partial directions, microcompact, session memory.                                              |
+| `context/`    | Sliding-window trim.                                                                                                                               |
 
 ### Service layer
 
-| Module | Purpose |
-|---|---|
-| `api/` | Retry with decorrelated jitter, error classification, prompt-cache-break detection, secret redaction. |
-| `cost/` | Model-price-aware USD accounting. `u128` nanodollars — no f64 drift. |
-| `attachments/` | `FilesClient` + `AnthropicFilesClient`, smart size-aware routing. |
-| `tokenizer/` | Pluggable trait. Real tiktoken plugs in via the trait. |
+| Module         | Purpose                                                                                               |
+| -------------- | ----------------------------------------------------------------------------------------------------- |
+| `api/`         | Retry with decorrelated jitter, error classification, prompt-cache-break detection, secret redaction. |
+| `cost/`        | Model-price-aware USD accounting. `u128` nanodollars — no f64 drift.                                  |
+| `attachments/` | `FilesClient` + `AnthropicFilesClient`, smart size-aware routing.                                     |
+| `tokenizer/`   | Pluggable trait. Real tiktoken plugs in via the trait.                                                |
 
 ### Discovery + extensibility
 
-| Module | Purpose |
-|---|---|
-| `mcp/` *(feature `mcp`)* | Full MCP client + production `RmcpConnector`. |
-| `memdir/` | `MEMORY.md` directory loader with frontmatter + relevance scoring. |
-| `skills/` · `plugins/` · `state/` · `bootstrap/` · `context_analysis/` · `tasks/` · `memory_extract/` · `remote/` | See [`crates/agent/src/`](./crates/agent/src/). |
+| Module                                                                                                            | Purpose                                                            |
+| ----------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| `mcp/` _(feature `mcp`)_                                                                                          | Full MCP client + production `RmcpConnector`.                      |
+| `memdir/`                                                                                                         | `MEMORY.md` directory loader with frontmatter + relevance scoring. |
+| `skills/` · `plugins/` · `state/` · `bootstrap/` · `context_analysis/` · `tasks/` · `memory_extract/` · `remote/` | See [`crates/agent/src/`](./crates/agent/src/).                    |
 
 </details>
 
 <details>
 <summary><b><code>agent-tools-code</code> crate</b> — optional coding tool pack</summary>
 
-| Tool | Class | Feature |
-|---|---|---|
-| `FileReadTool` | `ReadOnly` | `fs` |
-| `FileWriteTool` | `Mutating` | `fs` |
-| `FileEditTool` | `Mutating` | `fs` |
-| `ListDirTool` | `ReadOnly` | `fs` |
-| `MkdirTool` | `Mutating` | `fs` |
-| `MoveTool` | `Mutating` | `fs` |
-| `RemoveTool` | **`Destructive`** | `fs` |
-| `GrepTool` | `ReadOnly` | `search` |
-| `GlobTool` | `ReadOnly` | `search` |
-| `BashTool` | `Mutating` | `shell` |
-| `BashRunTool` | `Mutating` | `bash-async` |
-| `BashOutputTool` | `ReadOnly` | `bash-async` |
-| `KillShellTool` | `Mutating` | `bash-async` |
-| `WebFetchTool` | `ReadOnly` | `web` |
-| `WebSearchTool` | `ReadOnly` | `web-search` |
-| `TaskTool` | `Mutating` | `task` |
-| `TodoWriteTool` | `Mutating` | `todo` |
-| `NotebookEditTool` | `Mutating` | `notebook` |
-| `ToolSearchTool` | `ReadOnly` | (always) |
+| Tool               | Class             | Feature      |
+| ------------------ | ----------------- | ------------ |
+| `FileReadTool`     | `ReadOnly`        | `fs`         |
+| `FileWriteTool`    | `Mutating`        | `fs`         |
+| `FileEditTool`     | `Mutating`        | `fs`         |
+| `ListDirTool`      | `ReadOnly`        | `fs`         |
+| `MkdirTool`        | `Mutating`        | `fs`         |
+| `MoveTool`         | `Mutating`        | `fs`         |
+| `RemoveTool`       | **`Destructive`** | `fs`         |
+| `GrepTool`         | `ReadOnly`        | `search`     |
+| `GlobTool`         | `ReadOnly`        | `search`     |
+| `BashTool`         | `Mutating`        | `shell`      |
+| `BashRunTool`      | `Mutating`        | `bash-async` |
+| `BashOutputTool`   | `ReadOnly`        | `bash-async` |
+| `KillShellTool`    | `Mutating`        | `bash-async` |
+| `WebFetchTool`     | `ReadOnly`        | `web`        |
+| `WebSearchTool`    | `ReadOnly`        | `web-search` |
+| `TaskTool`         | `Mutating`        | `task`       |
+| `TodoWriteTool`    | `Mutating`        | `todo`       |
+| `NotebookEditTool` | `Mutating`        | `notebook`   |
+| `ToolSearchTool`   | `ReadOnly`        | (always)     |
 
 A shared `WorkspacePolicy` enforces path containment, file-size caps, and symlink rules. `register_default(registry, policy)` bulk-registers every enabled tool.
 

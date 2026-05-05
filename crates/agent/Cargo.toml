@@ -28,9 +28,9 @@ ollama = ["dep:ollama-rs"]
 # `mcp` pulls reqwest because the OAuth helper in mcp::auth POSTs to
 # the token endpoint. Don't depend on the `anthropic` feature gating
 # — they're orthogonal capabilities.
-mcp = ["dep:rmcp", "dep:reqwest", "dep:bytes", "dep:http"]   # Phase 5+ — MCP client + OAuth
-session-jsonl = ["dep:fs4"]      # Phase 4 — JSONL persistence + file lock
-swarm = ["dep:fs4", "dep:notify"]  # Phase 6 — mailbox / sub_agent / teams (lru is core)
+mcp = ["dep:rmcp", "dep:reqwest", "dep:bytes", "dep:http"] # Phase 5+ — MCP client + OAuth
+session-jsonl = ["dep:fs4"] # Phase 4 — JSONL persistence + file lock
+swarm = ["dep:fs4", "dep:notify"] # Phase 6 — mailbox / sub_agent / teams (lru is core)
 # Real BPE tokenizer (`tiktoken-rs`) — exposes `TiktokenTokenizer`
 # constructors for `cl100k_base` (Claude / GPT-3.5/4) /
 # `o200k_base` (GPT-4o) / `p50k_base` / `r50k_base`. Heuristic
