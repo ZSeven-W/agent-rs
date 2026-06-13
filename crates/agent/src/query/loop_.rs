@@ -146,6 +146,8 @@ pub struct QueryLoop {
     /// state when not provided (state then resets per-run, matching
     /// pre-Q-δ behavior).
     pub compact_state: Arc<Mutex<AutoCompactState>>,
+    /// Sampling temperature passed to the provider. `None` = provider default.
+    pub temperature: Option<f32>,
 }
 
 impl QueryLoop {
@@ -199,6 +201,7 @@ pub struct QueryLoopBuilder {
     model_max_tokens: u32,
     auto_compact_enabled: bool,
     compact_state: Option<Arc<Mutex<AutoCompactState>>>,
+    temperature: Option<f32>,
 }
 
 impl QueryLoopBuilder {
@@ -219,7 +222,15 @@ impl QueryLoopBuilder {
             model_max_tokens: DEFAULT_MODEL_MAX_TOKENS,
             auto_compact_enabled: true,
             compact_state: None,
+            temperature: None,
         }
+    }
+
+    /// Sampling temperature. `None` (default) uses the provider's default;
+    /// hosts set a low value (e.g. 0) for deterministic coding output.
+    pub fn temperature(mut self, t: f32) -> Self {
+        self.temperature = Some(t);
+        self
     }
 
     pub fn tools(mut self, tools: Arc<ToolRegistry>) -> Self {
@@ -310,6 +321,7 @@ impl QueryLoopBuilder {
             compact_state: self
                 .compact_state
                 .unwrap_or_else(|| Arc::new(Mutex::new(AutoCompactState::new()))),
+            temperature: self.temperature,
         }
     }
 }
@@ -373,6 +385,9 @@ async fn drive(
         };
         let mut req = StreamRequest::new(qloop.model.clone(), messages)
             .with_max_output_tokens(qloop.max_output_tokens);
+        if let Some(t) = qloop.temperature {
+            req = req.with_temperature(t);
+        }
         if let Some(s) = &qloop.system {
             req = req.with_system(s.clone());
         }
