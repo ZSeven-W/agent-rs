@@ -221,8 +221,12 @@ impl Tool for TaskTool {
                     output_tokens,
                     ..
                 }) => {
-                    usage_input = usage_input.saturating_add(input_tokens);
-                    usage_output = usage_output.saturating_add(output_tokens);
+                    // Usage is cumulative ("for-the-turn-so-far") and may be
+                    // emitted multiple times. The child runs a single turn, so
+                    // the peak frame is the turn total — take the max, not the
+                    // sum (summing cumulative frames multiply-counts).
+                    usage_input = usage_input.max(input_tokens);
+                    usage_output = usage_output.max(output_tokens);
                 }
                 Ok(Event::Result {
                     data:
