@@ -27,9 +27,12 @@
 //! present even when zero so the parent model has a stable
 //! schema to reason about.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use agent::error::AgentError;
+use agent::file_cache::FileStateCache;
+use agent::hook::HookRunner;
 use agent::permission::PermissionManager;
 use agent::provider::Provider;
 use agent::query::QueryLoop;
@@ -57,6 +60,18 @@ pub struct TaskAgentConfig {
     /// to fail-open on every permission decision (delegated trust)
     /// or fail-closed (ask-the-user). Either is a host policy.
     pub permissions: Option<Arc<PermissionManager>>,
+    /// Optional working directory for the child loop. When `None`,
+    /// QueryLoop's default applies. Hosts pass the parent cwd so the
+    /// child's path resolution and tool sandboxing match the parent.
+    pub cwd: Option<PathBuf>,
+    /// Optional shared file-state cache. When `None`, the child gets
+    /// its own. Sharing the parent's keeps read-before-write tracking
+    /// consistent across parent and child.
+    pub file_cache: Option<Arc<FileStateCache>>,
+    /// Optional shared hook runner. When `None`, the child runs without
+    /// hooks. Hosts pass the parent's runner so edit history, background-
+    /// shell tracking, and external hook blockers also apply to the child.
+    pub hooks: Option<Arc<HookRunner>>,
 }
 
 /// Factory for resolving an `agent_type` string to a concrete
@@ -174,6 +189,15 @@ impl Tool for TaskTool {
         }
         if let Some(p) = cfg.permissions.clone() {
             builder = builder.permissions(p);
+        }
+        if let Some(c) = cfg.cwd.clone() {
+            builder = builder.cwd(c);
+        }
+        if let Some(fc) = cfg.file_cache.clone() {
+            builder = builder.file_cache(fc);
+        }
+        if let Some(h) = cfg.hooks.clone() {
+            builder = builder.hooks(h);
         }
 
         let child = builder.build();
@@ -346,6 +370,9 @@ mod tests {
                     system: Some("you are a researcher".into()),
                     max_iterations: Some(2),
                     permissions: None,
+                    cwd: None,
+                    file_cache: None,
+                    hooks: None,
                 })
             } else {
                 Err(AgentError::other(format!(
