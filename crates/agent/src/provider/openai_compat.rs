@@ -25,9 +25,9 @@ use async_openai::types::chat::{
     ChatCompletionMessageToolCalls, ChatCompletionNamedToolChoice,
     ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
     ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
-    ChatCompletionRequestUserMessageArgs, ChatCompletionTool, ChatCompletionToolChoiceOption,
-    ChatCompletionTools, CreateChatCompletionRequestArgs, FinishReason, FunctionCall, FunctionName,
-    FunctionObject, ToolChoiceOptions,
+    ChatCompletionRequestUserMessageArgs, ChatCompletionStreamOptions, ChatCompletionTool,
+    ChatCompletionToolChoiceOption, ChatCompletionTools, CreateChatCompletionRequestArgs,
+    FinishReason, FunctionCall, FunctionName, FunctionObject, ToolChoiceOptions,
 };
 use async_openai::Client;
 use async_trait::async_trait;
@@ -163,7 +163,13 @@ impl Provider for OpenAiCompatProvider {
             .model(&req.model)
             .messages(messages)
             .max_tokens(req.max_output_tokens)
-            .stream(true);
+            .stream(true)
+            // Ask for a final usage chunk so we can surface token + cache
+            // counts (DeepSeek reports prompt_tokens_details.cached_tokens here).
+            .stream_options(ChatCompletionStreamOptions {
+                include_usage: Some(true),
+                include_obfuscation: None,
+            });
         if let Some(temp) = req.temperature {
             builder.temperature(temp);
         }
@@ -199,6 +205,7 @@ impl Provider for OpenAiCompatProvider {
             let mut tool_call_acc: HashMap<u32, ToolCallAccumulator> = HashMap::new();
             let mut model: Option<String> = None;
             let mut stop_reason: Option<String> = None;
+            let mut usage: Option<(u32, u32, u32)> = None; // (input, output, cache_read)
 
             loop {
                 tokio::select! {
@@ -215,6 +222,17 @@ impl Provider for OpenAiCompatProvider {
                             Ok(response) => {
                                 if model.is_none() && !response.model.is_empty() {
                                     model = Some(response.model.clone());
+                                }
+                                // Final chunk (choices empty) carries usage when
+                                // include_usage is set. cached_tokens is the
+                                // server-side prefix-cache hit (DeepSeek et al.).
+                                if let Some(u) = &response.usage {
+                                    let cached = u
+                                        .prompt_tokens_details
+                                        .as_ref()
+                                        .and_then(|d| d.cached_tokens)
+                                        .unwrap_or(0);
+                                    usage = Some((u.prompt_tokens, u.completion_tokens, cached));
                                 }
                                 for choice in response.choices {
                                     if let Some(content) = choice.delta.content {
@@ -257,6 +275,16 @@ impl Provider for OpenAiCompatProvider {
                         }
                     }
                 }
+            }
+
+            // Emit token usage (with prompt-cache hits) ahead of the result.
+            if let Some((input_tokens, output_tokens, cache_read)) = usage {
+                let _ = tx.unbounded_send(Ok(Event::Usage {
+                    input_tokens,
+                    output_tokens,
+                    cache_read,
+                    cache_create: 0,
+                }));
             }
 
             // Emit the terminal Result event.
