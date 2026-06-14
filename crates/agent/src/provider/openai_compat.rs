@@ -232,7 +232,16 @@ impl Provider for OpenAiCompatProvider {
                                         .as_ref()
                                         .and_then(|d| d.cached_tokens)
                                         .unwrap_or(0);
-                                    usage = Some((u.prompt_tokens, u.completion_tokens, cached));
+                                    // Report input_tokens as the NON-cached
+                                    // (full-rate) prompt tokens, matching the
+                                    // Anthropic provider's convention where
+                                    // cache_read is separate. DeepSeek's
+                                    // prompt_tokens is the TOTAL, so subtract
+                                    // the cached portion — otherwise downstream
+                                    // cache% (cache/total) is inconsistent
+                                    // across providers.
+                                    let non_cached = u.prompt_tokens.saturating_sub(cached);
+                                    usage = Some((non_cached, u.completion_tokens, cached));
                                 }
                                 for choice in response.choices {
                                     if let Some(content) = choice.delta.content {
