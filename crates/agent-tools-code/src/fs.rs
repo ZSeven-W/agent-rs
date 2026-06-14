@@ -112,9 +112,10 @@ impl Tool for FileReadTool {
     ) -> Result<serde_json::Value, AgentError> {
         let parsed: FileReadInput = serde_json::from_value(input)
             .map_err(|e| AgentError::other(format!("FileRead invalid input: {e}")))?;
+        // Reads aren't confined to the workspace root (see `resolve_read`).
         let resolved = self
             .policy
-            .resolve(&parsed.path, true)
+            .resolve_read(&parsed.path)
             .map_err(policy_to_agent_err)?;
         let meta = tokio::fs::metadata(&resolved)
             .await
@@ -433,9 +434,10 @@ impl Tool for ListDirTool {
     ) -> Result<serde_json::Value, AgentError> {
         let parsed: ListDirInput = serde_json::from_value(input)
             .map_err(|e| AgentError::other(format!("ListDir invalid input: {e}")))?;
+        // Reads aren't confined to the workspace root (see `resolve_read`).
         let resolved = self
             .policy
-            .resolve(&parsed.path, true)
+            .resolve_read(&parsed.path)
             .map_err(policy_to_agent_err)?;
         let mut entries = tokio::fs::read_dir(&resolved)
             .await

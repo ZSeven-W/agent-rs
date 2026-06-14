@@ -139,7 +139,7 @@ impl Tool for GrepTool {
         let root_str = parsed.path.as_deref().unwrap_or(".");
         let root = self
             .policy
-            .resolve(root_str, true)
+            .resolve_read(root_str)
             .map_err(policy_to_agent_err)?;
 
         // Use RegexBuilder so case-insensitivity is enforced at the
@@ -328,7 +328,7 @@ impl Tool for GlobTool {
         let root_str = parsed.path.as_deref().unwrap_or(".");
         let root = self
             .policy
-            .resolve(root_str, true)
+            .resolve_read(root_str)
             .map_err(policy_to_agent_err)?;
         let policy = self.policy.clone();
         let pattern = parsed.pattern.clone();

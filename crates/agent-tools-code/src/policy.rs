@@ -162,6 +162,21 @@ impl WorkspacePolicy {
         Ok(resolved)
     }
 
+    /// Resolve a path for READ access, WITHOUT confining it to
+    /// `allowed_roots`. Reads are non-destructive, and a coding agent routinely
+    /// needs to read files outside the working directory — the project source
+    /// when launched elsewhere, sibling projects, `~/.zode`, configs. Only
+    /// existence + canonicalization apply (the OS still enforces real file
+    /// permissions). Write confinement stays in [`resolve`].
+    pub fn resolve_read(&self, raw: &str) -> Result<PathBuf, PolicyError> {
+        let path = if Path::new(raw).is_absolute() {
+            PathBuf::from(raw)
+        } else {
+            self.cwd.join(raw)
+        };
+        canonicalize(&path)
+    }
+
     /// Enforce the file-size cap. Call before reading bytes into
     /// memory.
     pub fn check_size(&self, size_bytes: u64) -> Result<(), PolicyError> {
@@ -293,6 +308,20 @@ mod tests {
             .resolve(path.to_str().unwrap(), true)
             .expect_err("should reject");
         assert!(matches!(err, PolicyError::OutsideWorkspace { .. }));
+    }
+
+    #[test]
+    fn resolve_read_allows_outside_workspace() {
+        // Reads are not confined to the workspace root: a write `resolve`
+        // rejects an outside path, but `resolve_read` returns it.
+        let (_dir, policy) = temp_policy();
+        let outside = TempDir::new().unwrap();
+        let path = outside.path().join("x.txt");
+        std::fs::write(&path, b"x").unwrap();
+        let raw = path.to_str().unwrap();
+        assert!(policy.resolve(raw, true).is_err());
+        let resolved = policy.resolve_read(raw).expect("read resolves outside root");
+        assert!(resolved.ends_with("x.txt"));
     }
 
     #[test]
