@@ -148,6 +148,8 @@ pub struct QueryLoop {
     pub compact_state: Arc<Mutex<AutoCompactState>>,
     /// Sampling temperature passed to the provider. `None` = provider default.
     pub temperature: Option<f32>,
+    /// Whether to request provider prompt caching (Anthropic `cache_control`).
+    pub use_prompt_cache: bool,
 }
 
 impl QueryLoop {
@@ -202,6 +204,7 @@ pub struct QueryLoopBuilder {
     auto_compact_enabled: bool,
     compact_state: Option<Arc<Mutex<AutoCompactState>>>,
     temperature: Option<f32>,
+    use_prompt_cache: bool,
 }
 
 impl QueryLoopBuilder {
@@ -223,6 +226,7 @@ impl QueryLoopBuilder {
             auto_compact_enabled: true,
             compact_state: None,
             temperature: None,
+            use_prompt_cache: false,
         }
     }
 
@@ -230,6 +234,15 @@ impl QueryLoopBuilder {
     /// hosts set a low value (e.g. 0) for deterministic coding output.
     pub fn temperature(mut self, t: f32) -> Self {
         self.temperature = Some(t);
+        self
+    }
+
+    /// Request provider prompt caching. For Anthropic-family providers this
+    /// adds `cache_control` breakpoints (system + last user message) so the
+    /// stable prefix is cached across turns; other providers (OpenAI-compat)
+    /// cache automatically and ignore the flag. Default off.
+    pub fn use_prompt_cache(mut self, on: bool) -> Self {
+        self.use_prompt_cache = on;
         self
     }
 
@@ -322,6 +335,7 @@ impl QueryLoopBuilder {
                 .compact_state
                 .unwrap_or_else(|| Arc::new(Mutex::new(AutoCompactState::new()))),
             temperature: self.temperature,
+            use_prompt_cache: self.use_prompt_cache,
         }
     }
 }
@@ -388,6 +402,7 @@ async fn drive(
         if let Some(t) = qloop.temperature {
             req = req.with_temperature(t);
         }
+        req = req.with_prompt_cache(qloop.use_prompt_cache);
         if let Some(s) = &qloop.system {
             req = req.with_system(s.clone());
         }
