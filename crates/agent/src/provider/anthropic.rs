@@ -283,6 +283,14 @@ fn coalesce_messages(messages: &[Message]) -> Vec<(&'static str, Vec<ContentBloc
             _ => out.push((role, content.clone())),
         }
     }
+    // Anthropic requires the first message to be `user`. A leading assistant
+    // turn can't be answered by anything before it and would be rejected. It
+    // never arises in normal flow (the store always opens with the user's
+    // prompt), but guard defensively so an odd/partial history still yields a
+    // valid request.
+    while matches!(out.first(), Some((role, _)) if *role == "assistant") {
+        out.remove(0);
+    }
     out
 }
 
@@ -764,6 +772,28 @@ mod tests {
         assert_eq!(last.len(), 2, "merged user turn holds tool_result + text");
         assert_eq!(last[0]["type"], "tool_result");
         assert_eq!(last[1]["type"], "text");
+    }
+
+    #[test]
+    fn render_drops_leading_assistant_to_keep_first_message_user() {
+        // Anthropic rejects a request whose first message is `assistant`. A
+        // leading assistant turn can't occur in normal flow, but if it does,
+        // coalescing drops it so the request stays valid.
+        let msgs = vec![
+            Message::Assistant {
+                header: Header::new(),
+                content: vec![ContentBlock::Text {
+                    text: "orphan".into(),
+                }],
+            },
+            Message::User {
+                header: Header::new(),
+                content: vec![ContentBlock::Text { text: "hi".into() }],
+            },
+        ];
+        let rendered = render_messages(&msgs, false);
+        assert_eq!(rendered.len(), 1);
+        assert_eq!(rendered[0]["role"], "user");
     }
 
     #[test]

@@ -458,6 +458,11 @@ async fn drive(
         // ----- ToolDispatch phase: permission + BeforeToolUse hooks -----
         let mut surviving = Vec::with_capacity(pending_tool_uses.len());
         let mut tool_results: Vec<(String, bool, serde_json::Value)> = Vec::new();
+        // Set on a consumer-gone / executor-error / abort path, so we repair
+        // the store (push results) and then stop instead of re-looping. Lives
+        // here (before the permission loop) so a denial whose result fails to
+        // forward to a dropped consumer also trips it.
+        let mut terminate = false;
         for tu in pending_tool_uses {
             // 1. Permission.
             let decision = qloop.permissions.evaluate(&tu.name, &tu.input, None);
@@ -479,7 +484,9 @@ async fn drive(
                             tu.name, ask.message_text
                         ),
                     );
-                    forward_tool_result(&tx, synthetic.clone());
+                    if !forward_tool_result(&tx, synthetic.clone()) {
+                        terminate = true;
+                    }
                     tool_results.push((tu.id.clone(), synthetic.0.ok, synthetic.0.output));
                     let _ = qloop
                         .hooks
@@ -496,7 +503,9 @@ async fn drive(
                         false,
                         format!("Tool '{}' denied: {}", tu.name, deny.message_text),
                     );
-                    forward_tool_result(&tx, synthetic.clone());
+                    if !forward_tool_result(&tx, synthetic.clone()) {
+                        terminate = true;
+                    }
                     tool_results.push((tu.id.clone(), synthetic.0.ok, synthetic.0.output));
                     let _ = qloop
                         .hooks
@@ -523,7 +532,9 @@ async fn drive(
                     false,
                     format!("Tool '{}' blocked by BeforeToolUse hook", tu.name),
                 );
-                forward_tool_result(&tx, synthetic.clone());
+                if !forward_tool_result(&tx, synthetic.clone()) {
+                    terminate = true;
+                }
                 tool_results.push((tu.id.clone(), synthetic.0.ok, synthetic.0.output));
                 continue;
             }
@@ -542,12 +553,12 @@ async fn drive(
         // stream, so any survivor that never yields a result is reconciled
         // below into a synthetic `[interrupted]` result.
         let dispatched_ids: Vec<String> = surviving.iter().map(|tu| tu.id.clone()).collect();
-        // Set on a consumer-gone / executor-error / abort break, so we repair
-        // the store (push results) and then stop instead of re-looping.
-        let mut terminate = false;
 
         // ----- ToolCollecting phase: dispatch survivors via executor -----
-        if !surviving.is_empty() {
+        // Skipped when the consumer already vanished mid-permission-phase
+        // (`terminate`); the reconcile below then synthesizes results for every
+        // survivor so the store is still repaired before we return.
+        if !surviving.is_empty() && !terminate {
             let ctx = ToolUseContext {
                 cwd: qloop.cwd.clone(),
                 abort: abort.clone(),
@@ -835,15 +846,19 @@ fn synthetic_tool_result(
     })
 }
 
+/// Forward a synthetic tool result to the consumer. Returns `false` if the
+/// consumer has gone away (receiver dropped), so the caller can stop the turn
+/// instead of streaming another round into a dead channel.
 fn forward_tool_result(
     tx: &mpsc::UnboundedSender<Result<Event, AgentError>>,
     synthetic: SyntheticToolResult,
-) {
-    let _ = tx.unbounded_send(Ok(Event::ToolResult {
+) -> bool {
+    tx.unbounded_send(Ok(Event::ToolResult {
         id: synthetic.0.id,
         ok: synthetic.0.ok,
         output: synthetic.0.output,
-    }));
+    }))
+    .is_ok()
 }
 
 /// Reactive auto-compaction helper invoked once per turn.
@@ -1298,7 +1313,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(!tool_use_ids.is_empty(), "a tool_use was recorded in the store");
+        assert!(
+            !tool_use_ids.is_empty(),
+            "a tool_use was recorded in the store"
+        );
         for id in &tool_use_ids {
             assert!(
                 result_ids.contains(id),
@@ -1366,8 +1384,14 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(result_ids.contains("tu_1"), "tu_1 has a result: {result_ids:?}");
-        assert!(result_ids.contains("tu_2"), "tu_2 has a result: {result_ids:?}");
+        assert!(
+            result_ids.contains("tu_1"),
+            "tu_1 has a result: {result_ids:?}"
+        );
+        assert!(
+            result_ids.contains("tu_2"),
+            "tu_2 has a result: {result_ids:?}"
+        );
     }
 
     #[tokio::test]
