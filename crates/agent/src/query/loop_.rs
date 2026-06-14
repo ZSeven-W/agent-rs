@@ -391,7 +391,7 @@ async fn drive(
 
         // ----- Streaming phase -----
         let messages = match snapshot(&qloop.store) {
-            Ok(m) => m,
+            Ok(m) => normalize_request_messages(m),
             Err(e) => {
                 let _ = tx.unbounded_send(Err(e));
                 return;
@@ -749,6 +749,96 @@ fn snapshot(store: &Arc<Mutex<MessageStore>>) -> Result<Vec<Message>, AgentError
     Ok(s.iter().cloned().collect())
 }
 
+/// Repair a conversation snapshot so it satisfies provider invariants, no
+/// matter how it got malformed (most commonly: a turn the user interrupted
+/// mid-tool-call, which leaves an assistant `tool_use` with no `tool_result`).
+///
+/// Two normalizations, on the render-eligible (user/assistant) messages only —
+/// providers skip system/progress/tombstone anyway:
+///
+/// 1. **Tool pairing.** Every `tool_use` must be answered by a `tool_result`
+///    in the following message, or the API rejects the request ("tool_use ids
+///    were found without tool_result blocks"). For any `tool_use` id with no
+///    `tool_result` anywhere, inject a synthetic error result right after its
+///    assistant message.
+/// 2. **Role coalescing.** Adjacent same-role messages are merged. This both
+///    keeps the strict user/assistant alternation the API expects and folds an
+///    injected `[interrupted]` result into the user's next prompt.
+fn normalize_request_messages(messages: Vec<Message>) -> Vec<Message> {
+    // Reduce to render-eligible turns: (is_user, content).
+    let mut seq: Vec<(bool, Vec<ContentBlock>)> = Vec::new();
+    for m in messages {
+        match m {
+            Message::User { content, .. } => seq.push((true, content)),
+            Message::Assistant { content, .. } => seq.push((false, content)),
+            _ => {}
+        }
+    }
+
+    // 1. Inject synthetic results for tool_use ids that never got one.
+    let satisfied: std::collections::HashSet<String> = seq
+        .iter()
+        .flat_map(|(_, c)| c.iter())
+        .filter_map(|b| match b {
+            ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+            _ => None,
+        })
+        .collect();
+    let mut injected: Vec<(bool, Vec<ContentBlock>)> = Vec::with_capacity(seq.len());
+    for (is_user, content) in seq {
+        let dangling: Vec<String> = if is_user {
+            Vec::new()
+        } else {
+            content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::ToolUse { id, .. } if !satisfied.contains(id) => Some(id.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        injected.push((is_user, content));
+        if !dangling.is_empty() {
+            let results = dangling
+                .into_iter()
+                .map(|id| ContentBlock::ToolResult {
+                    tool_use_id: id,
+                    content: ToolResultContent::Text("[interrupted]".into()),
+                    is_error: true,
+                })
+                .collect();
+            injected.push((true, results));
+        }
+    }
+
+    // 2. Coalesce adjacent same-role messages.
+    let mut coalesced: Vec<(bool, Vec<ContentBlock>)> = Vec::with_capacity(injected.len());
+    for (is_user, content) in injected {
+        match coalesced.last_mut() {
+            Some((prev_user, prev_content)) if *prev_user == is_user => prev_content.extend(content),
+            _ => coalesced.push((is_user, content)),
+        }
+    }
+
+    // Rebuild Messages. Headers are irrelevant to rendering, so use fresh ones.
+    coalesced
+        .into_iter()
+        .map(|(is_user, content)| {
+            if is_user {
+                Message::User {
+                    header: Header::new(),
+                    content,
+                }
+            } else {
+                Message::Assistant {
+                    header: Header::new(),
+                    content,
+                }
+            }
+        })
+        .collect()
+}
+
 fn push(store: &Arc<Mutex<MessageStore>>, msg: Message) -> Result<(), AgentError> {
     let mut s = store
         .lock()
@@ -977,6 +1067,82 @@ mod tests {
     use crate::permission::{PermissionMode, RuleSource};
     use crate::testing::MockProvider;
     use crate::tool::Tool;
+
+    fn assistant_tool_use(id: &str) -> Message {
+        Message::Assistant {
+            header: Header::new(),
+            content: vec![ContentBlock::ToolUse {
+                id: id.into(),
+                name: "Bash".into(),
+                input: serde_json::json!({}),
+            }],
+        }
+    }
+
+    #[test]
+    fn interrupted_tool_use_is_repaired_and_coalesced() {
+        // assistant emits a tool_use, the user interrupts (no tool_result),
+        // then sends a fresh prompt — the exact shape that 400'd before.
+        let msgs = vec![
+            user_text("clone the repo"),
+            assistant_tool_use("call_1"),
+            user_text("why so slow"),
+        ];
+        let out = normalize_request_messages(msgs);
+        assert_eq!(out.len(), 3, "user / assistant(tool_use) / user(result+prompt)");
+        let Message::User { content, .. } = &out[2] else {
+            panic!("third message should be a user message");
+        };
+        let has_result = content.iter().any(|b| {
+            matches!(b, ContentBlock::ToolResult { tool_use_id, is_error, .. }
+                if tool_use_id == "call_1" && *is_error)
+        });
+        let has_prompt = content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text { text } if text == "why so slow"));
+        assert!(has_result, "synthetic tool_result for the dangling tool_use");
+        assert!(has_prompt, "the new prompt is coalesced into the same user turn");
+    }
+
+    #[test]
+    fn adjacent_same_role_messages_coalesce() {
+        let out = normalize_request_messages(vec![user_text("a"), user_text("b")]);
+        assert_eq!(out.len(), 1);
+        let Message::User { content, .. } = &out[0] else {
+            panic!("expected a single user message");
+        };
+        assert_eq!(content.len(), 2);
+    }
+
+    #[test]
+    fn well_formed_conversation_is_preserved() {
+        let msgs = vec![
+            user_text("hi"),
+            assistant_tool_use("c1"),
+            Message::User {
+                header: Header::new(),
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "c1".into(),
+                    content: ToolResultContent::Text("done".into()),
+                    is_error: false,
+                }],
+            },
+            Message::Assistant {
+                header: Header::new(),
+                content: vec![ContentBlock::Text { text: "ok".into() }],
+            },
+        ];
+        let out = normalize_request_messages(msgs);
+        assert_eq!(out.len(), 4, "already-paired turns are left intact");
+        let injected = out.iter().any(|m| match m {
+            Message::User { content, .. } => content.iter().any(|b| {
+                matches!(b, ContentBlock::ToolResult { content: ToolResultContent::Text(t), .. }
+                    if t == "[interrupted]")
+            }),
+            _ => false,
+        });
+        assert!(!injected, "no synthetic result when every tool_use is answered");
+    }
 
     #[derive(Debug)]
     struct EchoTool {
