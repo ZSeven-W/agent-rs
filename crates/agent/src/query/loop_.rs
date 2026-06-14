@@ -1308,6 +1308,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn partial_abort_fills_only_unanswered_tool_uses() {
+        // Two tool_uses in one assistant turn; one tool aborts the turn. Both
+        // ids must end with a result (the finished one real or synthetic, the
+        // aborted one synthetic) — never a dangling tool_use.
+        let provider = Arc::new(MockProvider::with_turns(vec![vec![
+            Event::ToolUse {
+                id: "tu_1".into(),
+                name: "echo".into(),
+                input: serde_json::json!({ "v": 1 }),
+            },
+            Event::ToolUse {
+                id: "tu_2".into(),
+                name: "slow".into(),
+                input: serde_json::json!({}),
+            },
+            Event::Result {
+                data: ResultData {
+                    stop_reason: Some("tool_use".into()),
+                    ..Default::default()
+                },
+            },
+        ]]));
+        let abort = AbortController::new();
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(EchoTool {
+            name: "echo".into(),
+            calls: Arc::new(AtomicUsize::new(0)),
+        }));
+        r.register(Arc::new(AbortingTool {
+            abort: abort.clone(),
+        }));
+        let perms = Arc::new(
+            PermissionManager::new()
+                .allow(RuleSource::User, "echo")
+                .allow(RuleSource::User, "slow"),
+        );
+        let qloop = QueryLoop::builder(provider, "mock")
+            .tools(Arc::new(r))
+            .permissions(perms)
+            .build();
+
+        let store = qloop.store.clone();
+        let mut stream = qloop.run("go", abort.clone()).await.unwrap();
+        while stream.next().await.is_some() {}
+
+        let snap: Vec<_> = store.lock().unwrap().iter().cloned().collect();
+        let result_ids: std::collections::HashSet<String> = snap
+            .iter()
+            .filter_map(|m| match m {
+                Message::User { content, .. } => Some(content),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(result_ids.contains("tu_1"), "tu_1 has a result: {result_ids:?}");
+        assert!(result_ids.contains("tu_2"), "tu_2 has a result: {result_ids:?}");
+    }
+
+    #[tokio::test]
     async fn permission_deny_synthesizes_failed_tool_result_and_does_not_dispatch() {
         let provider = Arc::new(MockProvider::with_turns(vec![
             vec![
