@@ -43,9 +43,71 @@ use crate::policy::{PolicyError, WorkspacePolicy};
 /// Code's per-call default. Tools that need longer should pass an
 /// explicit `timeout_secs`.
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
+/// More forgiving default for recognized network/build commands (clone,
+/// install, download, compile), which routinely exceed 60s. Still overridable
+/// via `timeout_secs` and still bounded by [`MAX_TIMEOUT_SECS`].
+const LONG_RUNNING_TIMEOUT_SECS: u64 = 5 * 60;
 /// Hard ceiling regardless of caller request. Stops a runaway
 /// command from pinning a runtime worker for an hour.
 const MAX_TIMEOUT_SECS: u64 = 10 * 60;
+
+/// Pick the default timeout when the caller didn't set `timeout_secs`. Network
+/// and build commands get [`LONG_RUNNING_TIMEOUT_SECS`] so a normal `git clone`
+/// or `npm install` doesn't fail at 60s; everything else keeps the snappy
+/// 60s default that surfaces hangs quickly.
+fn default_timeout_for(command: &str) -> u64 {
+    const SLOW: &[&str] = &[
+        "git clone",
+        "git fetch",
+        "git pull",
+        "git submodule",
+        "git lfs",
+        "npm install",
+        "npm ci",
+        "npm i ",
+        "pnpm install",
+        "pnpm i",
+        "yarn",
+        "cargo build",
+        "cargo install",
+        "cargo fetch",
+        "cargo update",
+        "cargo test",
+        "pip install",
+        "pip3 install",
+        "poetry install",
+        "uv pip",
+        "uv sync",
+        "go mod download",
+        "go install",
+        "go build",
+        "go get",
+        "bundle install",
+        "gem install",
+        "brew install",
+        "brew upgrade",
+        "apt install",
+        "apt-get install",
+        "dnf install",
+        "yum install",
+        "docker build",
+        "docker pull",
+        "docker compose",
+        "make ",
+        "cmake ",
+        "curl ",
+        "wget ",
+        "gradle",
+        "mvn ",
+        "./gradlew",
+    ];
+    let c = command.to_ascii_lowercase();
+    if SLOW.iter().any(|p| c.contains(p)) {
+        LONG_RUNNING_TIMEOUT_SECS
+    } else {
+        DEFAULT_TIMEOUT_SECS
+    }
+}
 /// Per-stream capture cap. Above this, output truncates; the tail
 /// (the last `MAX_OUTPUT_BYTES` bytes of the stream) is what we
 /// surface, since panic / error messages are usually at the end.
@@ -86,7 +148,7 @@ impl Tool for BashTool {
         "Bash"
     }
     fn description(&self) -> &str {
-        "Run a shell command. Captures stdout/stderr/exit_code. Per-call timeout (default 60s, max 600s). Output capped at 1 MiB."
+        "Run a shell command. Captures stdout/stderr/exit_code. Runs non-interactively (no prompts). Per-call timeout: 60s default, 300s for clone/install/build/download commands, max 600s — pass timeout_secs to override. Output capped at 1 MiB."
     }
     fn input_schema(&self) -> serde_json::Value {
         json!({
@@ -114,7 +176,7 @@ impl Tool for BashTool {
         }
         let timeout_secs = parsed
             .timeout_secs
-            .unwrap_or(DEFAULT_TIMEOUT_SECS)
+            .unwrap_or_else(|| default_timeout_for(&parsed.command))
             .clamp(1, MAX_TIMEOUT_SECS);
         let cwd = match parsed.cwd.as_deref() {
             Some(p) => self.policy.resolve(p, true).map_err(policy_to_agent_err)?,
@@ -135,6 +197,18 @@ impl Tool for BashTool {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+
+        // Run non-interactively. stdin is already /dev/null, but git and ssh
+        // read prompts from the TTY, so an unknown host key or missing
+        // credential would hang the command until the timeout (the classic
+        // "git clone hangs forever"). These make such cases fail fast with a
+        // clear error the agent can act on, instead of burning the budget.
+        cmd.env("GIT_TERMINAL_PROMPT", "0")
+            .env(
+                "GIT_SSH_COMMAND",
+                "ssh -oBatchMode=yes -oStrictHostKeyChecking=accept-new",
+            )
+            .env("GCM_INTERACTIVE", "never");
 
         // On Unix, put the child in its own process group so we can
         // kill descendants on timeout/abort, not just the direct
@@ -345,6 +419,24 @@ mod tests {
     use std::num::NonZeroUsize;
     use std::path::Path;
     use tempfile::TempDir;
+
+    #[test]
+    fn long_running_commands_get_a_forgiving_default() {
+        // Network/build commands get the longer default...
+        for cmd in [
+            "git clone git@github.com:x/y.git",
+            "cd /tmp && npm install",
+            "cargo build --release",
+            "pip install requests",
+            "curl -fsSL https://example.com/install.sh | sh",
+        ] {
+            assert_eq!(default_timeout_for(cmd), LONG_RUNNING_TIMEOUT_SECS, "{cmd}");
+        }
+        // ...while ordinary commands keep the snappy 60s default.
+        for cmd in ["ls -la", "echo hi", "grep foo bar.txt", "cat README.md"] {
+            assert_eq!(default_timeout_for(cmd), DEFAULT_TIMEOUT_SECS, "{cmd}");
+        }
+    }
 
     fn ctx() -> ToolUseContext {
         ToolUseContext {
