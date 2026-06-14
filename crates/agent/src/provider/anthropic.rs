@@ -259,27 +259,43 @@ fn render_system(system: &str, cache: bool) -> serde_json::Value {
     }
 }
 
+/// Merge consecutive same-role (user/user, assistant/assistant) turns into one.
+/// The query loop guarantees a `user(tool_result)` message is pushed after
+/// every `assistant(tool_use)`; when a turn is interrupted, the user's next
+/// prompt lands as a SECOND consecutive user message. Anthropic requires strict
+/// user/assistant alternation, so adjacent same-role turns are folded here.
+/// System/Progress/Tombstone are agent-internal (not rendered) and transparent
+/// to adjacency — they neither emit a role nor break a same-role run, so an
+/// interrupted `user(tool_result)` / `user(prompt)` pair still coalesces across
+/// an interleaved tombstone.
+fn coalesce_messages(messages: &[Message]) -> Vec<(&'static str, Vec<ContentBlock>)> {
+    let mut out: Vec<(&'static str, Vec<ContentBlock>)> = Vec::with_capacity(messages.len());
+    for m in messages {
+        let (role, content) = match m {
+            Message::User { content, .. } => ("user", content),
+            Message::Assistant { content, .. } => ("assistant", content),
+            _ => continue,
+        };
+        match out.last_mut() {
+            Some((prev_role, prev_content)) if *prev_role == role => {
+                prev_content.extend(content.iter().cloned());
+            }
+            _ => out.push((role, content.clone())),
+        }
+    }
+    out
+}
+
 fn render_messages(messages: &[Message], cache: bool) -> Vec<serde_json::Value> {
-    let len = messages.len();
-    messages
+    let coalesced = coalesce_messages(messages);
+    let len = coalesced.len();
+    coalesced
         .iter()
         .enumerate()
-        .filter_map(|(i, m)| {
-            let role = match m {
-                Message::User { .. } => "user",
-                Message::Assistant { .. } => "assistant",
-                // System / Progress / Tombstone are agent-internal — skip.
-                _ => return None,
-            };
-            // Mark only the last user message with cache_control if caching.
-            let mark_cache = cache && i + 1 == len && matches!(m, Message::User { .. });
-            let content = match m {
-                Message::User { content, .. } | Message::Assistant { content, .. } => {
-                    render_content(content, mark_cache)
-                }
-                _ => return None,
-            };
-            Some(serde_json::json!({"role": role, "content": content}))
+        .map(|(i, (role, content))| {
+            // Mark only the final user message's final block with cache_control.
+            let mark_cache = cache && i + 1 == len && *role == "user";
+            serde_json::json!({"role": role, "content": render_content(content, mark_cache)})
         })
         .collect()
 }
@@ -703,8 +719,52 @@ impl AccumulatedUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::{Header, Message};
+    use crate::message::{Header, Message, ToolResultContent};
     use crate::provider::ThinkingConfig;
+
+    #[test]
+    fn render_coalesces_consecutive_same_role_messages() {
+        // The interrupt shape: assistant(tool_use), then TWO user messages —
+        // the synthetic tool_result and the user's next prompt. These must
+        // render as one alternating sequence (user / assistant / user), with
+        // the final user message carrying both blocks (tool_result first),
+        // or Anthropic rejects the request for non-alternating roles.
+        let msgs = vec![
+            Message::User {
+                header: Header::new(),
+                content: vec![ContentBlock::Text { text: "go".into() }],
+            },
+            Message::Assistant {
+                header: Header::new(),
+                content: vec![ContentBlock::ToolUse {
+                    id: "t1".into(),
+                    name: "Bash".into(),
+                    input: serde_json::json!({}),
+                }],
+            },
+            Message::User {
+                header: Header::new(),
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: ToolResultContent::Text("[interrupted]".into()),
+                    is_error: true,
+                }],
+            },
+            Message::User {
+                header: Header::new(),
+                content: vec![ContentBlock::Text { text: "why".into() }],
+            },
+        ];
+        let rendered = render_messages(&msgs, false);
+        assert_eq!(rendered.len(), 3, "the two trailing user turns coalesce");
+        assert_eq!(rendered[0]["role"], "user");
+        assert_eq!(rendered[1]["role"], "assistant");
+        assert_eq!(rendered[2]["role"], "user");
+        let last = rendered[2]["content"].as_array().unwrap();
+        assert_eq!(last.len(), 2, "merged user turn holds tool_result + text");
+        assert_eq!(last[0]["type"], "tool_result");
+        assert_eq!(last[1]["type"], "text");
+    }
 
     #[test]
     fn build_body_minimal() {
