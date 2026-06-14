@@ -24,10 +24,12 @@ use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
     ChatCompletionMessageToolCalls, ChatCompletionNamedToolChoice,
     ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
+    ChatCompletionRequestMessageContentPartImage, ChatCompletionRequestMessageContentPartText,
     ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
-    ChatCompletionRequestUserMessageArgs, ChatCompletionStreamOptions, ChatCompletionTool,
+    ChatCompletionRequestUserMessageArgs, ChatCompletionRequestUserMessageContent,
+    ChatCompletionRequestUserMessageContentPart, ChatCompletionStreamOptions, ChatCompletionTool,
     ChatCompletionToolChoiceOption, ChatCompletionTools, CreateChatCompletionRequestArgs,
-    FinishReason, FunctionCall, FunctionName, FunctionObject, ToolChoiceOptions,
+    FinishReason, FunctionCall, FunctionName, FunctionObject, ImageUrl, ToolChoiceOptions,
 };
 use async_openai::Client;
 use async_trait::async_trait;
@@ -61,6 +63,7 @@ pub struct OpenAiCompatConfig {
     pub api_key: String,
     pub base_url: String,
     pub dialect: OpenAiDialect,
+    pub supports_images: bool,
 }
 
 impl OpenAiCompatConfig {
@@ -69,11 +72,17 @@ impl OpenAiCompatConfig {
             api_key: api_key.into(),
             base_url: base_url.into(),
             dialect: OpenAiDialect::Standard,
+            supports_images: false,
         }
     }
 
     pub fn with_dialect(mut self, dialect: OpenAiDialect) -> Self {
         self.dialect = dialect;
+        self
+    }
+
+    pub fn with_supports_images(mut self, supports_images: bool) -> Self {
+        self.supports_images = supports_images;
         self
     }
 
@@ -108,6 +117,7 @@ pub struct OpenAiCompatProvider {
 impl OpenAiCompatProvider {
     pub fn new(config: OpenAiCompatConfig) -> Self {
         let dialect = config.dialect;
+        let supports_images = config.supports_images;
         let id = match dialect {
             OpenAiDialect::Standard => "openai".to_string(),
             OpenAiDialect::DeepSeek => "openai-compat:deepseek".to_string(),
@@ -126,6 +136,7 @@ impl OpenAiCompatProvider {
                 // thinking tokens are silently dropped — so don't claim
                 // support.
                 supports_thinking: false,
+                supports_images,
                 max_context_tokens: 128_000,
                 needs_placeholder_text_before_tool_use: false,
             },
@@ -402,13 +413,15 @@ fn render_messages(
                 // a `user` message. Skip the user message entirely if
                 // every block was a ToolResult — the tool messages
                 // alone carry the turn.
-                let user_text = content_to_plain_text(content);
                 let any_non_tool_result = content
                     .iter()
                     .any(|b| !matches!(b, ContentBlock::ToolResult { .. }));
-                if any_non_tool_result && !user_text.is_empty() {
+                if any_non_tool_result {
+                    let Some(user_content) = render_user_content(content) else {
+                        continue;
+                    };
                     let m = ChatCompletionRequestUserMessageArgs::default()
-                        .content(user_text)
+                        .content(user_content)
                         .build()
                         .map_err(|e| AgentError::provider("openai-compat", format!("user: {e}")))?;
                     out.push(m.into());
@@ -504,6 +517,75 @@ fn render_messages(
         }
     }
     Ok(out)
+}
+
+fn render_user_content(blocks: &[ContentBlock]) -> Option<ChatCompletionRequestUserMessageContent> {
+    if !blocks
+        .iter()
+        .any(|b| matches!(b, ContentBlock::Image { .. }))
+    {
+        let text = content_to_plain_text(blocks);
+        return if text.is_empty() {
+            None
+        } else {
+            Some(ChatCompletionRequestUserMessageContent::Text(text))
+        };
+    }
+
+    let mut parts = Vec::new();
+    for block in blocks {
+        match block {
+            ContentBlock::Text { text } => {
+                if !text.is_empty() {
+                    parts.push(ChatCompletionRequestUserMessageContentPart::Text(
+                        ChatCompletionRequestMessageContentPartText { text: text.clone() },
+                    ));
+                }
+            }
+            ContentBlock::Thinking { thinking, .. } => {
+                if !thinking.is_empty() {
+                    parts.push(ChatCompletionRequestUserMessageContentPart::Text(
+                        ChatCompletionRequestMessageContentPartText {
+                            text: thinking.clone(),
+                        },
+                    ));
+                }
+            }
+            ContentBlock::Image { source } => {
+                if let Some(url) = image_source_to_openai_url(source) {
+                    parts.push(ChatCompletionRequestUserMessageContentPart::ImageUrl(
+                        ChatCompletionRequestMessageContentPartImage {
+                            image_url: ImageUrl { url, detail: None },
+                        },
+                    ));
+                }
+            }
+            ContentBlock::Document { .. } => {
+                parts.push(ChatCompletionRequestUserMessageContentPart::Text(
+                    ChatCompletionRequestMessageContentPartText {
+                        text: "[document attachment]".into(),
+                    },
+                ));
+            }
+            ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => {}
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(ChatCompletionRequestUserMessageContent::Array(parts))
+    }
+}
+
+fn image_source_to_openai_url(source: &crate::message::ImageSource) -> Option<String> {
+    match source {
+        crate::message::ImageSource::Base64 { media_type, data } => {
+            Some(format!("data:{media_type};base64,{data}"))
+        }
+        crate::message::ImageSource::Url { url } => Some(url.clone()),
+        crate::message::ImageSource::File { .. } => None,
+    }
 }
 
 fn finish_reason_str(reason: FinishReason) -> &'static str {
@@ -603,6 +685,10 @@ mod tests {
         let p = OpenAiCompatProvider::new(OpenAiCompatConfig::openai("k"));
         assert!(p.capabilities().supports_tool_use);
         assert!(!p.capabilities().supports_thinking);
+        assert!(!p.capabilities().supports_images);
+        let p =
+            OpenAiCompatProvider::new(OpenAiCompatConfig::openai("k").with_supports_images(true));
+        assert!(p.capabilities().supports_images);
         let p = OpenAiCompatProvider::new(OpenAiCompatConfig::deepseek("k"));
         assert!(p.capabilities().supports_tool_use);
         assert!(!p.capabilities().supports_thinking);
@@ -730,6 +816,33 @@ mod tests {
         let rendered = render_messages(&None, &messages).unwrap();
         // user (with the text) + tool_result.
         assert_eq!(rendered.len(), 2);
+    }
+
+    #[test]
+    fn render_messages_encodes_user_image_parts() {
+        let messages = vec![Message::User {
+            header: Header::new(),
+            content: vec![
+                ContentBlock::Text {
+                    text: "describe".into(),
+                },
+                ContentBlock::Image {
+                    source: crate::message::ImageSource::Base64 {
+                        media_type: "image/png".into(),
+                        data: "abc123".into(),
+                    },
+                },
+            ],
+        }];
+        let rendered = render_messages(&None, &messages).unwrap();
+        let json = serde_json::to_value(&rendered[0]).unwrap();
+        assert_eq!(json["content"][0]["type"], "text");
+        assert_eq!(json["content"][0]["text"], "describe");
+        assert_eq!(json["content"][1]["type"], "image_url");
+        assert_eq!(
+            json["content"][1]["image_url"]["url"],
+            "data:image/png;base64,abc123"
+        );
     }
 
     #[test]

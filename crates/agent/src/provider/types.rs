@@ -47,6 +47,7 @@ pub struct ProviderCapabilities {
     pub supports_tool_use: bool,
     pub supports_prompt_caching: bool,
     pub supports_thinking: bool,
+    pub supports_images: bool,
     pub max_context_tokens: u32,
     /// Some providers (older Anthropic models) require a non-empty text
     /// block immediately before a `tool_use` block in the assistant
@@ -67,6 +68,7 @@ impl Default for ProviderCapabilities {
             supports_tool_use: false,
             supports_prompt_caching: false,
             supports_thinking: false,
+            supports_images: false,
             max_context_tokens: 128_000,
             needs_placeholder_text_before_tool_use: false,
         }
@@ -287,6 +289,7 @@ mod tests {
                 supports_tool_use: true,
                 supports_prompt_caching: true,
                 supports_thinking: false,
+                supports_images: false,
                 max_context_tokens: 200_000,
                 needs_placeholder_text_before_tool_use: false,
             }
@@ -309,6 +312,7 @@ mod tests {
         assert!(!c.supports_tool_use);
         assert!(!c.supports_prompt_caching);
         assert!(!c.supports_thinking);
+        assert!(!c.supports_images);
         assert!(!c.needs_placeholder_text_before_tool_use);
         assert_eq!(c.max_context_tokens, 128_000);
     }

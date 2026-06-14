@@ -57,6 +57,7 @@ impl AnthropicProvider {
                 supports_tool_use: true,
                 supports_prompt_caching: true,
                 supports_thinking: true,
+                supports_images: true,
                 max_context_tokens: 200_000,
                 needs_placeholder_text_before_tool_use: false,
             },
@@ -67,6 +68,11 @@ impl AnthropicProvider {
     /// proxying through a corporate gateway.
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
+        self
+    }
+
+    pub fn with_supports_images(mut self, supports_images: bool) -> Self {
+        self.capabilities.supports_images = supports_images;
         self
     }
 }
@@ -940,6 +946,7 @@ mod tests {
         assert!(caps.supports_tool_use);
         assert!(caps.supports_prompt_caching);
         assert!(caps.supports_thinking);
+        assert!(caps.supports_images);
         assert_eq!(caps.max_context_tokens, 200_000);
     }
 

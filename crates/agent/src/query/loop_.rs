@@ -164,13 +164,27 @@ impl QueryLoop {
         user_msg: impl Into<String>,
         abort: AbortController,
     ) -> Result<Box<dyn EventStream>, AgentError> {
+        self.run_blocks(
+            vec![ContentBlock::Text {
+                text: user_msg.into(),
+            }],
+            abort,
+        )
+        .await
+    }
+
+    /// Run the loop with pre-built user content blocks, such as text plus
+    /// inline image attachments.
+    pub async fn run_blocks(
+        self,
+        content: Vec<ContentBlock>,
+        abort: AbortController,
+    ) -> Result<Box<dyn EventStream>, AgentError> {
         // Push user message before spawning so callers see it in the
         // store synchronously.
         let user_message = Message::User {
             header: Header::new(),
-            content: vec![ContentBlock::Text {
-                text: user_msg.into(),
-            }],
+            content,
         };
         {
             let mut store = self
@@ -1152,6 +1166,40 @@ mod tests {
         );
         assert_eq!(captured[0].tools.len(), 1);
         assert_eq!(captured[0].tools[0].name, "calc");
+    }
+
+    #[tokio::test]
+    async fn run_blocks_pushes_rich_user_content() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(CapturingProvider {
+            captured: captured.clone(),
+        });
+        let qloop = QueryLoop::builder(provider, "m").build();
+        let content = vec![
+            ContentBlock::Text {
+                text: "describe".into(),
+            },
+            ContentBlock::Image {
+                source: crate::message::ImageSource::Base64 {
+                    media_type: "image/png".into(),
+                    data: "abc123".into(),
+                },
+            },
+        ];
+        let mut stream = qloop
+            .run_blocks(content.clone(), AbortController::new())
+            .await
+            .unwrap();
+        while stream.next().await.is_some() {}
+
+        let captured = captured.lock().unwrap();
+        let Message::User {
+            content: observed, ..
+        } = &captured[0].messages[0]
+        else {
+            panic!("expected user message");
+        };
+        assert_eq!(observed, &content);
     }
 
     #[tokio::test]

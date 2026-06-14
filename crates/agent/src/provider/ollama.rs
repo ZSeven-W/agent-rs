@@ -73,6 +73,7 @@ impl OllamaProvider {
                 supports_tool_use: true,
                 supports_prompt_caching: false,
                 supports_thinking: false,
+                supports_images: false,
                 // Ollama context cap is per-model; this is a sane
                 // default for llama3 / mistral. Callers should
                 // override for larger models like deepseek-r1:32b
