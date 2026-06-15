@@ -320,7 +320,9 @@ mod tests {
         std::fs::write(&path, b"x").unwrap();
         let raw = path.to_str().unwrap();
         assert!(policy.resolve(raw, true).is_err());
-        let resolved = policy.resolve_read(raw).expect("read resolves outside root");
+        let resolved = policy
+            .resolve_read(raw)
+            .expect("read resolves outside root");
         assert!(resolved.ends_with("x.txt"));
     }
 
