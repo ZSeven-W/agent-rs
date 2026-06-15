@@ -658,12 +658,29 @@ async fn parse_sse_into_events<S>(
                                 // so the consumer doesn't see a
                                 // synthetic Result for a turn whose
                                 // tool call was silently dropped.
-                                let _ = tx.unbounded_send(Err(AgentError::provider(
-                                        "anthropic",
-                                        format!(
-                                            "tool_use input JSON parse error (id={id}, name={name}): {err}"
-                                        ),
-                                    )));
+                                //
+                                // The common cause is the model hitting
+                                // the output-token limit MID tool call,
+                                // which leaves the accumulated JSON
+                                // truncated (serde reports an EOF). Give
+                                // an actionable message instead of a raw
+                                // parser error so the user knows to raise
+                                // `max_output_tokens` (or ask for a
+                                // smaller change) rather than retry blind.
+                                let msg = if err.is_eof() {
+                                    format!(
+                                        "tool_use `{name}` input was cut off at {} bytes — the model hit \
+                                         the output-token limit mid-call. Raise `max_output_tokens` in \
+                                         config or ask for a smaller change. (id={id}: {err})",
+                                        partial_json.len()
+                                    )
+                                } else {
+                                    format!(
+                                        "tool_use input JSON parse error (id={id}, name={name}): {err}"
+                                    )
+                                };
+                                let _ =
+                                    tx.unbounded_send(Err(AgentError::provider("anthropic", msg)));
                                 return;
                             }
                         }
@@ -735,6 +752,41 @@ mod tests {
     use super::*;
     use crate::message::{Header, Message, ToolResultContent};
     use crate::provider::ThinkingConfig;
+
+    #[tokio::test]
+    async fn truncated_tool_use_input_reports_token_limit() {
+        use futures::StreamExt;
+        // A tool_use whose input JSON is cut off mid-string (the model hit the
+        // output-token limit) must surface an actionable error pointing at
+        // `max_output_tokens`, not a raw serde EOF parse error.
+        let start = serde_json::json!({
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "tool_use", "id": "t1", "name": "Bash"}
+        });
+        let delta = serde_json::json!({
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": "{\"command\": \"echo "}
+        });
+        let stop = serde_json::json!({"type": "content_block_stop", "index": 0});
+        let sse = format!("data: {start}\n\ndata: {delta}\n\ndata: {stop}\n\n");
+        let stream =
+            futures::stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::from(sse))]);
+
+        let (tx, mut rx) = mpsc::unbounded::<Result<Event, AgentError>>();
+        parse_sse_into_events(stream, tx, AbortController::default()).await;
+
+        let mut err_msg = None;
+        while let Some(item) = rx.next().await {
+            if let Err(e) = item {
+                err_msg = Some(e.to_string());
+            }
+        }
+        let msg = err_msg.expect("expected a truncation error event");
+        assert!(
+            msg.contains("cut off") && msg.contains("max_output_tokens"),
+            "error should be actionable about the token limit; got: {msg}"
+        );
+    }
 
     #[test]
     fn render_coalesces_consecutive_same_role_messages() {

@@ -137,11 +137,19 @@ async fn connect_stdio(
             c.current_dir(dir);
         }
     });
-    let transport = TokioChildProcess::new(cmd).map_err(|e| {
-        LifecycleError::Connector(format!(
-            "spawn '{command}' for MCP server '{server_name}' failed: {e}"
-        ))
-    })?;
+    // Use the builder so we can null the child's stderr — stdin/stdout are the
+    // MCP channel, but `TokioChildProcess::new` forces `stderr: inherit`, which
+    // leaks a failing/foreign server's stderr (e.g. `Script not found "start"`,
+    // or a "running on stdio" banner) into the host terminal. Diagnostics still
+    // surface via the handshake error.
+    let (transport, _stderr) = TokioChildProcess::builder(cmd)
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| {
+            LifecycleError::Connector(format!(
+                "spawn '{command}' for MCP server '{server_name}' failed: {e}"
+            ))
+        })?;
     let client_info = (*connector.client_info).clone();
     let service = client_info.serve(transport).await.map_err(|e| {
         LifecycleError::Connector(format!(
