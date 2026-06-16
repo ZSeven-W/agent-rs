@@ -124,45 +124,69 @@ pub enum ParseSummaryError {
     Malformed,
 }
 
-/// Parse a model response containing `<analysis>...</analysis>` and
-/// `<summary>...</summary>` blocks. Tags must each appear exactly
-/// once, with `<analysis>` first.
+/// Parse a model response into an analysis + summary, LENIENTLY.
 ///
-/// Tolerates leading/trailing whitespace and prose before the first
-/// tag (the model sometimes warms up with "Here is my analysis:" or
-/// similar). Inner content is trimmed.
+/// The prompt asks for `<analysis>...</analysis>` then `<summary>...</summary>`,
+/// and a well-behaved model emits exactly that (extracted precisely here). But
+/// models not tuned for this prompt routinely skip the `<analysis>` wrapper, or
+/// emit a bare summary, or get cut off mid-tag. Compaction must not throw away a
+/// usable summary over a missing wrapper — a degraded summary that preserves the
+/// conversation beats a hard failure that blocks compaction. So:
+///
+/// - Each block is located independently (order-independent).
+/// - A missing `<analysis>` ⇒ empty analysis (it's only used for diagnostics /
+///   file-restoration, which degrade to a no-op).
+/// - A `<summary>` opened but never closed ⇒ take everything after the tag.
+/// - No usable `<summary>` at all ⇒ fall back to the whole response with any
+///   `<analysis>` block stripped.
+///
+/// Only an effectively empty response errors (the caller already rejects a
+/// blank response before reaching here).
 pub fn parse_summary_response(text: &str) -> Result<ParsedSummary, ParseSummaryError> {
-    let analysis_open = text
-        .find(ANALYSIS_OPEN)
-        .ok_or(ParseSummaryError::MissingAnalysis)?;
-    let analysis_close = text[analysis_open + ANALYSIS_OPEN.len()..]
-        .find(ANALYSIS_CLOSE)
-        .map(|i| analysis_open + ANALYSIS_OPEN.len() + i)
-        .ok_or(ParseSummaryError::Malformed)?;
-    let summary_open = text[analysis_close + ANALYSIS_CLOSE.len()..]
-        .find(SUMMARY_OPEN)
-        .map(|i| analysis_close + ANALYSIS_CLOSE.len() + i)
-        .ok_or(ParseSummaryError::MissingSummary)?;
-    let summary_close = text[summary_open + SUMMARY_OPEN.len()..]
-        .find(SUMMARY_CLOSE)
-        .map(|i| summary_open + SUMMARY_OPEN.len() + i)
-        .ok_or(ParseSummaryError::Malformed)?;
+    let analysis = extract_block(text, ANALYSIS_OPEN, ANALYSIS_CLOSE).unwrap_or_default();
 
-    let analysis = text[analysis_open + ANALYSIS_OPEN.len()..analysis_close]
-        .trim()
-        .to_string();
-    let summary = text[summary_open + SUMMARY_OPEN.len()..summary_close]
-        .trim()
-        .to_string();
+    let summary = extract_block(text, SUMMARY_OPEN, SUMMARY_CLOSE)
+        .or_else(|| {
+            // `<summary>` opened but not closed (truncated): take the tail.
+            text.find(SUMMARY_OPEN)
+                .map(|o| text[o + SUMMARY_OPEN.len()..].trim().to_string())
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            // The model ignored the format. Use the whole response minus any
+            // analysis block, so compaction still succeeds.
+            let body = strip_block(text, ANALYSIS_OPEN, ANALYSIS_CLOSE);
+            let body = body.trim();
+            if body.is_empty() {
+                analysis.clone()
+            } else {
+                body.to_string()
+            }
+        });
 
-    if analysis.is_empty() {
-        return Err(ParseSummaryError::Malformed);
-    }
     if summary.is_empty() {
-        return Err(ParseSummaryError::Malformed);
+        return Err(ParseSummaryError::MissingSummary);
     }
-
     Ok(ParsedSummary { analysis, summary })
+}
+
+/// Trimmed content between the first `open` and the next `close` after it.
+/// `None` if either tag is absent.
+fn extract_block(text: &str, open: &str, close: &str) -> Option<String> {
+    let start = text.find(open)? + open.len();
+    let end = text[start..].find(close).map(|i| start + i)?;
+    Some(text[start..end].trim().to_string())
+}
+
+/// `text` with the first `open..close` block (inclusive) removed.
+fn strip_block(text: &str, open: &str, close: &str) -> String {
+    if let Some(o) = text.find(open) {
+        if let Some(rel) = text[o..].find(close) {
+            let end = o + rel + close.len();
+            return format!("{}{}", &text[..o], &text[end..]);
+        }
+    }
+    text.to_string()
 }
 
 #[cfg(test)]
@@ -224,42 +248,55 @@ The session aimed to fix bug X. Fix A was tried and failed because Y.
     }
 
     #[test]
-    fn parse_summary_missing_analysis_errors() {
+    fn parse_summary_lenient_missing_analysis_uses_empty_analysis() {
+        // Models not tuned for this prompt routinely skip <analysis>.
         let response = "<summary>only summary</summary>";
-        match parse_summary_response(response) {
-            Err(ParseSummaryError::MissingAnalysis) => {}
-            other => panic!("expected MissingAnalysis, got {other:?}"),
-        }
+        let parsed = parse_summary_response(response).unwrap();
+        assert_eq!(parsed.analysis, "");
+        assert_eq!(parsed.summary, "only summary");
     }
 
     #[test]
-    fn parse_summary_missing_summary_errors() {
+    fn parse_summary_lenient_no_tags_uses_whole_body() {
+        // The model ignored the format entirely — don't hard-fail, summarize
+        // with the raw text so compaction still reclaims context.
+        let response = "We set up the project and fixed the build.";
+        let parsed = parse_summary_response(response).unwrap();
+        assert_eq!(parsed.summary, "We set up the project and fixed the build.");
+    }
+
+    #[test]
+    fn parse_summary_lenient_only_analysis_falls_back_to_it() {
         let response = "<analysis>only analysis</analysis>";
-        match parse_summary_response(response) {
+        let parsed = parse_summary_response(response).unwrap();
+        // No <summary>, and the body minus the analysis block is empty, so the
+        // analysis text becomes the summary rather than erroring.
+        assert_eq!(parsed.summary, "only analysis");
+    }
+
+    #[test]
+    fn parse_summary_lenient_unclosed_summary_takes_tail() {
+        // Truncated mid-response (e.g. token limit) — keep what we got.
+        let response = "<analysis>a</analysis><summary>the tail that never closed";
+        let parsed = parse_summary_response(response).unwrap();
+        assert_eq!(parsed.analysis, "a");
+        assert_eq!(parsed.summary, "the tail that never closed");
+    }
+
+    #[test]
+    fn parse_summary_empty_analysis_still_extracts_summary() {
+        let response = "<analysis></analysis><summary>real</summary>";
+        let parsed = parse_summary_response(response).unwrap();
+        assert_eq!(parsed.analysis, "");
+        assert_eq!(parsed.summary, "real");
+    }
+
+    #[test]
+    fn parse_summary_blank_response_errors() {
+        // Truly nothing usable → error (the caller also guards this upstream).
+        match parse_summary_response("   \n  ") {
             Err(ParseSummaryError::MissingSummary) => {}
             other => panic!("expected MissingSummary, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_summary_empty_block_errors() {
-        let response = "<analysis></analysis><summary>real</summary>";
-        match parse_summary_response(response) {
-            Err(ParseSummaryError::Malformed) => {}
-            other => panic!("expected Malformed, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_summary_summary_before_analysis_errors() {
-        // Out-of-order: summary tag comes BEFORE analysis tag.
-        let response = "<summary>s</summary><analysis>a</analysis>";
-        match parse_summary_response(response) {
-            // The parser searches for </analysis> AFTER <analysis>.
-            // Since <summary> closes first, this presents as either
-            // Malformed or MissingSummary depending on the input.
-            Err(ParseSummaryError::Malformed) | Err(ParseSummaryError::MissingSummary) => {}
-            other => panic!("expected Malformed or MissingSummary, got {other:?}"),
         }
     }
 }

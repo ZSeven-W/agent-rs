@@ -185,7 +185,8 @@ impl Tool for NotebookEditTool {
                     .map(|s| s.to_string());
                 cells.insert(position, cell);
                 let out = serialize_notebook(&nb)?;
-                tokio::fs::write(&resolved, out.as_bytes())
+                self.policy
+                    .write_file(&resolved, out.as_bytes())
                     .await
                     .map_err(|e| io_to_agent_err("write", &parsed.path, e))?;
                 Ok(json!({
@@ -227,7 +228,8 @@ impl Tool for NotebookEditTool {
                     .and_then(Value::as_str)
                     .map(|s| s.to_string());
                 let out = serialize_notebook(&nb)?;
-                tokio::fs::write(&resolved, out.as_bytes())
+                self.policy
+                    .write_file(&resolved, out.as_bytes())
                     .await
                     .map_err(|e| io_to_agent_err("write", &parsed.path, e))?;
                 Ok(json!({
@@ -246,7 +248,8 @@ impl Tool for NotebookEditTool {
                     .and_then(Value::as_str)
                     .map(|s| s.to_string());
                 let out = serialize_notebook(&nb)?;
-                tokio::fs::write(&resolved, out.as_bytes())
+                self.policy
+                    .write_file(&resolved, out.as_bytes())
                     .await
                     .map_err(|e| io_to_agent_err("write", &parsed.path, e))?;
                 Ok(json!({

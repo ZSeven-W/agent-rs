@@ -253,7 +253,8 @@ impl Tool for FileWriteTool {
                 }
             }
         }
-        tokio::fs::write(&resolved, &bytes)
+        self.policy
+            .write_file(&resolved, &bytes)
             .await
             .map_err(|e| io_to_agent_err("write", &parsed.path, e))?;
         Ok(json!({
@@ -378,7 +379,8 @@ impl Tool for FileEditTool {
         self.policy
             .check_size(new_text.len() as u64)
             .map_err(policy_to_agent_err)?;
-        tokio::fs::write(&resolved, new_text.as_bytes())
+        self.policy
+            .write_file(&resolved, new_text.as_bytes())
             .await
             .map_err(|e| io_to_agent_err("write", &parsed.path, e))?;
         Ok(json!({
@@ -533,12 +535,10 @@ impl Tool for MkdirTool {
             .policy
             .resolve(&parsed.path, false)
             .map_err(policy_to_agent_err)?;
-        let res = if parsed.recursive {
-            tokio::fs::create_dir_all(&resolved).await
-        } else {
-            tokio::fs::create_dir(&resolved).await
-        };
-        res.map_err(|e| io_to_agent_err("mkdir", &parsed.path, e))?;
+        self.policy
+            .create_dir(&resolved, parsed.recursive)
+            .await
+            .map_err(|e| io_to_agent_err("mkdir", &parsed.path, e))?;
         Ok(json!({"path": resolved.display().to_string(), "status": "ok"}))
     }
 }
@@ -609,7 +609,8 @@ impl Tool for MoveTool {
                 parsed.to
             )));
         }
-        tokio::fs::rename(&from, &to)
+        self.policy
+            .rename(&from, &to)
             .await
             .map_err(|e| io_to_agent_err("rename", &parsed.from, e))?;
         Ok(json!({
@@ -680,16 +681,10 @@ impl Tool for RemoveTool {
         let meta = tokio::fs::symlink_metadata(&resolved)
             .await
             .map_err(|e| io_to_agent_err("stat", &parsed.path, e))?;
-        if meta.is_dir() {
-            if parsed.recursive {
-                tokio::fs::remove_dir_all(&resolved).await
-            } else {
-                tokio::fs::remove_dir(&resolved).await
-            }
-        } else {
-            tokio::fs::remove_file(&resolved).await
-        }
-        .map_err(|e| io_to_agent_err("remove", &parsed.path, e))?;
+        self.policy
+            .remove(&resolved, parsed.recursive, meta.is_dir())
+            .await
+            .map_err(|e| io_to_agent_err("remove", &parsed.path, e))?;
         Ok(json!({"path": resolved.display().to_string(), "status": "ok"}))
     }
 }

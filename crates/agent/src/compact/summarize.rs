@@ -422,10 +422,13 @@ The session was about X. Y happened.
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn compact_malformed_response_errors() {
+    async fn compact_tagless_response_is_summarized_leniently() {
+        // A model that ignores the <analysis>/<summary> format must NOT abort
+        // compaction — the plain text becomes the summary so context is still
+        // reclaimed (regression guard for the deepseek `/compact` failure).
         let provider = ScriptedProvider::from_text("Just plain text, no tags here.");
         let messages = vec![user("a"), user("b")];
-        match compact_conversation(
+        let result = compact_conversation(
             &messages,
             &provider,
             "m",
@@ -434,10 +437,27 @@ The session was about X. Y happened.
             AbortController::new(),
         )
         .await
-        {
-            Err(CompactError::Parse(_)) => {}
-            other => panic!("expected Parse, got {other:?}"),
-        }
+        .expect("tagless response should compact leniently, not error");
+        assert_eq!(result.summary, "Just plain text, no tags here.");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn compact_blank_response_still_errors() {
+        // A truly empty response is a real failure (nothing to summarize).
+        let provider = ScriptedProvider::from_text("   ");
+        let messages = vec![user("a"), user("b")];
+        assert!(matches!(
+            compact_conversation(
+                &messages,
+                &provider,
+                "m",
+                None,
+                PartialCompactDirection::Full,
+                AbortController::new(),
+            )
+            .await,
+            Err(CompactError::EmptyResponse)
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -87,7 +87,7 @@ pub mod web;
 pub mod web_search;
 
 pub use discovery::ToolSearchTool;
-pub use policy::{PolicyError, WorkspacePolicy};
+pub use policy::{DirectFsSink, FsSink, PolicyError, WorkspacePolicy};
 
 #[cfg(feature = "fs")]
 pub use fs::{

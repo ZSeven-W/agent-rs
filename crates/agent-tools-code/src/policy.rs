@@ -22,11 +22,69 @@
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+use async_trait::async_trait;
+
+/// Performs the actual filesystem MUTATION on behalf of the fs tools, once a
+/// path has already been resolved + policy-checked. The default
+/// [`DirectFsSink`] writes in-process; a host can supply an implementation that
+/// performs the mutating syscall inside an OS sandbox, so file writes become
+/// kernel-enforced — not just shell commands. This mirrors Codex's
+/// `ExecutorFileSystem` + `SandboxedFileSystem` split: the tool computes the
+/// new bytes in-process (no read-before-write staleness problem), then hands
+/// the final mutation to the sink.
+#[async_trait]
+pub trait FsSink: std::fmt::Debug + Send + Sync {
+    /// Write (create or truncate) `path` with `bytes`.
+    async fn write_file(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()>;
+    /// Create `path` as a directory (`recursive` ⇒ create missing parents).
+    async fn create_dir(&self, path: &Path, recursive: bool) -> std::io::Result<()>;
+    /// Rename / move `from` to `to`.
+    async fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()>;
+    /// Remove `path`. `is_dir` selects dir vs file removal; `recursive` removes
+    /// a non-empty directory tree.
+    async fn remove(&self, path: &Path, recursive: bool, is_dir: bool) -> std::io::Result<()>;
+}
+
+/// Default sink: perform the mutation in-process via `tokio::fs`. Identical to
+/// the behavior the fs tools had before the sink seam existed.
+#[derive(Debug, Default)]
+pub struct DirectFsSink;
+
+#[async_trait]
+impl FsSink for DirectFsSink {
+    async fn write_file(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        tokio::fs::write(path, bytes).await
+    }
+    async fn create_dir(&self, path: &Path, recursive: bool) -> std::io::Result<()> {
+        if recursive {
+            tokio::fs::create_dir_all(path).await
+        } else {
+            tokio::fs::create_dir(path).await
+        }
+    }
+    async fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        tokio::fs::rename(from, to).await
+    }
+    async fn remove(&self, path: &Path, recursive: bool, is_dir: bool) -> std::io::Result<()> {
+        if is_dir {
+            if recursive {
+                tokio::fs::remove_dir_all(path).await
+            } else {
+                tokio::fs::remove_dir(path).await
+            }
+        } else {
+            tokio::fs::remove_file(path).await
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum PolicyError {
     #[error("path '{path}' is outside the configured workspace roots")]
     OutsideWorkspace { path: String },
+    #[error("path '{path}' is a protected, read-only location")]
+    Protected { path: String },
     #[error("path '{path}' contains a symlink and follow_symlinks is disabled")]
     SymlinkRejected { path: String },
     #[error("path '{path}' could not be canonicalized: {source}")]
@@ -52,6 +110,14 @@ pub struct WorkspacePolicy {
     /// its canonical form starts with one of these. Empty means
     /// "anything under `cwd`".
     pub allowed_roots: Vec<PathBuf>,
+    /// Subtrees that are read-only even when inside an allowed root: a
+    /// resolved WRITE target under any of these is rejected with
+    /// [`PolicyError::Protected`]. Reads are unaffected. The host sets these to
+    /// protect metadata like `.git` / `.zode` from being rewritten by file
+    /// tools — the policy-layer twin of the OS sandbox's protected carveouts.
+    /// Stored as absolute paths (not necessarily existing, so first-time
+    /// creation is blocked too); matched by canonical-prefix.
+    pub denied_subpaths: Vec<PathBuf>,
     /// Hard cap on read / write payload size. Defaults to 8 MiB —
     /// matches the [`agent::file_cache::FileStateCache`] entry cap
     /// so tool reads don't blow past the cache's per-entry budget.
@@ -61,6 +127,10 @@ pub struct WorkspacePolicy {
     /// is canonicalized and checked against `allowed_roots` like
     /// any other path.
     pub follow_symlinks: bool,
+    /// How the fs tools perform their mutating syscalls. Defaults to
+    /// [`DirectFsSink`] (in-process); a host can swap in a sandboxed sink so
+    /// writes are kernel-enforced. Cheap to clone (Arc).
+    pub fs_sink: Arc<dyn FsSink>,
 }
 
 impl WorkspacePolicy {
@@ -74,9 +144,11 @@ impl WorkspacePolicy {
         let canonical = canonicalize(raw)?;
         Ok(Self {
             allowed_roots: vec![canonical.clone()],
+            denied_subpaths: Vec::new(),
             cwd: canonical,
             max_file_size_bytes: 8 * 1024 * 1024,
             follow_symlinks: true,
+            fs_sink: Arc::new(DirectFsSink),
         })
     }
 
@@ -92,9 +164,53 @@ impl WorkspacePolicy {
         Ok(self)
     }
 
+    /// Mark a subtree read-only (writes under it are rejected). The lexical
+    /// absolute path is stored WITHOUT requiring it to exist, so a not-yet-
+    /// created `.zode` is still protected from first-time creation. If the path
+    /// DOES exist, its canonical form is stored too: a write target is matched
+    /// after canonicalization, so a denied dir that is itself a symlink would
+    /// otherwise resolve to a different prefix and slip through.
+    pub fn with_denied_subpath(mut self, path: impl AsRef<Path>) -> Self {
+        let path = path.as_ref();
+        let abs = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.cwd.join(path)
+        };
+        if let Ok(canonical) = canonicalize(&abs) {
+            if canonical != abs && !self.denied_subpaths.contains(&canonical) {
+                self.denied_subpaths.push(canonical);
+            }
+        }
+        self.denied_subpaths.push(abs);
+        self
+    }
+
     pub fn with_max_file_size(mut self, n: u64) -> Self {
         self.max_file_size_bytes = n;
         self
+    }
+
+    /// Swap the filesystem-mutation sink (e.g. a sandboxed writer). The fs
+    /// tools route their final write/create/rename/remove through this.
+    pub fn with_fs_sink(mut self, sink: Arc<dyn FsSink>) -> Self {
+        self.fs_sink = sink;
+        self
+    }
+
+    /// Mutation helpers the fs tools call instead of `tokio::fs` directly, so a
+    /// host-supplied sink (sandboxed or not) handles the actual syscall.
+    pub async fn write_file(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        self.fs_sink.write_file(path, bytes).await
+    }
+    pub async fn create_dir(&self, path: &Path, recursive: bool) -> std::io::Result<()> {
+        self.fs_sink.create_dir(path, recursive).await
+    }
+    pub async fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        self.fs_sink.rename(from, to).await
+    }
+    pub async fn remove(&self, path: &Path, recursive: bool, is_dir: bool) -> std::io::Result<()> {
+        self.fs_sink.remove(path, recursive, is_dir).await
     }
 
     pub fn with_follow_symlinks(mut self, follow: bool) -> Self {
@@ -118,6 +234,12 @@ impl WorkspacePolicy {
         if must_exist {
             let canonical = canonicalize(&path)?;
             self.check_inside(&canonical)?;
+            // Check the deny-list against BOTH the canonical target and the
+            // lexical path: a `.zode` symlink created mid-session would make the
+            // canonical target escape the denied prefix, but the lexical
+            // `cwd/.zode/...` still matches.
+            self.check_not_denied(&canonical)?;
+            self.check_not_denied(&path)?;
             self.check_symlink_policy(&path)?;
             return Ok(canonical);
         }
@@ -158,6 +280,9 @@ impl WorkspacePolicy {
             ancestor_canonical.join(&missing_tail)
         };
         self.check_inside(&resolved)?;
+        self.check_not_denied(&resolved)?;
+        // Also block the lexical path (see the must_exist branch above).
+        self.check_not_denied(&path)?;
         self.check_symlink_policy(&path)?;
         Ok(resolved)
     }
@@ -200,6 +325,22 @@ impl WorkspacePolicy {
         Err(PolicyError::OutsideWorkspace {
             path: canonical.display().to_string(),
         })
+    }
+
+    /// Reject a resolved WRITE target that falls under a protected subtree.
+    /// `resolved` is already canonical, so symlinks/`..` that point INTO a
+    /// protected dir are caught here too.
+    fn check_not_denied(&self, resolved: &Path) -> Result<(), PolicyError> {
+        if self
+            .denied_subpaths
+            .iter()
+            .any(|denied| resolved.starts_with(denied))
+        {
+            return Err(PolicyError::Protected {
+                path: resolved.display().to_string(),
+            });
+        }
+        Ok(())
     }
 
     fn check_symlink_policy(&self, raw: &Path) -> Result<(), PolicyError> {
@@ -324,6 +465,68 @@ mod tests {
             .resolve_read(raw)
             .expect("read resolves outside root");
         assert!(resolved.ends_with("x.txt"));
+    }
+
+    #[test]
+    fn denied_subpath_blocks_writes_but_not_reads() {
+        let dir = TempDir::new().unwrap();
+        let policy = WorkspacePolicy::new(dir.path())
+            .unwrap()
+            .with_denied_subpath(".git");
+        // A write under the protected subtree is rejected — even for a path
+        // that does not exist yet (first-time creation blocked).
+        let err = policy
+            .resolve(".git/config", false)
+            .expect_err("write into .git must be rejected");
+        assert!(matches!(err, PolicyError::Protected { .. }), "{err:?}");
+        // Writes elsewhere in the workspace still succeed.
+        assert!(policy.resolve("src/main.rs", false).is_ok());
+        // Reads of the protected subtree are still allowed.
+        let f = dir.path().join(".git");
+        std::fs::create_dir_all(&f).unwrap();
+        std::fs::write(f.join("HEAD"), b"ref: x").unwrap();
+        assert!(policy.resolve_read(".git/HEAD").is_ok(), "reads not confined");
+    }
+
+    #[test]
+    fn denied_subpath_catches_symlink_into_protected_dir() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".zode")).unwrap();
+        // A symlink that points into the protected dir is resolved and caught.
+        let link = dir.path().join("sneaky");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.path().join(".zode"), &link).unwrap();
+        let policy = WorkspacePolicy::new(dir.path())
+            .unwrap()
+            .with_denied_subpath(".zode");
+        #[cfg(unix)]
+        {
+            let err = policy
+                .resolve("sneaky/state.json", false)
+                .expect_err("symlink into .zode must be rejected");
+            assert!(matches!(err, PolicyError::Protected { .. }), "{err:?}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn denied_subpath_that_is_itself_a_symlink_is_still_blocked() {
+        // `.zode` is a symlink to a real dir; a write through it canonicalizes
+        // to the target, which the lexical deny path wouldn't catch — so the
+        // canonical form must also be denied.
+        let dir = TempDir::new().unwrap();
+        let real = dir.path().join("real-zode");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join(".zode")).unwrap();
+        let policy = WorkspacePolicy::new(dir.path())
+            .unwrap()
+            .with_allowed_root(&real)
+            .unwrap()
+            .with_denied_subpath(".zode");
+        let err = policy
+            .resolve(".zode/state.json", false)
+            .expect_err("write through the symlinked .zode must be rejected");
+        assert!(matches!(err, PolicyError::Protected { .. }), "{err:?}");
     }
 
     #[test]
