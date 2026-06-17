@@ -769,8 +769,7 @@ mod tests {
         });
         let stop = serde_json::json!({"type": "content_block_stop", "index": 0});
         let sse = format!("data: {start}\n\ndata: {delta}\n\ndata: {stop}\n\n");
-        let stream =
-            futures::stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::from(sse))]);
+        let stream = futures::stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::from(sse))]);
 
         let (tx, mut rx) = mpsc::unbounded::<Result<Event, AgentError>>();
         parse_sse_into_events(stream, tx, AbortController::default()).await;

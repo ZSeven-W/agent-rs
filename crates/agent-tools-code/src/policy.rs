@@ -485,7 +485,10 @@ mod tests {
         let f = dir.path().join(".git");
         std::fs::create_dir_all(&f).unwrap();
         std::fs::write(f.join("HEAD"), b"ref: x").unwrap();
-        assert!(policy.resolve_read(".git/HEAD").is_ok(), "reads not confined");
+        assert!(
+            policy.resolve_read(".git/HEAD").is_ok(),
+            "reads not confined"
+        );
     }
 
     #[test]
