@@ -72,6 +72,19 @@ pub struct TaskAgentConfig {
     /// hooks. Hosts pass the parent's runner so edit history, background-
     /// shell tracking, and external hook blockers also apply to the child.
     pub hooks: Option<Arc<HookRunner>>,
+    /// Optional observer that receives the child loop's start, each streamed
+    /// event, and finish. When `None`, the tool runs exactly as before.
+    pub observer: Option<Arc<dyn TaskObserver>>,
+}
+
+/// Optional observer of a child sub-agent's lifecycle. Hosts implement this
+/// to surface sub-agent progress in their UI. `on_start` returns a host id
+/// used to route subsequent `on_event`/`on_finish` calls. All methods are
+/// synchronous and must not block.
+pub trait TaskObserver: Send + Sync + std::fmt::Debug {
+    fn on_start(&self, agent_type: &str, description: Option<&str>, depth: usize) -> u64;
+    fn on_event(&self, id: u64, event: &Event);
+    fn on_finish(&self, id: u64, result: &str, error: Option<&str>);
 }
 
 /// Factory for resolving an `agent_type` string to a concrete
@@ -208,12 +221,20 @@ impl Tool for TaskTool {
         let _depth_guard = depth_state::Increment::new();
         let mut stream = child.run(parsed.prompt.clone(), abort).await?;
 
+        let observer = cfg.observer.clone();
+        let sub_id = observer
+            .as_ref()
+            .map(|o| o.on_start(&parsed.agent_type, parsed.description.as_deref(), depth));
+
         let mut output = String::new();
         let mut usage_input = 0u32;
         let mut usage_output = 0u32;
         let mut stop_reason: Option<String> = None;
         let mut error: Option<AgentError> = None;
         while let Some(event) = stream.next().await {
+            if let (Some(o), Some(id), Ok(ev)) = (&observer, sub_id, &event) {
+                o.on_event(id, ev);
+            }
             match event {
                 Ok(Event::TextDelta { delta }) => output.push_str(&delta),
                 Ok(Event::Usage {
@@ -244,6 +265,13 @@ impl Tool for TaskTool {
                     error = Some(e);
                 }
             }
+        }
+        if let (Some(o), Some(id)) = (&observer, sub_id) {
+            o.on_finish(
+                id,
+                &output,
+                error.as_ref().map(|e| e.to_string()).as_deref(),
+            );
         }
         if let Some(e) = error {
             return Err(e);
@@ -361,6 +389,7 @@ mod tests {
     #[derive(Debug)]
     struct StubFactory {
         provider: Arc<dyn Provider>,
+        observer: Option<Arc<dyn TaskObserver>>,
     }
 
     #[async_trait]
@@ -377,6 +406,7 @@ mod tests {
                     cwd: None,
                     file_cache: None,
                     hooks: None,
+                    observer: self.observer.clone(),
                 })
             } else {
                 Err(AgentError::other(format!(
@@ -391,6 +421,7 @@ mod tests {
             provider: Arc::new(StubProvider {
                 reply: reply.into(),
             }),
+            observer: None,
         })
     }
 
@@ -457,5 +488,61 @@ mod tests {
             .await
             .expect_err("depth exceeded");
         assert!(err.to_string().contains("max recursion"));
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingObserver {
+        log: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl TaskObserver for RecordingObserver {
+        fn on_start(&self, agent_type: &str, description: Option<&str>, depth: usize) -> u64 {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("start {agent_type} d{depth} desc={}", description.unwrap_or("-")));
+            1
+        }
+        fn on_event(&self, id: u64, event: &AgentEvent) {
+            let kind = match event {
+                AgentEvent::TextDelta { .. } => "text",
+                AgentEvent::Usage { .. } => "usage",
+                AgentEvent::Result { .. } => "result",
+                _ => "other",
+            };
+            self.log.lock().unwrap().push(format!("event {id} {kind}"));
+        }
+        fn on_finish(&self, id: u64, result: &str, error: Option<&str>) {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("finish {id} {result} err={}", error.unwrap_or("-")));
+        }
+    }
+
+    #[tokio::test]
+    async fn task_drives_observer_start_events_finish() {
+        let obs = Arc::new(RecordingObserver::default());
+        let factory = Arc::new(StubFactory {
+            provider: Arc::new(StubProvider {
+                reply: "the result is 42".into(),
+            }),
+            observer: Some(obs.clone()),
+        });
+        let tool = TaskTool::new(factory);
+        tool.call(&ctx(), json!({"prompt": "compute", "agent_type": "researcher", "description": "do math"}))
+            .await
+            .unwrap();
+        let log = obs.log.lock().unwrap().clone();
+        assert_eq!(
+            log,
+            vec![
+                "start researcher d0 desc=do math".to_string(),
+                "event 1 text".to_string(),
+                "event 1 usage".to_string(),
+                "event 1 result".to_string(),
+                "finish 1 the result is 42 err=-".to_string(),
+            ]
+        );
     }
 }
