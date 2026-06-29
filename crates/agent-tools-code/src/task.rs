@@ -497,10 +497,10 @@ mod tests {
 
     impl TaskObserver for RecordingObserver {
         fn on_start(&self, agent_type: &str, description: Option<&str>, depth: usize) -> u64 {
-            self.log
-                .lock()
-                .unwrap()
-                .push(format!("start {agent_type} d{depth} desc={}", description.unwrap_or("-")));
+            self.log.lock().unwrap().push(format!(
+                "start {agent_type} d{depth} desc={}",
+                description.unwrap_or("-")
+            ));
             1
         }
         fn on_event(&self, id: u64, event: &AgentEvent) {
@@ -530,9 +530,12 @@ mod tests {
             observer: Some(obs.clone()),
         });
         let tool = TaskTool::new(factory);
-        tool.call(&ctx(), json!({"prompt": "compute", "agent_type": "researcher", "description": "do math"}))
-            .await
-            .unwrap();
+        tool.call(
+            &ctx(),
+            json!({"prompt": "compute", "agent_type": "researcher", "description": "do math"}),
+        )
+        .await
+        .unwrap();
         let log = obs.log.lock().unwrap().clone();
         assert_eq!(
             log,
