@@ -209,9 +209,16 @@ impl Tool for GrepTool {
                 if policy.allowed_roots.iter().all(|r| !path.starts_with(r)) {
                     continue;
                 }
-                match std::fs::canonicalize(path) {
-                    Ok(canon) if policy.allowed_roots.iter().any(|r| canon.starts_with(r)) => {}
+                let canon = match std::fs::canonicalize(path) {
+                    Ok(canon) if policy.allowed_roots.iter().any(|r| canon.starts_with(r)) => canon,
                     _ => continue,
+                };
+                // Strict-read: skip files under a read-denied (credential) subtree.
+                // Grep only resolve_read's the root, so this per-file check is what
+                // stops grep from surfacing ~/.ssh etc. when an allowed root is an
+                // ancestor. Check lexical + canonical (a symlink resolves in).
+                if policy.is_read_denied(path) || policy.is_read_denied(&canon) {
+                    continue;
                 }
                 let meta = match std::fs::metadata(path) {
                     Ok(m) => m,
@@ -367,9 +374,14 @@ impl Tool for GlobTool {
                 if policy.allowed_roots.iter().all(|r| !path.starts_with(r)) {
                     continue;
                 }
-                match std::fs::canonicalize(path) {
-                    Ok(canon) if policy.allowed_roots.iter().any(|r| canon.starts_with(r)) => {}
+                let canon = match std::fs::canonicalize(path) {
+                    Ok(canon) if policy.allowed_roots.iter().any(|r| canon.starts_with(r)) => canon,
                     _ => continue,
+                };
+                // Strict-read: don't surface paths under a read-denied (credential)
+                // subtree (Glob only resolve_read's the root). Lexical + canonical.
+                if policy.is_read_denied(path) || policy.is_read_denied(&canon) {
+                    continue;
                 }
                 // Match the pattern against the path relative to the
                 // search root — that's what shell-style globs assume.
@@ -700,6 +712,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out["matches"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn grep_skips_read_denied_subtree() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("public.txt"), "NEEDLE here\n").unwrap();
+        let secrets = dir.path().join("secrets");
+        std::fs::create_dir_all(&secrets).unwrap();
+        std::fs::write(secrets.join("key.txt"), "NEEDLE secret\n").unwrap();
+        let policy = WorkspacePolicy::new(dir.path())
+            .unwrap()
+            .with_read_denied_subpath(&secrets)
+            .into_arc();
+        let out = GrepTool::new(policy)
+            .call(&ctx(), json!({"pattern": "NEEDLE"}))
+            .await
+            .unwrap();
+        let matches = out["matches"].as_array().unwrap();
+        // The read-denied subtree is skipped even though it's under the root.
+        assert_eq!(matches.len(), 1, "got {matches:?}");
+        assert!(matches[0]["path"].as_str().unwrap().ends_with("public.txt"));
+    }
+
+    #[tokio::test]
+    async fn glob_skips_read_denied_subtree() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "").unwrap();
+        let secrets = dir.path().join("secrets");
+        std::fs::create_dir_all(&secrets).unwrap();
+        std::fs::write(secrets.join("b.rs"), "").unwrap();
+        let policy = WorkspacePolicy::new(dir.path())
+            .unwrap()
+            .with_read_denied_subpath(&secrets)
+            .into_arc();
+        let out = GlobTool::new(policy)
+            .call(&ctx(), json!({"pattern": "**/*.rs"}))
+            .await
+            .unwrap();
+        let matches = out["matches"].as_array().unwrap();
+        assert!(
+            matches
+                .iter()
+                .all(|m| !m["path"].as_str().unwrap().contains("secrets")),
+            "read-denied subtree must not appear: {matches:?}"
+        );
+        assert!(matches
+            .iter()
+            .any(|m| m["path"].as_str().unwrap().ends_with("a.rs")));
     }
 
     #[tokio::test]

@@ -118,6 +118,12 @@ pub struct WorkspacePolicy {
     /// Stored as absolute paths (not necessarily existing, so first-time
     /// creation is blocked too); matched by canonical-prefix.
     pub denied_subpaths: Vec<PathBuf>,
+    /// Subtrees that are hidden from READS (resolve_read rejects them). Separate
+    /// from `denied_subpaths` (which only blocks writes) so a host can opt into
+    /// hiding credential dirs (`~/.ssh`, …) from the file tools WITHOUT making
+    /// the write-protected `.git`/`.zode` unreadable. Empty by default → reads
+    /// stay unconfined. Matched by canonical/lexical prefix, like writes.
+    pub read_denied_subpaths: Vec<PathBuf>,
     /// Hard cap on read / write payload size. Defaults to 8 MiB —
     /// matches the [`agent::file_cache::FileStateCache`] entry cap
     /// so tool reads don't blow past the cache's per-entry budget.
@@ -145,6 +151,7 @@ impl WorkspacePolicy {
         Ok(Self {
             allowed_roots: vec![canonical.clone()],
             denied_subpaths: Vec::new(),
+            read_denied_subpaths: Vec::new(),
             cwd: canonical,
             max_file_size_bytes: 8 * 1024 * 1024,
             follow_symlinks: true,
@@ -183,6 +190,26 @@ impl WorkspacePolicy {
             }
         }
         self.denied_subpaths.push(abs);
+        self
+    }
+
+    /// Hide a subtree from READS (`resolve_read` rejects it). Stores the lexical
+    /// absolute path AND, if it exists, its canonical form — same dual-match as
+    /// [`Self::with_denied_subpath`], so a symlinked credential dir can't slip
+    /// through. Used by a host that opts into credential-read hiding.
+    pub fn with_read_denied_subpath(mut self, path: impl AsRef<Path>) -> Self {
+        let path = path.as_ref();
+        let abs = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.cwd.join(path)
+        };
+        if let Ok(canonical) = canonicalize(&abs) {
+            if canonical != abs && !self.read_denied_subpaths.contains(&canonical) {
+                self.read_denied_subpaths.push(canonical);
+            }
+        }
+        self.read_denied_subpaths.push(abs);
         self
     }
 
@@ -299,7 +326,36 @@ impl WorkspacePolicy {
         } else {
             self.cwd.join(raw)
         };
-        canonicalize(&path)
+        let canonical = canonicalize(&path)?;
+        // Credential-read hiding (opt-in): reject reads under a read-denied
+        // subtree. Check BOTH the canonical and lexical path (a symlinked dir
+        // created mid-session would canonicalize elsewhere; the lexical prefix
+        // still matches), mirroring the write deny-list.
+        if !self.read_denied_subpaths.is_empty() {
+            self.check_not_read_denied(&canonical)?;
+            self.check_not_read_denied(&path)?;
+        }
+        Ok(canonical)
+    }
+
+    fn check_not_read_denied(&self, resolved: &Path) -> Result<(), PolicyError> {
+        if self.is_read_denied(resolved) {
+            return Err(PolicyError::Protected {
+                path: resolved.display().to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Whether `path` is under a read-denied (strict-read credential) subtree.
+    /// Public so directory-WALKING tools (`Grep`/`Glob`) can skip entries that a
+    /// per-file `resolve_read` would reject — they only `resolve_read` the search
+    /// root, then iterate, so without this a grep under an allowed root that is
+    /// an ancestor of `~/.ssh` would still surface credentials.
+    pub fn is_read_denied(&self, path: &Path) -> bool {
+        self.read_denied_subpaths
+            .iter()
+            .any(|denied| path.starts_with(denied))
     }
 
     /// Enforce the file-size cap. Call before reading bytes into
@@ -488,6 +544,31 @@ mod tests {
         assert!(
             policy.resolve_read(".git/HEAD").is_ok(),
             "reads not confined"
+        );
+    }
+
+    #[test]
+    fn read_denied_subpath_blocks_reads_only() {
+        let dir = TempDir::new().unwrap();
+        let secrets = dir.path().join("secrets");
+        std::fs::create_dir_all(&secrets).unwrap();
+        std::fs::write(secrets.join("key"), b"shh").unwrap();
+        let policy = WorkspacePolicy::new(dir.path())
+            .unwrap()
+            .with_read_denied_subpath(&secrets);
+        // Reads under the read-denied subtree are rejected…
+        let err = policy
+            .resolve_read("secrets/key")
+            .expect_err("read of a hidden dir must be rejected");
+        assert!(matches!(err, PolicyError::Protected { .. }), "{err:?}");
+        // …reads elsewhere are unaffected…
+        std::fs::write(dir.path().join("ok.txt"), b"x").unwrap();
+        assert!(policy.resolve_read("ok.txt").is_ok());
+        // …and the read-deny does NOT also block writes into that dir (it is a
+        // read-only hide, separate from the write deny-list).
+        assert!(
+            policy.resolve("secrets/new", false).is_ok(),
+            "read-deny must not change write policy"
         );
     }
 
