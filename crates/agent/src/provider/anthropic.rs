@@ -75,6 +75,30 @@ impl AnthropicProvider {
         self.capabilities.supports_images = supports_images;
         self
     }
+
+    /// Insert the authentication headers. The official Anthropic API reads
+    /// `x-api-key`; third-party Anthropic-compatible gateways (DeepSeek,
+    /// LongCat, …) instead read `Authorization: Bearer <key>`. For a custom
+    /// base URL we send BOTH, so whichever the endpoint expects is present. The
+    /// official endpoint (default base URL) keeps receiving only `x-api-key` —
+    /// sending it a bearer token would be read as an OAuth credential.
+    fn insert_auth_headers(&self, headers: &mut HeaderMap) -> Result<(), AgentError> {
+        headers.insert(
+            "x-api-key",
+            HeaderValue::from_str(&self.api_key).map_err(|e| {
+                AgentError::provider("anthropic", format!("invalid x-api-key header: {e}"))
+            })?,
+        );
+        if self.base_url != DEFAULT_BASE_URL {
+            headers.insert(
+                "authorization",
+                HeaderValue::from_str(&format!("Bearer {}", self.api_key)).map_err(|e| {
+                    AgentError::provider("anthropic", format!("invalid authorization header: {e}"))
+                })?,
+            );
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -96,12 +120,7 @@ impl Provider for AnthropicProvider {
         let url = format!("{}/v1/messages", self.base_url);
 
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-api-key",
-            HeaderValue::from_str(&self.api_key).map_err(|e| {
-                AgentError::provider("anthropic", format!("invalid x-api-key header: {e}"))
-            })?,
-        );
+        self.insert_auth_headers(&mut headers)?;
         headers.insert(
             "anthropic-version",
             HeaderValue::from_static(ANTHROPIC_VERSION),
@@ -752,6 +771,29 @@ mod tests {
     use super::*;
     use crate::message::{Header, Message, ToolResultContent};
     use crate::provider::ThinkingConfig;
+
+    #[test]
+    fn custom_base_url_sends_bearer_and_x_api_key() {
+        // A third-party Anthropic-compatible gateway (LongCat/DeepSeek) reads
+        // `Authorization: Bearer`; we send both it AND `x-api-key`.
+        let p =
+            AnthropicProvider::new("ak_test").with_base_url("https://api.longcat.chat/anthropic");
+        let mut h = HeaderMap::new();
+        p.insert_auth_headers(&mut h).unwrap();
+        assert_eq!(h.get("x-api-key").unwrap(), "ak_test");
+        assert_eq!(h.get("authorization").unwrap(), "Bearer ak_test");
+    }
+
+    #[test]
+    fn official_base_url_sends_only_x_api_key() {
+        // The official Anthropic API uses `x-api-key`; a bearer token there would
+        // be read as an OAuth credential, so we must NOT send one.
+        let p = AnthropicProvider::new("sk-ant-test");
+        let mut h = HeaderMap::new();
+        p.insert_auth_headers(&mut h).unwrap();
+        assert_eq!(h.get("x-api-key").unwrap(), "sk-ant-test");
+        assert!(h.get("authorization").is_none());
+    }
 
     #[tokio::test]
     async fn truncated_tool_use_input_reports_token_limit() {
