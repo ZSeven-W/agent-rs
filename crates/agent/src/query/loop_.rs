@@ -122,9 +122,14 @@ pub struct QueryLoop {
     pub system: Option<String>,
     pub max_output_tokens: u32,
     pub max_concurrent_tools: usize,
-    /// Hard cap on assistant turns to prevent runaway loops. Defaults
-    /// to 16 in [`Self::builder`].
+    /// Optional cap on assistant turns. Defaults to `usize::MAX` (UNBOUNDED) in
+    /// [`Self::builder`] — the loop already stops naturally on a turn with no
+    /// tool calls. Set a finite value only to force a runaway backstop.
     pub max_iterations: usize,
+    /// How many times to retry a transient API failure (rate limit / 5xx /
+    /// network) when opening the provider stream, with exponential backoff
+    /// between attempts. Defaults to 10 in [`Self::builder`].
+    pub max_api_retries: u32,
     /// Working directory threaded into every [`ToolUseContext`].
     pub cwd: PathBuf,
     /// Shared file state cache threaded into every [`ToolUseContext`].
@@ -212,6 +217,7 @@ pub struct QueryLoopBuilder {
     max_output_tokens: u32,
     max_concurrent_tools: usize,
     max_iterations: usize,
+    max_api_retries: u32,
     cwd: PathBuf,
     file_cache: Option<Arc<FileStateCache>>,
     model_max_tokens: u32,
@@ -233,7 +239,8 @@ impl QueryLoopBuilder {
             system: None,
             max_output_tokens: 4096,
             max_concurrent_tools: 8,
-            max_iterations: 16,
+            max_iterations: usize::MAX,
+            max_api_retries: 10,
             cwd: PathBuf::from("."),
             file_cache: None,
             model_max_tokens: DEFAULT_MODEL_MAX_TOKENS,
@@ -292,6 +299,12 @@ impl QueryLoopBuilder {
         self.max_iterations = n;
         self
     }
+    /// How many times to retry a transient API failure with exponential
+    /// backoff. Defaults to 10.
+    pub fn max_api_retries(mut self, n: u32) -> Self {
+        self.max_api_retries = n;
+        self
+    }
     pub fn cwd(mut self, p: impl Into<PathBuf>) -> Self {
         self.cwd = p.into();
         self
@@ -341,6 +354,7 @@ impl QueryLoopBuilder {
             max_output_tokens: self.max_output_tokens,
             max_concurrent_tools: self.max_concurrent_tools,
             max_iterations: self.max_iterations,
+            max_api_retries: self.max_api_retries,
             cwd: self.cwd,
             file_cache,
             model_max_tokens: self.model_max_tokens,
@@ -430,11 +444,41 @@ async fn drive(
             req = req.with_tools(tool_defs);
         }
 
-        let upstream = match qloop.provider.stream(req, abort.clone()).await {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = tx.unbounded_send(Err(e));
-                return;
+        // Open the provider stream, retrying transient API failures (rate
+        // limits, 5xx, transport drops) with exponential backoff. Each attempt
+        // waits longer than the last, and every retry is announced as a Notice
+        // so the UI can show it. Permanent errors (auth / bad request) and an
+        // abort break out immediately.
+        let upstream = {
+            let mut attempt: u32 = 0;
+            loop {
+                match qloop.provider.stream(req.clone(), abort.clone()).await {
+                    Ok(s) => break s,
+                    Err(e) => {
+                        if abort.is_aborted() {
+                            return;
+                        }
+                        if attempt >= qloop.max_api_retries || !is_retryable_api_error(&e) {
+                            let _ = tx.unbounded_send(Err(e));
+                            return;
+                        }
+                        attempt += 1;
+                        let delay = retry_backoff(attempt);
+                        let _ = tx.unbounded_send(Ok(Event::Notice {
+                            code: "api_retry".into(),
+                            message: format!(
+                                "API error (attempt {attempt}/{}), retrying in {}s — {e}",
+                                qloop.max_api_retries,
+                                delay.as_secs(),
+                            ),
+                        }));
+                        // Back off, but wake immediately if the user aborts.
+                        tokio::select! {
+                            _ = tokio::time::sleep(delay) => {}
+                            _ = abort.token().cancelled() => return,
+                        }
+                    }
+                }
             }
         };
 
@@ -792,15 +836,19 @@ async fn consume_turn(
         }
     }
 
-    if !accumulated_text.is_empty() {
-        summary.assistant_blocks.push(ContentBlock::Text {
-            text: accumulated_text,
-        });
-    }
+    // Order blocks the way the model produced them: reasoning first, then the
+    // answer text, then tool calls. Storing thinking BEFORE text keeps a resumed
+    // session's transcript consistent with the live view (reasoning above the
+    // answer) instead of surfacing the answer before its reasoning.
     if let Some(thinking) = accumulated_thinking {
         summary.assistant_blocks.push(ContentBlock::Thinking {
             thinking,
             signature: None,
+        });
+    }
+    if !accumulated_text.is_empty() {
+        summary.assistant_blocks.push(ContentBlock::Text {
+            text: accumulated_text,
         });
     }
     for tu in &summary.pending_tool_uses {
@@ -818,6 +866,52 @@ fn snapshot(store: &Arc<Mutex<MessageStore>>) -> Result<Vec<Message>, AgentError
         .lock()
         .map_err(|_| AgentError::other("query store lock poisoned"))?;
     Ok(s.iter().cloned().collect())
+}
+
+/// Whether an API failure is transient and worth retrying. Providers that report
+/// `HTTP <code>: ...` (anthropic-compat) are classified precisely — rate limits,
+/// overload, and 5xx retry; auth / bad-request do not. SDK-wrapped errors without
+/// a clean status (openai/ollama) are treated as retryable transport failures
+/// unless they name an obvious permanent condition.
+fn is_retryable_api_error(e: &AgentError) -> bool {
+    let AgentError::Provider { message, .. } = e else {
+        return false;
+    };
+    if let Some(code) = parse_http_status(message) {
+        // 429 (rate limit) + a few transient client statuses, and ANY 5xx server
+        // error — 500/502/503/504, Anthropic 529 overload, and gateway/proxy 52x
+        // (common from third-party endpoints) — except 501 Not Implemented, which
+        // is permanent.
+        return code == 408
+            || code == 409
+            || code == 425
+            || code == 429
+            || (code >= 500 && code != 501);
+    }
+    let m = message.to_ascii_lowercase();
+    !(m.contains("invalid")
+        || m.contains("unauthorized")
+        || m.contains("401")
+        || m.contains("403")
+        || m.contains("400")
+        || m.contains("404"))
+}
+
+/// Parse the leading numeric status from a `"HTTP <code> ...: ..."` message.
+fn parse_http_status(message: &str) -> Option<u16> {
+    let rest = message.strip_prefix("HTTP ")?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// Exponential backoff for a 1-based retry `attempt`: 1s, 2s, 4s, 8s, … capped at
+/// 60s so a long outage doesn't stall each retry indefinitely.
+fn retry_backoff(attempt: u32) -> std::time::Duration {
+    let secs = 1u64
+        .checked_shl(attempt.saturating_sub(1))
+        .unwrap_or(u64::MAX)
+        .min(60);
+    std::time::Duration::from_secs(secs)
 }
 
 fn push(store: &Arc<Mutex<MessageStore>>, msg: Message) -> Result<(), AgentError> {
@@ -1052,6 +1146,51 @@ mod tests {
     use crate::permission::{PermissionMode, RuleSource};
     use crate::testing::MockProvider;
     use crate::tool::Tool;
+
+    #[test]
+    fn retryable_classifies_http_statuses() {
+        let prov = |m: &str| AgentError::provider("anthropic", m);
+        // Rate limit + ANY 5xx server/gateway/overload error → retry.
+        assert!(is_retryable_api_error(&prov(
+            "HTTP 429 Too Many Requests: slow down"
+        )));
+        assert!(is_retryable_api_error(&prov(
+            "HTTP 500 Internal Server Error: x"
+        )));
+        assert!(is_retryable_api_error(&prov(
+            "HTTP 503 Service Unavailable: x"
+        )));
+        assert!(is_retryable_api_error(&prov("HTTP 504 Gateway Timeout: x")));
+        assert!(is_retryable_api_error(&prov(
+            "HTTP 522 Connection Timed Out: cf"
+        )));
+        assert!(is_retryable_api_error(&prov("HTTP 529 Overloaded: x")));
+        // Auth / bad request / not-implemented → do NOT retry.
+        assert!(!is_retryable_api_error(&prov(
+            "HTTP 401 Unauthorized: bad key"
+        )));
+        assert!(!is_retryable_api_error(&prov(
+            "HTTP 400 Bad Request: schema"
+        )));
+        assert!(!is_retryable_api_error(&prov(
+            "HTTP 501 Not Implemented: x"
+        )));
+        // No status = transport failure → retry; aborts/others → no.
+        assert!(is_retryable_api_error(&prov(
+            "error sending request: connection reset"
+        )));
+        assert!(!is_retryable_api_error(&AgentError::Aborted("user".into())));
+        assert!(!is_retryable_api_error(&prov("invalid x-api-key header")));
+    }
+
+    #[test]
+    fn backoff_grows_then_caps() {
+        let s = |a| retry_backoff(a).as_secs();
+        assert_eq!((s(1), s(2), s(3), s(4)), (1, 2, 4, 8));
+        assert!(s(2) > s(1) && s(3) > s(2)); // each longer than the last…
+        assert_eq!(s(7), 60); // …until the 60s cap
+        assert_eq!(s(10), 60);
+    }
 
     #[derive(Debug)]
     struct EchoTool {
