@@ -151,6 +151,26 @@ pub fn microcompact(messages: &mut [Message], config: &MicrocompactConfig) -> Mi
     }
 }
 
+/// Run [`microcompact`] over a [`MessageStore`]. The store is append-only,
+/// so the messages are snapshotted, mutated, and the store rebuilt — but
+/// ONLY when something was actually cleared. UUIDs are preserved by the
+/// rebuild, so the DAG and `parent_uuid` references stay valid.
+pub fn apply_microcompact_to_store(
+    store: &mut crate::message::MessageStore,
+    config: &MicrocompactConfig,
+) -> Result<MicrocompactResult, crate::error::AgentError> {
+    let mut snapshot: Vec<Message> = store.iter().cloned().collect();
+    let result = microcompact(&mut snapshot, config);
+    if result.cleared_count > 0 {
+        let mut rebuilt = crate::message::MessageStore::new();
+        for msg in snapshot {
+            rebuilt.push(msg)?;
+        }
+        *store = rebuilt;
+    }
+    Ok(result)
+}
+
 /// Per-block token estimate matching the rule in [`super::estimate_tokens`].
 fn estimate_block_tokens(content: &ToolResultContent) -> u32 {
     match content {
@@ -307,5 +327,55 @@ mod tests {
         };
         let result = microcompact(&mut messages, &cfg);
         assert_eq!(result.cleared_count, 1);
+    }
+
+    #[test]
+    fn apply_to_store_rebuilds_and_preserves_uuids() {
+        use crate::message::MessageStore;
+        let mut store = MessageStore::new();
+        store
+            .push(user_with_tool_result("tu_old", &"x".repeat(2_000)))
+            .unwrap();
+        for i in 0..4 {
+            store.push(user_text(&format!("turn {i}"))).unwrap();
+        }
+        let uuids_before: Vec<_> = store.iter().map(|m| m.uuid()).collect();
+
+        let cfg = MicrocompactConfig {
+            min_age_turns: 2,
+            preserve_last_n: 0,
+            min_tokens_per_result: 100,
+        };
+        let result = apply_microcompact_to_store(&mut store, &cfg).unwrap();
+        assert_eq!(result.cleared_count, 1);
+        assert_eq!(result.cleared_tool_use_ids, vec!["tu_old"]);
+
+        // UUIDs and order survive the rebuild.
+        let uuids_after: Vec<_> = store.iter().map(|m| m.uuid()).collect();
+        assert_eq!(uuids_before, uuids_after);
+
+        // The payload is actually replaced in the store.
+        let first = store.iter().next().unwrap();
+        match first {
+            Message::User { content, .. } => match &content[0] {
+                ContentBlock::ToolResult { content, .. } => match content {
+                    ToolResultContent::Text(t) => assert_eq!(t, CLEARED_PLACEHOLDER),
+                    other => panic!("expected text payload, got {other:?}"),
+                },
+                other => panic!("expected tool result, got {other:?}"),
+            },
+            other => panic!("expected user message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_to_store_no_op_leaves_store_untouched() {
+        use crate::message::MessageStore;
+        let mut store = MessageStore::new();
+        store.push(user_text("only text, nothing to clear")).unwrap();
+        let result =
+            apply_microcompact_to_store(&mut store, &MicrocompactConfig::default()).unwrap();
+        assert_eq!(result.cleared_count, 0);
+        assert_eq!(store.len(), 1);
     }
 }

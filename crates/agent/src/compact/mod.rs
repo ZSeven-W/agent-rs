@@ -47,7 +47,10 @@ pub use auto::{
     MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES, WARNING_THRESHOLD_BUFFER_TOKENS,
 };
 pub use grouping::{group_messages, safe_split_index, GroupKind, MessageGroup};
-pub use microcompact::{microcompact, MicrocompactConfig, MicrocompactResult, CLEARED_PLACEHOLDER};
+pub use microcompact::{
+    apply_microcompact_to_store, microcompact, MicrocompactConfig, MicrocompactResult,
+    CLEARED_PLACEHOLDER,
+};
 pub use post_cleanup::{
     build_post_compact_message, FileAttachment, PostCompactConfig, PostCompactResult,
 };
