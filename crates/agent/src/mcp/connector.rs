@@ -114,6 +114,107 @@ impl Connector for RmcpConnector {
     }
 }
 
+/// How a stdio MCP server command spawns on Windows.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+enum StdioProgram {
+    /// Spawn directly — an explicit path, an `.exe`, or a name
+    /// `CreateProcess` resolves itself (it appends `.exe` to
+    /// extension-less names). Arguments never touch cmd's parser.
+    Direct(String),
+    /// A `.cmd` / `.bat` shim — `CreateProcess` can't execute those
+    /// and Rust 1.77+ refuses them as program names, so the RESOLVED
+    /// path routes through `cmd /c`.
+    CmdShim(String),
+}
+
+/// Decide how to spawn `command` on Windows, probing `path_env` the
+/// way PATHEXT would: per PATH dir in order, a real executable
+/// (`name` / `name.exe`) beats a `name.cmd` / `name.bat` shim in the
+/// same dir. Only genuine shims (npx and most npm-installed MCP
+/// servers ship as `*.cmd`) take the `cmd /c` trampoline — everything
+/// else spawns directly so user-configured arguments (`&`, `%`,
+/// quotes) never pass through cmd's re-parsing, kill semantics stay
+/// direct, and exit codes are the server's own.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn resolve_stdio_program(command: &str, path_env: Option<&std::ffi::OsStr>) -> StdioProgram {
+    let path = std::path::Path::new(command);
+    let has_path_sep = path
+        .parent()
+        .map(|p| !p.as_os_str().is_empty())
+        .unwrap_or(false);
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    if matches!(ext.as_deref(), Some("cmd" | "bat")) {
+        return StdioProgram::CmdShim(command.to_string());
+    }
+    if has_path_sep || ext.as_deref() == Some("exe") {
+        return StdioProgram::Direct(command.to_string());
+    }
+    let Some(path_env) = path_env else {
+        return StdioProgram::Direct(command.to_string());
+    };
+    for dir in std::env::split_paths(path_env).filter(|d| !d.as_os_str().is_empty()) {
+        if dir.join(command).is_file() || dir.join(format!("{command}.exe")).is_file() {
+            return StdioProgram::Direct(command.to_string());
+        }
+        for shim_ext in ["cmd", "bat"] {
+            let candidate = dir.join(format!("{command}.{shim_ext}"));
+            if candidate.is_file() {
+                return StdioProgram::CmdShim(candidate.to_string_lossy().into_owned());
+            }
+        }
+    }
+    // Nothing found — spawn the bare name and let `CreateProcess`
+    // produce its own clean not-found error.
+    StdioProgram::Direct(command.to_string())
+}
+
+/// The PATH the spawned server will actually search: a per-server env
+/// override wins (Windows env names are case-insensitive, so `PATH` /
+/// `Path` / `path` all count), else the parent process PATH is
+/// inherited. Shim resolution must probe THIS path — probing the
+/// parent PATH would miss a shim that only exists on the server's
+/// overridden PATH (and vice versa).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn effective_path_env(env: &BTreeMap<String, String>) -> Option<std::ffi::OsString> {
+    env.iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("path"))
+        .map(|(_, v)| std::ffi::OsString::from(v))
+        .or_else(|| std::env::var_os("PATH"))
+}
+
+/// Base command for a stdio MCP server. On Windows a command that
+/// resolves to a `.cmd` / `.bat` shim (against the PATH the server
+/// will actually see — see [`effective_path_env`]) routes through
+/// `cmd /c`; real executables spawn directly. Every spawn gets
+/// CREATE_NO_WINDOW so background servers don't flash console windows
+/// behind a GUI host.
+fn stdio_base_command(command: &str, env: &BTreeMap<String, String>) -> Command {
+    #[cfg(windows)]
+    {
+        let path_env = effective_path_env(env);
+        let mut cmd = match resolve_stdio_program(command, path_env.as_deref()) {
+            StdioProgram::Direct(program) => Command::new(program),
+            StdioProgram::CmdShim(shim) => {
+                let mut c = Command::new("cmd");
+                c.arg("/c").arg(shim);
+                c
+            }
+        };
+        // CREATE_NO_WINDOW from winbase.h.
+        cmd.creation_flags(0x0800_0000);
+        cmd
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = env;
+        Command::new(command)
+    }
+}
+
 async fn connect_stdio(
     connector: &RmcpConnector,
     server_name: &str,
@@ -128,7 +229,7 @@ async fn connect_stdio(
     let env_owned: Vec<(String, String)> =
         env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     let cwd_owned: Option<String> = cwd.map(|s| s.to_string());
-    let cmd = Command::new(command).configure(move |c| {
+    let cmd = stdio_base_command(command, env).configure(move |c| {
         c.args(&args_owned);
         for (k, v) in &env_owned {
             c.env(k, v);
@@ -560,5 +661,97 @@ mod tests {
             }
             other => panic!("expected Connector error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn explicit_shapes_resolve_without_a_path_probe() {
+        // Extension states its nature regardless of PATH contents.
+        assert_eq!(
+            resolve_stdio_program("some-server.cmd", None),
+            StdioProgram::CmdShim("some-server.cmd".to_string())
+        );
+        assert_eq!(
+            resolve_stdio_program("npx.exe", None),
+            StdioProgram::Direct("npx.exe".to_string())
+        );
+        // Explicit paths spawn directly.
+        assert_eq!(
+            resolve_stdio_program("./server", None),
+            StdioProgram::Direct("./server".to_string())
+        );
+        assert_eq!(
+            resolve_stdio_program("/usr/local/bin/server", None),
+            StdioProgram::Direct("/usr/local/bin/server".to_string())
+        );
+    }
+
+    #[test]
+    fn only_genuine_cmd_shims_take_the_cmd_trampoline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // `npx` ships only as a .cmd shim; `node` is a real .exe;
+        // `deno` has both (the .exe must win, PATHEXT-style).
+        std::fs::write(dir.path().join("npx.cmd"), "").unwrap();
+        std::fs::write(dir.path().join("node.exe"), "").unwrap();
+        std::fs::write(dir.path().join("deno.exe"), "").unwrap();
+        std::fs::write(dir.path().join("deno.cmd"), "").unwrap();
+        let path_env = std::env::join_paths([dir.path()]).expect("join_paths");
+
+        assert_eq!(
+            resolve_stdio_program("npx", Some(&path_env)),
+            StdioProgram::CmdShim(dir.path().join("npx.cmd").to_string_lossy().into_owned()),
+            "a .cmd-only CLI needs the cmd /c trampoline"
+        );
+        assert_eq!(
+            resolve_stdio_program("node", Some(&path_env)),
+            StdioProgram::Direct("node".to_string()),
+            "a real executable must NOT be shelled through cmd"
+        );
+        assert_eq!(
+            resolve_stdio_program("deno", Some(&path_env)),
+            StdioProgram::Direct("deno".to_string()),
+            "an .exe beats a sibling .cmd shim, PATHEXT-style"
+        );
+        // Unknown names spawn directly so CreateProcess produces its
+        // own clean not-found error.
+        assert_eq!(
+            resolve_stdio_program("no-such-cli", Some(&path_env)),
+            StdioProgram::Direct("no-such-cli".to_string())
+        );
+    }
+
+    #[test]
+    fn per_server_path_override_wins_case_insensitively() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("srv.cmd"), "").unwrap();
+        let override_path = dir.path().to_string_lossy().into_owned();
+        // Windows env names are case-insensitive — `Path` must count.
+        let env: BTreeMap<String, String> =
+            [("Path".to_string(), override_path)].into_iter().collect();
+
+        let effective = effective_path_env(&env).expect("override present");
+        assert_eq!(
+            resolve_stdio_program("srv", Some(&effective)),
+            StdioProgram::CmdShim(dir.path().join("srv.cmd").to_string_lossy().into_owned()),
+            "the shim only exists on the server's overridden PATH"
+        );
+        // No override → the parent PATH is what the child inherits.
+        let no_override: BTreeMap<String, String> = BTreeMap::new();
+        assert_eq!(effective_path_env(&no_override), std::env::var_os("PATH"));
+    }
+
+    #[test]
+    fn path_dirs_probe_in_order() {
+        let first = tempfile::tempdir().expect("tempdir");
+        let second = tempfile::tempdir().expect("tempdir");
+        // The shim in the FIRST dir wins over the exe in the second —
+        // same precedence CreateProcess/PATHEXT would apply.
+        std::fs::write(first.path().join("tool.cmd"), "").unwrap();
+        std::fs::write(second.path().join("tool.exe"), "").unwrap();
+        let path_env = std::env::join_paths([first.path(), second.path()]).expect("join_paths");
+
+        assert_eq!(
+            resolve_stdio_program("tool", Some(&path_env)),
+            StdioProgram::CmdShim(first.path().join("tool.cmd").to_string_lossy().into_owned())
+        );
     }
 }
