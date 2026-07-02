@@ -32,9 +32,9 @@ use futures::StreamExt;
 
 use crate::abort::AbortController;
 use crate::compact::{
-    apply_compaction_to_store, compact_with_hooks, estimate_tokens, AutoCompactReason,
-    AutoCompactState, CompactError, CompactTrigger, CompactWithHooksRequest,
-    PartialCompactDirection,
+    apply_compaction_to_store, apply_microcompact_to_store, compact_with_hooks, estimate_tokens,
+    promote_to_store, AutoCompactReason, AutoCompactState, CompactError, CompactTrigger,
+    CompactWithHooksRequest, MicrocompactConfig, PartialCompactDirection, SessionMemoryStore,
 };
 use crate::error::AgentError;
 use crate::file_cache::FileStateCache;
@@ -155,6 +155,20 @@ pub struct QueryLoop {
     pub temperature: Option<f32>,
     /// Whether to request provider prompt caching (Anthropic `cache_control`).
     pub use_prompt_cache: bool,
+    /// Whether the microcompact ladder step runs before LLM compaction:
+    /// on threshold hit, old tool-result payloads are cleared first, and
+    /// if that alone drops the total back under the threshold the LLM
+    /// compaction is skipped for this turn. Defaults to `false`.
+    pub microcompact_enabled: bool,
+    /// Host-supplied extra instructions appended to the summarization
+    /// prompt of every auto-compaction (see
+    /// [`CompactWithHooksRequest::with_custom_instructions`]).
+    pub compact_instructions: Option<String>,
+    /// Optional durable sink: after a successful auto-compaction the
+    /// analysis bullets are promoted here via
+    /// [`crate::compact::promote_to_store`]. Errors surface as a Notice
+    /// and never fail the compaction.
+    pub session_memory: Option<Arc<dyn SessionMemoryStore>>,
 }
 
 impl QueryLoop {
@@ -225,6 +239,9 @@ pub struct QueryLoopBuilder {
     compact_state: Option<Arc<Mutex<AutoCompactState>>>,
     temperature: Option<f32>,
     use_prompt_cache: bool,
+    microcompact_enabled: bool,
+    compact_instructions: Option<String>,
+    session_memory: Option<Arc<dyn SessionMemoryStore>>,
 }
 
 impl QueryLoopBuilder {
@@ -248,6 +265,9 @@ impl QueryLoopBuilder {
             compact_state: None,
             temperature: None,
             use_prompt_cache: false,
+            microcompact_enabled: false,
+            compact_instructions: None,
+            session_memory: None,
         }
     }
 
@@ -331,6 +351,23 @@ impl QueryLoopBuilder {
         self.compact_state = Some(s);
         self
     }
+    /// Enable the microcompact ladder step (clear old tool results before
+    /// resorting to LLM compaction). Defaults to `false`.
+    pub fn microcompact(mut self, on: bool) -> Self {
+        self.microcompact_enabled = on;
+        self
+    }
+    /// Extra instructions appended to the auto-compaction summarization
+    /// prompt.
+    pub fn compact_instructions(mut self, ci: impl Into<String>) -> Self {
+        self.compact_instructions = Some(ci.into());
+        self
+    }
+    /// Durable sink for compaction analysis bullets.
+    pub fn session_memory(mut self, sm: Arc<dyn SessionMemoryStore>) -> Self {
+        self.session_memory = Some(sm);
+        self
+    }
 
     pub fn build(self) -> QueryLoop {
         let file_cache = self.file_cache.unwrap_or_else(|| {
@@ -364,6 +401,9 @@ impl QueryLoopBuilder {
                 .unwrap_or_else(|| Arc::new(Mutex::new(AutoCompactState::new()))),
             temperature: self.temperature,
             use_prompt_cache: self.use_prompt_cache,
+            microcompact_enabled: self.microcompact_enabled,
+            compact_instructions: self.compact_instructions,
+            session_memory: self.session_memory,
         }
     }
 }
@@ -1050,6 +1090,42 @@ async fn maybe_auto_compact(
         return Ok(());
     }
 
+    // ----- Ladder step ①: microcompact (no LLM call) -----
+    // Clearing old tool-result payloads is free. When it alone drops the
+    // total back under the threshold, skip LLM compaction this turn.
+    // Deliberately NOT recorded as success/failure: the circuit breaker
+    // tracks LLM compaction attempts only.
+    let mut snapshot = snapshot;
+    if qloop.microcompact_enabled {
+        let threshold = crate::compact::auto_compact_threshold(qloop.model_max_tokens);
+        let (mc, new_total, new_snapshot) = {
+            let mut store = qloop
+                .store
+                .lock()
+                .map_err(|_| AgentError::other("query store lock poisoned"))?;
+            let mc = apply_microcompact_to_store(&mut store, &MicrocompactConfig::default())?;
+            let new_total = store
+                .iter()
+                .map(estimate_tokens)
+                .fold(0u32, u32::saturating_add);
+            let new_snapshot: Vec<Message> = store.iter().cloned().collect();
+            (mc, new_total, new_snapshot)
+        };
+        if mc.cleared_count > 0 {
+            let _ = tx.unbounded_send(Ok(Event::Notice {
+                code: "agent.compact.micro".into(),
+                message: format!(
+                    "microcompact cleared {} tool result(s), freed ~{} tokens",
+                    mc.cleared_count, mc.tokens_freed
+                ),
+            }));
+            snapshot = new_snapshot;
+            if new_total < threshold {
+                return Ok(());
+            }
+        }
+    }
+
     // Run the compaction. `EarliestHalf` keeps the recent half — vital
     // because [`QueryLoop::run`] just pushed the user's prompt and we
     // need the model to see it on the next streaming turn.
@@ -1057,10 +1133,13 @@ async fn maybe_auto_compact(
     // Use a child abort so an internal abort during summarization
     // doesn't poison the outer loop. Parent → child propagates, child
     // → parent does not.
-    let request = CompactWithHooksRequest::new(&snapshot, qloop.model.clone())
+    let mut request = CompactWithHooksRequest::new(&snapshot, qloop.model.clone())
         .with_trigger(CompactTrigger::Auto)
         .with_direction(PartialCompactDirection::EarliestHalf)
         .with_abort(abort.child());
+    if let Some(ci) = qloop.compact_instructions.as_deref() {
+        request = request.with_custom_instructions(ci);
+    }
     let outcome = compact_with_hooks(&qloop.hooks, &*qloop.provider, request).await;
 
     match outcome {
@@ -1090,6 +1169,23 @@ async fn maybe_auto_compact(
                 // [`AutoCompactState::reset_no_progress`].
                 if new_total >= auto_threshold {
                     s.record_no_progress();
+                }
+            }
+            if let Some(sm) = &qloop.session_memory {
+                match promote_to_store(sm.as_ref(), &result).await {
+                    Ok(n) if n > 0 => {
+                        let _ = tx.unbounded_send(Ok(Event::Notice {
+                            code: "agent.compact.memory".into(),
+                            message: format!("promoted {n} analysis bullet(s) to session memory"),
+                        }));
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        let _ = tx.unbounded_send(Ok(Event::Notice {
+                            code: "agent.compact.memory_failed".into(),
+                            message: e.to_string(),
+                        }));
+                    }
                 }
             }
             let _ = tx.unbounded_send(Ok(Event::Notice {
@@ -1144,6 +1240,7 @@ mod tests {
 
     use super::*;
     use crate::permission::{PermissionMode, RuleSource};
+    use crate::provider::ProviderCapabilities;
     use crate::testing::MockProvider;
     use crate::tool::Tool;
 
@@ -1682,8 +1779,12 @@ mod tests {
 
     /// Build a builder pre-populated with `extra` messages plus aggressive
     /// compact thresholds so any 2+ messages trigger immediately.
+    ///
+    /// Takes `Arc<dyn Provider>` (not `Arc<MockProvider>`) so tests that
+    /// need to inspect the outgoing `StreamRequest` (e.g. asserting on
+    /// `compact_instructions`) can plug in a custom `Provider` impl.
     fn compact_loop_builder(
-        provider: Arc<MockProvider>,
+        provider: Arc<dyn Provider>,
         store: Arc<Mutex<MessageStore>>,
     ) -> QueryLoopBuilder {
         QueryLoop::builder(provider, "mock")
@@ -2139,5 +2240,205 @@ mod tests {
             }
         }
         assert!(got_max_err, "expected max_iterations error");
+    }
+
+    fn user_tool_result(tu_id: &str, payload: &str) -> Message {
+        Message::User {
+            header: Header::new(),
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: tu_id.into(),
+                content: agent_tool_result_text(payload),
+                is_error: false,
+            }],
+        }
+    }
+
+    fn agent_tool_result_text(payload: &str) -> crate::message::ToolResultContent {
+        crate::message::ToolResultContent::Text(payload.into())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn microcompact_ladder_skips_llm_compaction_when_enough() {
+        // One huge OLD tool result (~100K tokens) + 5 small recent ones.
+        // model_max_tokens = 50_000 → auto threshold = 17_000.
+        // Pre-micro total ≈ 100K ≥ 17K → fires; clearing tu_0 alone drops
+        // the total below 17K → the LLM compaction turn must NOT run.
+        let provider = Arc::new(MockProvider::with_turns(vec![vec![
+            Event::TextDelta { delta: "ok".into() },
+            Event::Result {
+                data: ResultData {
+                    stop_reason: Some("end_turn".into()),
+                    ..Default::default()
+                },
+            },
+        ]]));
+        let mut preload = vec![user_tool_result("tu_0", &"x".repeat(400_000))];
+        for i in 1..6 {
+            preload.push(user_tool_result(&format!("tu_{i}"), &"y".repeat(600)));
+        }
+        let store = preload_store(preload);
+        let qloop = QueryLoop::builder(provider.clone(), "mock")
+            .permissions(Arc::new(
+                PermissionManager::new().with_mode(PermissionMode::Bypass),
+            ))
+            .store(store.clone())
+            .model_max_tokens(50_000)
+            .microcompact(true)
+            .build();
+        let mut stream = qloop.run("trigger", AbortController::new()).await.unwrap();
+        let mut events = Vec::new();
+        while let Some(item) = stream.next().await {
+            events.push(item.unwrap());
+        }
+        // Only the assistant turn was consumed — no LLM compaction.
+        assert_eq!(provider.remaining_turns(), 0);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::Notice { code, .. } if code == "agent.compact.micro")));
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, Event::Notice { code, .. } if code == "agent.compact.ok")));
+        // tu_0's payload was cleared in the store; no tombstones exist.
+        let snap: Vec<_> = store.lock().unwrap().iter().cloned().collect();
+        assert!(!snap.iter().any(|m| matches!(m, Message::Tombstone { .. })));
+        match &snap[0] {
+            Message::User { content, .. } => match &content[0] {
+                ContentBlock::ToolResult { content, .. } => {
+                    assert_eq!(
+                        content,
+                        &agent_tool_result_text(crate::compact::CLEARED_PLACEHOLDER)
+                    );
+                }
+                other => panic!("expected tool result, got {other:?}"),
+            },
+            other => panic!("expected user message, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn auto_compact_promotes_analysis_to_session_memory() {
+        let tagged = "<analysis>\n\
+            - DECISION: rebuild MessageStore on microcompact.\n\
+            - REQUIREMENT: never include co-author lines in commits.\n\
+            - OPEN QUESTION: split loop_.rs into submodules?\n\
+            </analysis>\n\
+            <summary>Working on the compact ladder; decisions recorded.</summary>";
+        let provider = Arc::new(MockProvider::with_turns(vec![
+            vec![
+                Event::TextDelta {
+                    delta: tagged.into(),
+                },
+                Event::Result {
+                    data: Default::default(),
+                },
+            ],
+            vec![
+                Event::TextDelta { delta: "ok".into() },
+                Event::Result {
+                    data: ResultData {
+                        stop_reason: Some("end_turn".into()),
+                        ..Default::default()
+                    },
+                },
+            ],
+        ]));
+        let store = preload_store(vec![
+            user_text("u1"),
+            assistant_text("a1"),
+            user_text("u2"),
+            assistant_text("a2"),
+        ]);
+        let mem = Arc::new(crate::compact::InMemoryStore::new());
+        let qloop = compact_loop_builder(provider.clone(), store)
+            .session_memory(mem.clone())
+            .build();
+        let mut stream = qloop.run("trigger", AbortController::new()).await.unwrap();
+        let mut events = Vec::new();
+        while let Some(item) = stream.next().await {
+            events.push(item.unwrap());
+        }
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::Notice { code, .. } if code == "agent.compact.memory")));
+        let entries = mem.list().await.unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].kind, crate::compact::SessionMemoryKind::Decision);
+        assert_eq!(
+            entries[1].kind,
+            crate::compact::SessionMemoryKind::Requirement
+        );
+        assert_eq!(
+            entries[2].kind,
+            crate::compact::SessionMemoryKind::OpenQuestion
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn compact_instructions_reach_the_summarization_prompt() {
+        // Captures every StreamRequest's system prompt.
+        #[derive(Debug)]
+        struct CapturingProvider {
+            systems: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+            turns: std::sync::Mutex<Vec<Vec<Event>>>,
+        }
+        #[async_trait]
+        impl Provider for CapturingProvider {
+            fn id(&self) -> &str {
+                "capturing"
+            }
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+            async fn stream(
+                &self,
+                req: StreamRequest,
+                _abort: AbortController,
+            ) -> Result<Box<dyn EventStream>, AgentError> {
+                self.systems.lock().unwrap().push(req.system.clone());
+                let turn = self.turns.lock().unwrap().remove(0);
+                Ok(Box::new(futures::stream::iter(turn.into_iter().map(Ok))))
+            }
+        }
+        let systems = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(CapturingProvider {
+            systems: systems.clone(),
+            turns: std::sync::Mutex::new(vec![
+                vec![
+                    Event::TextDelta {
+                        delta: "<analysis>- did X</analysis><summary>Did X.</summary>".into(),
+                    },
+                    Event::Result {
+                        data: Default::default(),
+                    },
+                ],
+                vec![
+                    Event::TextDelta { delta: "ok".into() },
+                    Event::Result {
+                        data: ResultData {
+                            stop_reason: Some("end_turn".into()),
+                            ..Default::default()
+                        },
+                    },
+                ],
+            ]),
+        });
+        let store = preload_store(vec![
+            user_text("u1"),
+            assistant_text("a1"),
+            user_text("u2"),
+            assistant_text("a2"),
+        ]);
+        let qloop = compact_loop_builder(provider, store)
+            .compact_instructions("ALWAYS TAG REQUIREMENT BULLETS")
+            .build();
+        let mut stream = qloop.run("trigger", AbortController::new()).await.unwrap();
+        while let Some(item) = stream.next().await {
+            item.unwrap();
+        }
+        // First request is the compaction call; its system prompt must
+        // carry the custom instructions appended to the vendor prompt.
+        let captured = systems.lock().unwrap();
+        let first = captured[0].as_deref().expect("compact call has a system");
+        assert!(first.contains("ALWAYS TAG REQUIREMENT BULLETS"));
     }
 }
