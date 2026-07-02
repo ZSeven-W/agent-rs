@@ -33,6 +33,7 @@ pub enum SessionMemoryKind {
     Observation,
     Constraint,
     OpenQuestion,
+    Requirement,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -191,6 +192,7 @@ impl SessionMemoryStore for JsonlMemoryStore {
 /// - `DECISION:` / `decision:` — captured as [`SessionMemoryKind::Decision`].
 /// - `OBSERVATION:` / `observation:` — [`SessionMemoryKind::Observation`].
 /// - `CONSTRAINT:` / `constraint:` — [`SessionMemoryKind::Constraint`].
+/// - `REQUIREMENT:` / `requirement:` — [`SessionMemoryKind::Requirement`].
 /// - `OPEN QUESTION:` / `OPEN_QUESTION:` / `question:` — [`SessionMemoryKind::OpenQuestion`].
 ///
 /// Bullets without an explicit kind tag default to `Observation`.
@@ -221,6 +223,11 @@ pub fn extract_memories_from_analysis(
             (
                 SessionMemoryKind::Constraint,
                 trimmed["constraint:".len()..].trim(),
+            )
+        } else if lower.starts_with("requirement:") {
+            (
+                SessionMemoryKind::Requirement,
+                trimmed["requirement:".len()..].trim(),
             )
         } else if lower.starts_with("open question:") {
             (
@@ -354,5 +361,17 @@ mod tests {
         let uuids = vec![Uuid::new_v4(), Uuid::new_v4()];
         let entries = extract_memories_from_analysis("- DECISION: yes", &uuids);
         assert_eq!(entries[0].source_message_uuids, uuids);
+    }
+
+    #[test]
+    fn extract_memories_recognizes_requirement() {
+        let analysis = "\
+- REQUIREMENT: commit messages must never include co-author lines.
+- requirement: use 王小明 as the placeholder name in fixtures.";
+        let entries = extract_memories_from_analysis(analysis, &[]);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].kind, SessionMemoryKind::Requirement);
+        assert_eq!(entries[1].kind, SessionMemoryKind::Requirement);
+        assert!(entries[0].text.starts_with("commit messages"));
     }
 }
