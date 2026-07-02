@@ -15,6 +15,16 @@ pub const NO_TOOLS_PREAMBLE: &str = "CRITICAL: Respond with TEXT ONLY. Do NOT ca
 - Tool calls will be REJECTED and will waste your only turn — you will fail the task.
 - Your entire response must be plain text: an <analysis> block followed by a <summary> block.";
 
+/// Final synthetic user message appended to the summarize request. The
+/// conversation being summarized usually ENDS mid-task (assistant tool call →
+/// tool result), which invites the model to keep working on that task instead
+/// of answering the system prompt — DeepSeek models were seen emitting raw
+/// DSML tool markup exactly this way. A closing user turn re-anchors the
+/// request on the summarize instruction.
+pub const SUMMARIZE_NOW_NUDGE: &str = "Stop working on the task above — do not call any tools. \
+Respond now with the compaction output only: an <analysis> block followed by a <summary> block, \
+as plain text.";
+
 /// Tag the model uses to wrap its preliminary reasoning.
 pub const ANALYSIS_OPEN: &str = "<analysis>";
 pub const ANALYSIS_CLOSE: &str = "</analysis>";
@@ -122,6 +132,8 @@ pub enum ParseSummaryError {
     MissingSummary,
     #[error("response has unbalanced or out-of-order tags")]
     Malformed,
+    #[error("response is raw tool-call markup, not a summary")]
+    RawToolMarkup,
 }
 
 /// Parse a model response into an analysis + summary, LENIENTLY.
@@ -145,29 +157,50 @@ pub enum ParseSummaryError {
 pub fn parse_summary_response(text: &str) -> Result<ParsedSummary, ParseSummaryError> {
     let analysis = extract_block(text, ANALYSIS_OPEN, ANALYSIS_CLOSE).unwrap_or_default();
 
-    let summary = extract_block(text, SUMMARY_OPEN, SUMMARY_CLOSE)
+    let tagged = extract_block(text, SUMMARY_OPEN, SUMMARY_CLOSE)
         .or_else(|| {
             // `<summary>` opened but not closed (truncated): take the tail.
             text.find(SUMMARY_OPEN)
                 .map(|o| text[o + SUMMARY_OPEN.len()..].trim().to_string())
         })
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
-            // The model ignored the format. Use the whole response minus any
-            // analysis block, so compaction still succeeds.
+        .filter(|s| !s.is_empty());
+
+    let summary = match tagged {
+        Some(s) => s,
+        None => {
+            // The model ignored the format. A prose response still makes a
+            // usable summary — but raw tool-call markup (a model continuing
+            // the conversation's task instead of summarizing, e.g. DeepSeek
+            // emitting `<｜DSML｜tool_calls>` as text on a tool-less request)
+            // must be REJECTED: splicing it into the store would replace the
+            // real transcript with garbage, unrecoverably.
             let body = strip_block(text, ANALYSIS_OPEN, ANALYSIS_CLOSE);
             let body = body.trim();
+            if looks_like_tool_markup(body) {
+                return Err(ParseSummaryError::RawToolMarkup);
+            }
             if body.is_empty() {
                 analysis.clone()
             } else {
                 body.to_string()
             }
-        });
+        }
+    };
 
     if summary.is_empty() {
         return Err(ParseSummaryError::MissingSummary);
     }
     Ok(ParsedSummary { analysis, summary })
+}
+
+/// Special-token fences that mark a tool call emitted as literal text:
+/// ChatML-style `<|...|>` or DeepSeek's fullwidth `<｜...｜>` (also seen
+/// doubled: `<｜｜DSML｜｜tool_calls>`). A real summary never STARTS with a
+/// token fence, so only the leading characters are checked — prose that
+/// merely mentions such tokens later in the text still passes.
+fn looks_like_tool_markup(body: &str) -> bool {
+    let t = body.trim_start();
+    t.starts_with("<|") || t.starts_with("<｜")
 }
 
 /// Trimmed content between the first `open` and the next `close` after it.
@@ -197,6 +230,32 @@ mod tests {
     fn no_tools_preamble_explicit() {
         assert!(NO_TOOLS_PREAMBLE.contains("Do NOT call any tools"));
         assert!(NO_TOOLS_PREAMBLE.contains("Tool calls will be REJECTED"));
+    }
+
+    #[test]
+    fn fallback_rejects_raw_tool_markup() {
+        // Regression: DeepSeek answered a summarize request by "calling" a
+        // tool as literal DSML text. The lenient no-tags fallback must not
+        // splice that into the transcript as the summary.
+        let dsml = "<｜｜DSML｜｜tool_calls>\n<｜｜DSML｜｜invoke name=\"Bash\">\
+                    \n</｜｜DSML｜｜invoke>\n</｜｜DSML｜｜tool_calls>";
+        assert!(matches!(
+            parse_summary_response(dsml),
+            Err(ParseSummaryError::RawToolMarkup)
+        ));
+        // ChatML-style token fences are rejected the same way.
+        let chatml = "<|tool_call|>{\"name\":\"bash\"}<|end|>";
+        assert!(matches!(
+            parse_summary_response(chatml),
+            Err(ParseSummaryError::RawToolMarkup)
+        ));
+        // Untagged PROSE still passes via the lenient fallback, even when it
+        // mentions token fences later in the text.
+        let prose = "We fixed the parser. The model kept emitting <|junk|> mid-run.";
+        assert_eq!(parse_summary_response(prose).unwrap().summary, prose);
+        // A tagged summary is trusted as-is (the model followed the format).
+        let tagged = "<summary>Ran <|weird|> experiments; all pass.</summary>";
+        assert!(parse_summary_response(tagged).is_ok());
     }
 
     #[test]

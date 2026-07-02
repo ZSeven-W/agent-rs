@@ -16,7 +16,7 @@ use super::{
     estimate_tokens,
     prompt::{
         parse_summary_response, summarization_prompt, ParseSummaryError, ParsedSummary,
-        PartialCompactDirection,
+        PartialCompactDirection, SUMMARIZE_NOW_NUDGE,
     },
 };
 use crate::abort::AbortController;
@@ -130,59 +130,98 @@ pub async fn compact_conversation(
         ),
     };
 
-    let req = StreamRequest::new(model.into(), target_slice)
-        .with_system(system)
-        .with_max_output_tokens(MAX_OUTPUT_TOKENS_FOR_SUMMARY);
+    // The transcript usually ENDS mid-task (tool call → tool result), which
+    // invites the model to continue that task instead of obeying the system
+    // prompt — DeepSeek was seen emitting raw DSML tool markup as "summary"
+    // text this way. A closing synthetic user turn re-anchors the request on
+    // the summarize instruction. It is request-only: never stored, and not
+    // part of `replaced_uuids`.
+    let mut request_messages = target_slice;
+    request_messages.push(Message::User {
+        header: Header::new(),
+        content: vec![ContentBlock::Text {
+            text: SUMMARIZE_NOW_NUDGE.into(),
+        }],
+    });
+    let model: String = model.into();
 
-    let mut stream = provider
-        .stream(req, abort.clone())
-        .await
-        .map_err(CompactError::Provider)?;
+    // A failed compaction is recoverable (the transcript is untouched); a
+    // garbage summary spliced into the store is not. So parse strictly and
+    // give the model ONE retry when it ignored the response format (parse
+    // errors are stochastic — a second sample usually complies). Provider,
+    // stream, and empty-response failures are NOT retried: those are
+    // transport-level and belong to the provider layer / auto-compact
+    // failure handling.
+    let mut last_err = CompactError::EmptyResponse;
+    let mut parsed: Option<ParsedSummary> = None;
+    for _attempt in 0..2 {
+        let req = StreamRequest::new(model.clone(), request_messages.clone())
+            .with_system(system.clone())
+            .with_max_output_tokens(MAX_OUTPUT_TOKENS_FOR_SUMMARY);
 
-    let collected = Arc::new(Mutex::new(String::new()));
-    let mut emitted_error: Option<AgentError> = None;
-    while let Some(item) = stream.next().await {
-        if abort.is_aborted() {
-            return Err(CompactError::Aborted);
-        }
-        match item {
-            Ok(Event::TextDelta { delta }) => {
-                if let Ok(mut buf) = collected.lock() {
-                    buf.push_str(&delta);
+        let mut stream = provider
+            .stream(req, abort.clone())
+            .await
+            .map_err(CompactError::Provider)?;
+
+        let collected = Arc::new(Mutex::new(String::new()));
+        let mut emitted_error: Option<AgentError> = None;
+        while let Some(item) = stream.next().await {
+            if abort.is_aborted() {
+                return Err(CompactError::Aborted);
+            }
+            match item {
+                Ok(Event::TextDelta { delta }) => {
+                    if let Ok(mut buf) = collected.lock() {
+                        buf.push_str(&delta);
+                    }
+                }
+                Ok(Event::Result { .. }) => {
+                    // Stream completed; loop will end at next None.
+                }
+                Ok(Event::Error { code, message }) => {
+                    emitted_error = Some(AgentError::provider(
+                        "compact",
+                        format!("stream error code={code}: {message}"),
+                    ));
+                    break;
+                }
+                Ok(_) => {
+                    // Other events (Usage, Thinking, ToolUse) — ignore for
+                    // compaction. NO_TOOLS_PREAMBLE should prevent
+                    // ToolUse; if one slips through we drop it.
+                }
+                Err(e) => {
+                    emitted_error = Some(e);
+                    break;
                 }
             }
-            Ok(Event::Result { .. }) => {
-                // Stream completed; loop will end at next None.
-            }
-            Ok(Event::Error { code, message }) => {
-                emitted_error = Some(AgentError::provider(
-                    "compact",
-                    format!("stream error code={code}: {message}"),
-                ));
+        }
+
+        if let Some(err) = emitted_error {
+            return Err(CompactError::Provider(err));
+        }
+
+        let response_text = collected.lock().map(|b| b.clone()).unwrap_or_default();
+        if response_text.trim().is_empty() {
+            return Err(CompactError::EmptyResponse);
+        }
+
+        match parse_summary_response(&response_text) {
+            Ok(p) => {
+                parsed = Some(p);
                 break;
-            }
-            Ok(_) => {
-                // Other events (Usage, Thinking, ToolUse) — ignore for
-                // compaction. NO_TOOLS_PREAMBLE should prevent
-                // ToolUse; if one slips through we drop it.
             }
             Err(e) => {
-                emitted_error = Some(e);
-                break;
+                last_err = e.into();
+                continue;
             }
         }
     }
 
-    if let Some(err) = emitted_error {
-        return Err(CompactError::Provider(err));
-    }
-
-    let response_text = collected.lock().map(|b| b.clone()).unwrap_or_default();
-    if response_text.trim().is_empty() {
-        return Err(CompactError::EmptyResponse);
-    }
-
-    let ParsedSummary { analysis, summary } = parse_summary_response(&response_text)?;
+    let Some(ParsedSummary { analysis, summary }) = parsed else {
+        return Err(last_err);
+    };
 
     let boundary_message = Message::System {
         header: Header::new(),
@@ -306,22 +345,41 @@ mod tests {
 
     #[derive(Debug)]
     struct ScriptedProvider {
-        events: StdMutex<Vec<Event>>,
+        /// One event script per expected `stream` call, popped front-first.
+        /// A drained queue yields an empty stream (→ `EmptyResponse`).
+        scripts: StdMutex<std::collections::VecDeque<Vec<Event>>>,
+        /// Every request handed to `stream`, for request-shape assertions.
+        requests: StdMutex<Vec<StreamRequest>>,
     }
 
     impl ScriptedProvider {
-        fn new(events: Vec<Event>) -> Self {
+        fn scripted(scripts: Vec<Vec<Event>>) -> Self {
             Self {
-                events: StdMutex::new(events),
+                scripts: StdMutex::new(scripts.into()),
+                requests: StdMutex::new(Vec::new()),
             }
         }
         fn from_text(text: &str) -> Self {
-            Self::new(vec![
-                Event::TextDelta { delta: text.into() },
-                Event::Result {
-                    data: Default::default(),
-                },
-            ])
+            Self::from_texts(&[text])
+        }
+        /// One text response per expected call.
+        fn from_texts(texts: &[&str]) -> Self {
+            Self::scripted(
+                texts
+                    .iter()
+                    .map(|t| {
+                        vec![
+                            Event::TextDelta { delta: (*t).into() },
+                            Event::Result {
+                                data: Default::default(),
+                            },
+                        ]
+                    })
+                    .collect(),
+            )
+        }
+        fn calls(&self) -> usize {
+            self.requests.lock().unwrap().len()
         }
     }
 
@@ -335,13 +393,14 @@ mod tests {
         }
         async fn stream(
             &self,
-            _req: StreamRequest,
+            req: StreamRequest,
             _abort: AbortController,
         ) -> Result<Box<dyn EventStream>, AgentError> {
+            self.requests.lock().unwrap().push(req);
             let events: Vec<Event> = self
-                .events
+                .scripts
                 .lock()
-                .map(|mut g| std::mem::take(&mut *g))
+                .map(|mut q| q.pop_front().unwrap_or_default())
                 .unwrap();
             Ok(Box::new(stream::iter(events.into_iter().map(Ok))))
         }
@@ -381,6 +440,85 @@ The session was about X. Y happened.
             Message::System { text, .. } => assert_eq!(text, COMPACT_BOUNDARY_TEXT),
             _ => panic!("expected System boundary"),
         }
+    }
+
+    /// The DSML tool-call markup DeepSeek emitted as literal text when asked
+    /// to summarize (regression sample from a real corrupted session).
+    fn dsml_garbage() -> &'static str {
+        "<｜｜DSML｜｜tool_calls>\n<｜｜DSML｜｜invoke name=\"Bash\">\
+         \n</｜｜DSML｜｜invoke>\n</｜｜DSML｜｜tool_calls>"
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn summarize_request_ends_with_nudge_user_turn() {
+        let provider = ScriptedProvider::from_text(happy_response());
+        let messages = vec![user("hi"), assistant("hello")];
+        compact_conversation(
+            &messages,
+            &provider,
+            "any-model",
+            None,
+            PartialCompactDirection::Full,
+            AbortController::new(),
+        )
+        .await
+        .unwrap();
+        let requests = provider.requests.lock().unwrap();
+        let last = requests[0].messages.last().expect("request has messages");
+        match last {
+            Message::User { content, .. } => {
+                assert!(matches!(
+                    &content[0],
+                    ContentBlock::Text { text } if text == SUMMARIZE_NOW_NUDGE
+                ));
+            }
+            other => panic!("expected closing nudge User turn, got {other:?}"),
+        }
+        // The nudge is request-only: it must not count as a replaced message.
+        assert_eq!(requests[0].messages.len(), messages.len() + 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn compact_retries_once_past_tool_markup_response() {
+        // First response is raw DSML garbage, second is well-formed: the
+        // retry rescues the compaction instead of splicing garbage.
+        let provider = ScriptedProvider::from_texts(&[dsml_garbage(), happy_response()]);
+        let messages = vec![user("hi"), assistant("hello")];
+        let result = compact_conversation(
+            &messages,
+            &provider,
+            "any-model",
+            None,
+            PartialCompactDirection::Full,
+            AbortController::new(),
+        )
+        .await
+        .unwrap();
+        assert!(result.summary.starts_with("The session was about X"));
+        assert_eq!(provider.calls(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn compact_gives_up_after_two_tool_markup_responses() {
+        // Both attempts return garbage: compaction must FAIL (transcript
+        // untouched) rather than store tool markup as the summary.
+        let provider = ScriptedProvider::from_texts(&[dsml_garbage(), dsml_garbage()]);
+        let messages = vec![user("hi"), assistant("hello")];
+        let err = compact_conversation(
+            &messages,
+            &provider,
+            "any-model",
+            None,
+            PartialCompactDirection::Full,
+            AbortController::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            CompactError::Parse(ParseSummaryError::RawToolMarkup)
+        ));
+        assert_eq!(provider.calls(), 2);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
