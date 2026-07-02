@@ -372,7 +372,9 @@ mod tests {
     fn apply_to_store_no_op_leaves_store_untouched() {
         use crate::message::MessageStore;
         let mut store = MessageStore::new();
-        store.push(user_text("only text, nothing to clear")).unwrap();
+        store
+            .push(user_text("only text, nothing to clear"))
+            .unwrap();
         let result =
             apply_microcompact_to_store(&mut store, &MicrocompactConfig::default()).unwrap();
         assert_eq!(result.cleared_count, 0);
