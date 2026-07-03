@@ -60,6 +60,7 @@ impl AnthropicProvider {
                 supports_images: true,
                 max_context_tokens: 200_000,
                 needs_placeholder_text_before_tool_use: false,
+                tool_result_images: true,
             },
         }
     }
@@ -1064,6 +1065,12 @@ mod tests {
         assert!(caps.supports_thinking);
         assert!(caps.supports_images);
         assert_eq!(caps.max_context_tokens, 200_000);
+    }
+
+    #[test]
+    fn anthropic_supports_tool_result_images() {
+        let p = AnthropicProvider::new("test-key");
+        assert!(p.capabilities().tool_result_images);
     }
 
     #[test]

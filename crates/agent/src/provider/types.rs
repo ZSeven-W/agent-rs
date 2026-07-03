@@ -54,6 +54,10 @@ pub struct ProviderCapabilities {
     /// response. The QueryEngine inserts a zero-width-space placeholder
     /// when this is set.
     pub needs_placeholder_text_before_tool_use: bool,
+    /// Whether this provider's tool_result rendering preserves image
+    /// blocks (rather than flattening ToolResultContent::Blocks to
+    /// plain text). Gates rich tool-result emission in the query loop.
+    pub tool_result_images: bool,
 }
 
 impl Default for ProviderCapabilities {
@@ -71,6 +75,7 @@ impl Default for ProviderCapabilities {
             supports_images: false,
             max_context_tokens: 128_000,
             needs_placeholder_text_before_tool_use: false,
+            tool_result_images: false,
         }
     }
 }
@@ -292,6 +297,7 @@ mod tests {
                 supports_images: false,
                 max_context_tokens: 200_000,
                 needs_placeholder_text_before_tool_use: false,
+                tool_result_images: false,
             }
         }
 
@@ -315,6 +321,11 @@ mod tests {
         assert!(!c.supports_images);
         assert!(!c.needs_placeholder_text_before_tool_use);
         assert_eq!(c.max_context_tokens, 128_000);
+    }
+
+    #[test]
+    fn tool_result_images_defaults_false() {
+        assert!(!ProviderCapabilities::default().tool_result_images);
     }
 
     #[test]
