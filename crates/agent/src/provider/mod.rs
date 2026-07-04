@@ -36,3 +36,16 @@ pub use types::{
     Provider, ProviderCapabilities, StreamRequest, ThinkingConfig, ToolChoice, ToolDefinition,
     ToolDefinitionError,
 };
+
+/// Shared HTTP client for streaming providers: bounded connect + idle-read
+/// timeouts so a black-holed endpoint can't hang a turn forever, while
+/// leaving the TOTAL request unbounded (SSE streams legitimately run for
+/// minutes). Falls back to a default client if the builder ever fails.
+#[cfg(any(feature = "anthropic", feature = "openai"))]
+pub(crate) fn default_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .read_timeout(std::time::Duration::from_secs(120))
+        .build()
+        .unwrap_or_default()
+}

@@ -178,7 +178,7 @@ impl Tool for TaskTool {
         // local since `ToolUseContext` doesn't carry an extension
         // map. Single-threaded per-call execution is the norm for
         // the tool dispatch path, so this is fine.
-        let depth = depth_state::current();
+        let depth = ctx.task_depth;
         if depth >= self.max_depth {
             return Err(AgentError::other(format!(
                 "Task: max recursion depth {} reached (current depth {depth})",
@@ -213,12 +213,16 @@ impl Tool for TaskTool {
             builder = builder.hooks(h);
         }
 
+        // Explicit depth chain: the child loop stamps depth+1 into every
+        // ToolUseContext it hands its tools, so a grandchild Task call sees
+        // the real nesting level. (The previous thread-local guard did not
+        // survive the child loop's tokio::spawn / work-stealing.)
+        builder = builder.task_depth(depth + 1);
         let child = builder.build();
         // Forward the parent's abort to the child so cancelling the
         // outer loop also short-circuits the child.
         let abort = ctx.abort.clone();
 
-        let _depth_guard = depth_state::Increment::new();
         let mut stream = child.run(parsed.prompt.clone(), abort).await?;
 
         let observer = cfg.observer.clone();
@@ -227,8 +231,15 @@ impl Tool for TaskTool {
             .map(|o| o.on_start(&parsed.agent_type, parsed.description.as_deref(), depth));
 
         let mut output = String::new();
-        let mut usage_input = 0u32;
-        let mut usage_output = 0u32;
+        // Usage frames are cumulative WITHIN one provider turn and reset on
+        // the next; the child loop runs many turns (one per tool round-trip).
+        // Track the running per-turn peak and fold it into the totals when a
+        // counter regresses (= a new turn began) — a plain max would report
+        // only the largest single turn, undercounting multi-turn children.
+        let mut total_input = 0u32;
+        let mut total_output = 0u32;
+        let mut turn_input = 0u32;
+        let mut turn_output = 0u32;
         let mut stop_reason: Option<String> = None;
         let mut error: Option<AgentError> = None;
         while let Some(event) = stream.next().await {
@@ -242,12 +253,14 @@ impl Tool for TaskTool {
                     output_tokens,
                     ..
                 }) => {
-                    // Usage is cumulative ("for-the-turn-so-far") and may be
-                    // emitted multiple times. The child runs a single turn, so
-                    // the peak frame is the turn total — take the max, not the
-                    // sum (summing cumulative frames multiply-counts).
-                    usage_input = usage_input.max(input_tokens);
-                    usage_output = usage_output.max(output_tokens);
+                    if input_tokens < turn_input || output_tokens < turn_output {
+                        total_input = total_input.saturating_add(turn_input);
+                        total_output = total_output.saturating_add(turn_output);
+                        turn_input = 0;
+                        turn_output = 0;
+                    }
+                    turn_input = turn_input.max(input_tokens);
+                    turn_output = turn_output.max(output_tokens);
                 }
                 Ok(Event::Result {
                     data:
@@ -276,6 +289,9 @@ impl Tool for TaskTool {
         if let Some(e) = error {
             return Err(e);
         }
+        // Fold the final turn's peak into the totals.
+        let usage_input = total_input.saturating_add(turn_input);
+        let usage_output = total_output.saturating_add(turn_output);
         Ok(json!({
             "output": output,
             "agent_type": parsed.agent_type,
@@ -284,39 +300,6 @@ impl Tool for TaskTool {
             "usage_output_tokens": usage_output,
             "stop_reason": stop_reason,
         }))
-    }
-}
-
-mod depth_state {
-    //! Thread-local recursion depth for `Task`. The dispatch path
-    //! runs each tool call on a single tokio task, so a thread-
-    //! local works as long as we increment / decrement around the
-    //! await point without yielding to a different task.
-
-    use std::cell::Cell;
-
-    thread_local! {
-        static DEPTH: Cell<usize> = const { Cell::new(0) };
-    }
-
-    pub fn current() -> usize {
-        DEPTH.with(|d| d.get())
-    }
-
-    /// RAII guard. Increments on construction, decrements on drop.
-    pub struct Increment;
-
-    impl Increment {
-        pub fn new() -> Self {
-            DEPTH.with(|d| d.set(d.get().saturating_add(1)));
-            Self
-        }
-    }
-
-    impl Drop for Increment {
-        fn drop(&mut self) {
-            DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
-        }
     }
 }
 
@@ -342,6 +325,7 @@ mod tests {
             )),
             permissions: Arc::new(PermissionManager::new()),
             hooks: Arc::new(HookRunner::new()),
+            task_depth: 0,
         }
     }
 
@@ -476,18 +460,82 @@ mod tests {
     #[tokio::test]
     async fn task_max_depth_caps_recursion() {
         let tool = TaskTool::new(factory("x")).with_max_depth(2);
-        // Synthesize the depth state to simulate already being 2
-        // levels in.
-        let _g1 = depth_state::Increment::new();
-        let _g2 = depth_state::Increment::new();
+        // Depth now rides on the context (explicitly threaded parent→child),
+        // not a thread-local — simulate already being 2 levels in.
+        let mut deep = ctx();
+        deep.task_depth = 2;
         let err = tool
             .call(
-                &ctx(),
+                &deep,
                 json!({"prompt": "go deeper", "agent_type": "researcher"}),
             )
             .await
             .expect_err("depth exceeded");
         assert!(err.to_string().contains("max recursion"));
+    }
+
+    /// Provider that emits `frames` of (input,output) Usage across ONE
+    /// stream. A decreasing frame simulates a turn boundary (usage resets
+    /// per provider turn), so this exercises the cross-turn accumulation
+    /// without a real multi-round-trip loop.
+    #[derive(Debug)]
+    struct MultiUsageProvider {
+        frames: Vec<(u32, u32)>,
+    }
+
+    #[async_trait]
+    impl Provider for MultiUsageProvider {
+        fn id(&self) -> &str {
+            "multi-usage"
+        }
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+        async fn stream(
+            &self,
+            _req: StreamRequest,
+            _abort: AbortController,
+        ) -> Result<Box<dyn EventStream>, AgentError> {
+            let mut events: Vec<Result<AgentEvent, AgentError>> = Vec::new();
+            for (i, o) in &self.frames {
+                events.push(Ok(AgentEvent::Usage {
+                    input_tokens: *i,
+                    output_tokens: *o,
+                    cache_read: 0,
+                    cache_create: 0,
+                }));
+            }
+            events.push(Ok(AgentEvent::Result {
+                data: ResultData {
+                    stop_reason: Some("end_turn".into()),
+                    ..Default::default()
+                },
+            }));
+            Ok(Box::new(stream::iter(events)))
+        }
+    }
+
+    #[tokio::test]
+    async fn task_sums_usage_peaks_across_turns() {
+        // Two turns' worth of cumulative usage: turn A peaks at (10,5),
+        // then a drop to (3,2) marks turn B starting. Total must be the
+        // SUM of the per-turn peaks (13,7), not a global max (10,5).
+        let factory = Arc::new(StubFactory {
+            provider: Arc::new(MultiUsageProvider {
+                frames: vec![(4, 2), (10, 5), (3, 1), (8, 4)],
+            }),
+            observer: None,
+        });
+        let out = TaskTool::new(factory)
+            .call(
+                &ctx(),
+                json!({"prompt": "work", "agent_type": "researcher"}),
+            )
+            .await
+            .unwrap();
+        // Peaks: turn A = 10/5, turn B = 8/4 → 18 input, 9 output.
+        assert_eq!(out["usage_input_tokens"], 18);
+        assert_eq!(out["usage_output_tokens"], 9);
     }
 
     #[derive(Debug, Default)]

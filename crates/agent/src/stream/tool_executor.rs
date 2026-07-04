@@ -76,7 +76,11 @@ async fn forward(
     let stream = futures::stream::iter(tool_uses).map(move |req| {
         let registry = registry.clone();
         let ctx = ctx.clone();
-        async move {
+        let panic_id = req.id.clone();
+        // Each tool runs on its OWN spawned task: previously all buffered
+        // futures were polled cooperatively on this one task, so a
+        // CPU-bound or blocking-sync tool starved every concurrent peer.
+        let handle = tokio::spawn(async move {
             let RequestedToolUse { id, name, input } = req;
             match registry.get(&name) {
                 Some(tool) => match tool.call(&ctx, input).await {
@@ -99,6 +103,30 @@ async fn forward(
                     }),
                 },
             }
+        });
+        async move {
+            // Kill the spawned task if this wrapper is dropped (the abort
+            // path drops the buffered stream) — preserves the old
+            // drop-cancels-tools semantics for ill-behaved tools that
+            // ignore `ctx.abort`.
+            struct KillOnDrop(Option<tokio::task::JoinHandle<Event>>);
+            impl Drop for KillOnDrop {
+                fn drop(&mut self) {
+                    if let Some(h) = self.0.take() {
+                        h.abort();
+                    }
+                }
+            }
+            let mut guard = KillOnDrop(Some(handle));
+            let joined = guard.0.as_mut().expect("handle present").await;
+            guard.0 = None; // completed — nothing left to kill
+            joined.unwrap_or_else(|join_err| Event::ToolResult {
+                id: panic_id,
+                ok: false,
+                output: serde_json::json!({
+                    "error": format!("tool task failed: {join_err}"),
+                }),
+            })
         }
     });
 

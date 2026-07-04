@@ -64,7 +64,9 @@ pub struct CompactionResult {
     /// caller decides whether to delete + tombstone them, or simply
     /// surface the summary alongside.
     pub replaced_uuids: Vec<Uuid>,
-    /// Estimated token total of the messages BEFORE compaction.
+    /// Estimated token total of the REPLACED messages before
+    /// compaction (the whole transcript for `Full`, the replaced
+    /// slice for partial directions).
     pub pre_compact_tokens: u32,
     /// Estimated token total of `(boundary + summary)` AFTER.
     pub post_compact_tokens: u32,
@@ -72,12 +74,36 @@ pub struct CompactionResult {
     pub direction: PartialCompactDirection,
 }
 
+/// Index splitting `messages` so `[..idx]` holds roughly half of the
+/// estimated token mass, clamped to `1..=len-1` so both sides stay
+/// non-empty. Halving by message COUNT is wrong when the mass is
+/// uneven: a head full of tiny tombstones from a previous compaction
+/// (or one huge tool dump late in the transcript) makes a count-based
+/// "half" reclaim almost nothing, and occupancy-driven callers then
+/// re-fire compaction forever without the context ever shrinking.
+/// Callers must ensure `messages.len() >= 2`.
+fn token_split_index(messages: &[Message]) -> usize {
+    let total: u64 = messages.iter().map(|m| u64::from(estimate_tokens(m))).sum();
+    let half = total.div_ceil(2);
+    let mut acc = 0u64;
+    for (i, msg) in messages.iter().enumerate() {
+        acc = acc.saturating_add(u64::from(estimate_tokens(msg)));
+        if acc >= half {
+            return (i + 1).clamp(1, messages.len() - 1);
+        }
+    }
+    // Unreachable (acc == total >= half at the last message); keep the
+    // count-based midpoint as a safe fallback.
+    (messages.len() / 2).max(1)
+}
+
 /// Compact `messages` into a single summary System message.
 ///
 /// **Behavior**:
 /// 1. Validate at least 2 messages exist (single message is not
 ///    compactable).
-/// 2. Compute pre_compact tokens via [`estimate_tokens`].
+/// 2. Compute pre_compact tokens via [`estimate_tokens`] over the
+///    slice the chosen direction replaces.
 /// 3. Build a [`StreamRequest`] with `messages` as the body and
 ///    [`summarization_prompt`] as the system. `max_output_tokens` is
 ///    capped by [`MAX_OUTPUT_TOKENS_FOR_SUMMARY`].
@@ -104,31 +130,41 @@ pub async fn compact_conversation(
         return Err(CompactError::NotEnoughMessages);
     }
 
-    let pre_compact_tokens: u32 = messages
-        .iter()
-        .map(estimate_tokens)
-        .fold(0u32, u32::saturating_add);
-
     let system = summarization_prompt(direction, custom_instructions);
 
     // Slice into compact-target depending on direction. For Full, send
-    // every message. For EarliestHalf, send the first half. For
-    // LatestHalf, send the second half.
-    let mid = messages.len() / 2;
+    // every message. For the partial directions, split at the TOKEN
+    // midpoint (not the message-count midpoint): EarliestHalf compacts
+    // the prefix holding ~half the estimated mass, LatestHalf the
+    // matching suffix.
     let (target_slice, replaced_uuids): (Vec<Message>, Vec<Uuid>) = match direction {
         PartialCompactDirection::Full => (
             messages.to_vec(),
             messages.iter().map(|m| m.uuid()).collect(),
         ),
-        PartialCompactDirection::EarliestHalf => (
-            messages[..mid].to_vec(),
-            messages[..mid].iter().map(|m| m.uuid()).collect(),
-        ),
-        PartialCompactDirection::LatestHalf => (
-            messages[mid..].to_vec(),
-            messages[mid..].iter().map(|m| m.uuid()).collect(),
-        ),
+        PartialCompactDirection::EarliestHalf => {
+            let mid = token_split_index(messages);
+            (
+                messages[..mid].to_vec(),
+                messages[..mid].iter().map(|m| m.uuid()).collect(),
+            )
+        }
+        PartialCompactDirection::LatestHalf => {
+            let mid = token_split_index(messages);
+            (
+                messages[mid..].to_vec(),
+                messages[mid..].iter().map(|m| m.uuid()).collect(),
+            )
+        }
     };
+
+    // The "before" figure describes what this compaction replaces (the
+    // target slice), so partial compactions report an honest reduction
+    // instead of the whole-transcript total.
+    let pre_compact_tokens: u32 = target_slice
+        .iter()
+        .map(estimate_tokens)
+        .fold(0u32, u32::saturating_add);
 
     // The transcript usually ENDS mid-task (tool call → tool result), which
     // invites the model to continue that task instead of obeying the system
@@ -478,6 +514,109 @@ The session was about X. Y happened.
         assert_eq!(requests[0].messages.len(), messages.len() + 1);
     }
 
+    fn tombstone() -> Message {
+        Message::Tombstone {
+            header: Header::new(),
+            reason: "compacted".into(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn earliest_half_split_follows_token_mass() {
+        // A transcript whose head is tiny (tombstones from a previous round
+        // plus small chatter) and whose token mass sits in one large tool
+        // dump. Halving by MESSAGE COUNT would replace only the tiny head,
+        // reclaim ~nothing, and an occupancy-driven caller would re-fire
+        // compaction forever — the split must follow token mass instead.
+        let provider = ScriptedProvider::from_text(happy_response());
+        let mut messages: Vec<Message> = (0..4).map(|_| tombstone()).collect();
+        messages.push(user("small question"));
+        messages.push(assistant(&"x".repeat(40_000))); // the mass, index 5
+        messages.push(user("tail"));
+        messages.push(assistant("tail answer"));
+        let heavy_uuid = messages[5].uuid();
+        let result = compact_conversation(
+            &messages,
+            &provider,
+            "any-model",
+            None,
+            PartialCompactDirection::EarliestHalf,
+            AbortController::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.replaced_uuids.contains(&heavy_uuid),
+            "token-weighted split must reach the message holding the mass"
+        );
+        // The recent tail survives verbatim.
+        assert!(!result.replaced_uuids.contains(&messages[6].uuid()));
+        assert!(!result.replaced_uuids.contains(&messages[7].uuid()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn earliest_half_never_replaces_the_final_message() {
+        // All the mass in the LAST message: the token midpoint lands inside
+        // it, but the final message must survive (the runtime relies on the
+        // just-pushed user prompt being preserved), so the split clamps to
+        // everything-but-the-last.
+        let provider = ScriptedProvider::from_text(happy_response());
+        let messages = vec![user("a"), user("b"), assistant(&"y".repeat(40_000))];
+        let result = compact_conversation(
+            &messages,
+            &provider,
+            "any-model",
+            None,
+            PartialCompactDirection::EarliestHalf,
+            AbortController::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.replaced_uuids,
+            vec![messages[0].uuid(), messages[1].uuid()],
+            "split clamps to len-1: replace the two tiny heads, keep the heavy tail"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn partial_pre_compact_tokens_count_only_the_replaced_slice() {
+        // For partial directions the "before" figure must describe what the
+        // compaction actually replaced, not the whole transcript — otherwise
+        // the UI reports "~2000 → ~50 tokens" while the gauge barely moves.
+        let provider = ScriptedProvider::from_text(happy_response());
+        let messages = vec![
+            assistant(&"z".repeat(4_000)),
+            user("k"),
+            assistant(&"z".repeat(4_000)),
+        ];
+        let result = compact_conversation(
+            &messages,
+            &provider,
+            "any-model",
+            None,
+            PartialCompactDirection::EarliestHalf,
+            AbortController::new(),
+        )
+        .await
+        .unwrap();
+        let slice_tokens: u32 = result
+            .replaced_uuids
+            .iter()
+            .map(|u| {
+                messages
+                    .iter()
+                    .find(|m| m.uuid() == *u)
+                    .map(estimate_tokens)
+                    .unwrap()
+            })
+            .sum();
+        assert_eq!(
+            result.pre_compact_tokens, slice_tokens,
+            "pre_compact_tokens must cover the replaced slice only"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn compact_retries_once_past_tool_markup_response() {
         // First response is raw DSML garbage, second is well-formed: the
@@ -679,14 +818,15 @@ The session was about X. Y happened.
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn apply_compaction_earliest_half_inserts_at_boundary() {
-        // 4 messages, EarliestHalf compacts the first 2; boundary +
-        // summary insert AFTER the tombstones, BEFORE the preserved
-        // tail. Final layout: [Tomb, Tomb, System, User, m3, m4].
+        // 4 equal-mass messages, EarliestHalf compacts the first 2 (the
+        // token midpoint = the count midpoint here); boundary + summary
+        // insert AFTER the tombstones, BEFORE the preserved tail.
+        // Final layout: [Tomb, Tomb, System, User, m3, m4].
         let provider = ScriptedProvider::from_text(happy_response());
-        let m1 = user("a");
-        let m2 = assistant("b");
-        let m3 = user("c");
-        let m4 = assistant("d");
+        let m1 = user(&"a".repeat(40));
+        let m2 = assistant(&"b".repeat(40));
+        let m3 = user(&"c".repeat(40));
+        let m4 = assistant(&"d".repeat(40));
         let mut store = MessageStore::new();
         for m in [&m1, &m2, &m3, &m4] {
             store.push(m.clone()).unwrap();
@@ -720,14 +860,15 @@ The session was about X. Y happened.
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn apply_compaction_latest_half_inserts_before_replaced() {
-        // 4 messages, LatestHalf compacts the last 2; boundary +
-        // summary insert BEFORE the replaced tail, AFTER the preserved
-        // head. Final layout: [m1, m2, System, User, Tomb, Tomb].
+        // 4 equal-mass messages, LatestHalf compacts the last 2 (the
+        // token midpoint = the count midpoint here); boundary + summary
+        // insert BEFORE the replaced tail, AFTER the preserved head.
+        // Final layout: [m1, m2, System, User, Tomb, Tomb].
         let provider = ScriptedProvider::from_text(happy_response());
-        let m1 = user("a");
-        let m2 = assistant("b");
-        let m3 = user("c");
-        let m4 = assistant("d");
+        let m1 = user(&"a".repeat(40));
+        let m2 = assistant(&"b".repeat(40));
+        let m3 = user(&"c".repeat(40));
+        let m4 = assistant(&"d".repeat(40));
         let mut store = MessageStore::new();
         for m in [&m1, &m2, &m3, &m4] {
             store.push(m.clone()).unwrap();

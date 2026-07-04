@@ -147,7 +147,9 @@ impl OpenAiCompatProvider {
         let config = OpenAIConfig::new()
             .with_api_key(self.config.api_key.clone())
             .with_api_base(self.config.base_url.clone());
-        Client::with_config(config)
+        // Bounded connect/idle-read timeouts (shared policy with the
+        // Anthropic provider) so a black-holed endpoint can't hang a turn.
+        Client::with_config(config).with_http_client(super::default_http_client())
     }
 }
 
@@ -204,11 +206,19 @@ impl Provider for OpenAiCompatProvider {
             .build()
             .map_err(|e| AgentError::provider("openai-compat", format!("build request: {e}")))?;
 
-        let mut sse = client
-            .chat()
-            .create_stream(request)
-            .await
-            .map_err(|e| AgentError::provider("openai-compat", e.to_string()))?;
+        // Wrap request initiation in an abort select — without it, a hung
+        // connection blocks past the user's cancel until transport timeouts.
+        let chat = client.chat();
+        let create = chat.create_stream(request);
+        let mut sse = tokio::select! {
+            biased;
+            _ = abort.cancelled() => {
+                return Err(AgentError::Aborted("request cancelled".into()));
+            }
+            r = create => {
+                r.map_err(|e| AgentError::provider("openai-compat", error_message(&e)))?
+            }
+        };
 
         let (tx, rx) = mpsc::unbounded::<Result<Event, AgentError>>();
 
@@ -275,7 +285,7 @@ impl Provider for OpenAiCompatProvider {
                             Err(e) => {
                                 let _ = tx.unbounded_send(Err(AgentError::provider(
                                     "openai-compat",
-                                    e.to_string(),
+                                    error_message(&e),
                                 )));
                                 return;
                             }
@@ -340,6 +350,19 @@ impl ToolCallAccumulator {
         };
         Some(Event::ToolUse { id, name, input })
     }
+}
+
+/// Error text with a leading `HTTP <code>` when the underlying transport
+/// exposes a status — the driver's retry classifier works from a real
+/// code instead of substring guessing (async-openai's `ApiError` drops
+/// the HTTP status entirely; only the Reqwest variant still carries it).
+fn error_message(e: &async_openai::error::OpenAIError) -> String {
+    if let async_openai::error::OpenAIError::Reqwest(re) = e {
+        if let Some(status) = re.status() {
+            return format!("HTTP {status}: {re}");
+        }
+    }
+    e.to_string()
 }
 
 fn accumulate_tool_call(

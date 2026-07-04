@@ -129,6 +129,50 @@ impl Session {
         Ok(())
     }
 
+    /// Append `messages` to an existing session file — O(new messages)
+    /// instead of the O(total) full rewrite [`save`] does. Used when a turn
+    /// only APPENDED to the store (the common case), so a long session's
+    /// per-turn I/O stops being quadratic.
+    ///
+    /// Safe-by-construction: if the file is missing, has no header, or is
+    /// shorter than `expected_existing` messages (someone else rewrote it,
+    /// or a compaction changed the prefix), this refuses to append and
+    /// returns `Ok(false)` so the caller falls back to a full [`save`].
+    /// Returns `Ok(true)` when the append happened.
+    pub async fn append(
+        path: impl AsRef<Path>,
+        messages: &[Message],
+        expected_existing: usize,
+    ) -> Result<bool, SessionError> {
+        let path = path.as_ref();
+        // Verify the file's current message count matches what the caller
+        // believes is already persisted — otherwise appending would produce
+        // a corrupt (misordered / duplicated) transcript.
+        let actual = match count_messages(path).await {
+            Ok(Some(n)) => n,
+            Ok(None) => return Ok(false), // missing / headerless → full save
+            Err(e) => return Err(e),
+        };
+        if actual != expected_existing {
+            return Ok(false);
+        }
+        if messages.is_empty() {
+            return Ok(true); // nothing to append; file already correct
+        }
+        // Append is not atomic like the tmp+rename full save, but it only
+        // ever adds trailing lines: a torn append leaves already-persisted
+        // history intact, and the next full save heals a partial tail.
+        let mut file = fs::OpenOptions::new().append(true).open(path).await?;
+        for msg in messages {
+            let line = serde_json::to_string(msg)?;
+            file.write_all(line.as_bytes()).await?;
+            file.write_all(b"\n").await?;
+        }
+        file.flush().await?;
+        file.sync_all().await?;
+        Ok(true)
+    }
+
     /// Read a session file, validate the schema header, and rebuild a
     /// `MessageStore` with all messages in original order. Unknown
     /// schema → [`SessionError::UnsupportedVersion`].
@@ -174,6 +218,39 @@ impl Session {
     }
 }
 
+/// Count the message (non-header, non-blank) lines in a session file.
+/// `Ok(None)` when the file is missing or has no valid header — the caller
+/// treats that as "can't append, do a full save". Cheap: reads line
+/// boundaries without deserializing message bodies.
+async fn count_messages(path: &Path) -> Result<Option<usize>, SessionError> {
+    let file = match fs::File::open(path).await {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let mut reader = BufReader::new(file);
+    let mut header = String::new();
+    if reader.read_line(&mut header).await? == 0 || header.trim_end().is_empty() {
+        return Ok(None);
+    }
+    // Validate it's a schema header, not a stray body line.
+    if serde_json::from_str::<SessionHeader>(header.trim_end()).is_err() {
+        return Ok(None);
+    }
+    let mut count = 0usize;
+    let mut buf = String::new();
+    loop {
+        buf.clear();
+        if reader.read_line(&mut buf).await? == 0 {
+            break;
+        }
+        if !buf.trim_end().is_empty() {
+            count += 1;
+        }
+    }
+    Ok(Some(count))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,6 +289,54 @@ mod tests {
         let mut iter = loaded.iter();
         assert_eq!(iter.next().unwrap(), &m1);
         assert_eq!(iter.next().unwrap(), &m2);
+    }
+
+    #[tokio::test]
+    async fn append_extends_an_existing_session() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let mut store = MessageStore::new();
+        let m1 = user("first");
+        store.push(m1.clone()).unwrap();
+        Session::save(&path, &store).await.unwrap();
+
+        // Append two more, claiming 1 already persisted.
+        let m2 = assistant("second");
+        let m3 = user("third");
+        let ok = Session::append(&path, &[m2.clone(), m3.clone()], 1)
+            .await
+            .unwrap();
+        assert!(ok, "append should succeed when the count matches");
+
+        let loaded = Session::load(&path).await.unwrap();
+        let msgs: Vec<_> = loaded.iter().cloned().collect();
+        assert_eq!(msgs, vec![m1, m2, m3], "append preserves order");
+    }
+
+    #[tokio::test]
+    async fn append_refuses_on_count_mismatch() {
+        // A wrong watermark (e.g. a compaction rewrote the prefix) must be
+        // refused so the caller falls back to a full rewrite — never corrupt.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let mut store = MessageStore::new();
+        store.push(user("a")).unwrap();
+        store.push(assistant("b")).unwrap();
+        Session::save(&path, &store).await.unwrap(); // 2 persisted
+
+        // Claim only 1 exists → refuse.
+        let ok = Session::append(&path, &[user("c")], 1).await.unwrap();
+        assert!(!ok, "count mismatch must refuse the append");
+        // File unchanged (still 2 messages).
+        assert_eq!(Session::load(&path).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn append_to_missing_file_is_refused() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nope.jsonl");
+        let ok = Session::append(&path, &[user("x")], 0).await.unwrap();
+        assert!(!ok, "missing file → full save, not append");
     }
 
     #[tokio::test]

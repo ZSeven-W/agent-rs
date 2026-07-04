@@ -122,6 +122,16 @@ pub struct QueryLoop {
     pub system: Option<String>,
     pub max_output_tokens: u32,
     pub max_concurrent_tools: usize,
+    /// Sub-agent nesting depth of THIS loop (0 = root). Threaded into
+    /// every [`ToolUseContext`] so the Task tool's recursion guard holds
+    /// across the child loop's `tokio::spawn`.
+    pub task_depth: usize,
+    /// Optional mid-turn steering inbox: user messages injected while a
+    /// multi-step turn runs. Drained at the top of each loop iteration and
+    /// appended to the store before the next provider round-trip. Shared
+    /// (Arc<Mutex<Receiver>>) because the loop is rebuilt per turn while the
+    /// channel persists on the host engine.
+    pub steer: Option<Arc<std::sync::Mutex<mpsc::UnboundedReceiver<Vec<ContentBlock>>>>>,
     /// Optional cap on assistant turns. Defaults to `usize::MAX` (UNBOUNDED) in
     /// [`Self::builder`] — the loop already stops naturally on a turn with no
     /// tool calls. Set a finite value only to force a runaway backstop.
@@ -230,6 +240,8 @@ pub struct QueryLoopBuilder {
     system: Option<String>,
     max_output_tokens: u32,
     max_concurrent_tools: usize,
+    task_depth: usize,
+    steer: Option<Arc<std::sync::Mutex<mpsc::UnboundedReceiver<Vec<ContentBlock>>>>>,
     max_iterations: usize,
     max_api_retries: u32,
     cwd: PathBuf,
@@ -256,6 +268,8 @@ impl QueryLoopBuilder {
             system: None,
             max_output_tokens: 4096,
             max_concurrent_tools: 8,
+            task_depth: 0,
+            steer: None,
             max_iterations: usize::MAX,
             max_api_retries: 10,
             cwd: PathBuf::from("."),
@@ -311,6 +325,22 @@ impl QueryLoopBuilder {
         self.max_output_tokens = n;
         self
     }
+    /// Sub-agent nesting depth for this loop (0 = root; Task children
+    /// pass parent depth + 1). Feeds `ToolUseContext::task_depth`.
+    pub fn task_depth(mut self, depth: usize) -> Self {
+        self.task_depth = depth;
+        self
+    }
+
+    /// Attach a mid-turn steering inbox (see [`QueryLoop::steer`]).
+    pub fn steer(
+        mut self,
+        rx: Arc<std::sync::Mutex<mpsc::UnboundedReceiver<Vec<ContentBlock>>>>,
+    ) -> Self {
+        self.steer = Some(rx);
+        self
+    }
+
     pub fn max_concurrent_tools(mut self, n: usize) -> Self {
         self.max_concurrent_tools = n;
         self
@@ -390,6 +420,8 @@ impl QueryLoopBuilder {
             system: self.system,
             max_output_tokens: self.max_output_tokens,
             max_concurrent_tools: self.max_concurrent_tools,
+            task_depth: self.task_depth,
+            steer: self.steer,
             max_iterations: self.max_iterations,
             max_api_retries: self.max_api_retries,
             cwd: self.cwd,
@@ -424,6 +456,10 @@ async fn drive(
         metadata: Default::default(),
     };
     let compact_state = qloop.compact_state.clone();
+    // The tool set is immutable for the loop's lifetime — serialize the
+    // definitions once, not on every model round-trip (each `definitions()`
+    // call rebuilds and re-sorts every tool's JSON schema).
+    let tool_defs = qloop.tools.definitions();
 
     loop {
         if abort.is_aborted() {
@@ -434,6 +470,12 @@ async fn drive(
         }
 
         if iter >= qloop.max_iterations {
+            // Surface the partial run as a distinguishable Result first —
+            // hosts can tell the runaway backstop from a generic failure
+            // and show what the run accomplished before the cap.
+            let mut data = final_result.clone();
+            data.stop_reason = Some("max_iterations".into());
+            let _ = tx.unbounded_send(Ok(Event::Result { data }));
             let _ = tx.unbounded_send(Err(AgentError::other(format!(
                 "QueryLoop hit max_iterations ({})",
                 qloop.max_iterations
@@ -443,6 +485,30 @@ async fn drive(
         iter += 1;
         if let Ok(mut s) = compact_state.lock() {
             s.next_turn();
+        }
+
+        // ----- Mid-turn steering -----
+        // Drain any user messages injected while this multi-step turn was in
+        // flight and append them (as User turns) BEFORE the request snapshot,
+        // so the model sees the new instruction on the very next round-trip.
+        // The store ends with the prior user prompt / tool_results here, so a
+        // fresh User message is coherent (providers coalesce adjacent
+        // same-role turns). Announced as a Notice so the UI can show it.
+        if let Some(steer) = &qloop.steer {
+            if let Ok(mut rx) = steer.lock() {
+                while let Ok(blocks) = rx.try_recv() {
+                    let msg = Message::User {
+                        header: child_header(&qloop.store),
+                        content: blocks,
+                    };
+                    if push(&qloop.store, msg).is_ok() {
+                        let _ = tx.unbounded_send(Ok(Event::Notice {
+                            code: "agent.steer".into(),
+                            message: "injected a mid-turn user message".into(),
+                        }));
+                    }
+                }
+            }
         }
 
         // ----- Reactive auto-compaction (Q-δ) -----
@@ -479,9 +545,8 @@ async fn drive(
         if let Some(s) = &qloop.system {
             req = req.with_system(s.clone());
         }
-        let tool_defs = qloop.tools.definitions();
         if !tool_defs.is_empty() {
-            req = req.with_tools(tool_defs);
+            req = req.with_tools(tool_defs.clone());
         }
 
         // Open the provider stream, retrying transient API failures (rate
@@ -503,7 +568,7 @@ async fn drive(
                             return;
                         }
                         attempt += 1;
-                        let delay = retry_backoff(attempt);
+                        let delay = retry_delay(attempt, &e);
                         let _ = tx.unbounded_send(Ok(Event::Notice {
                             code: "api_retry".into(),
                             message: format!(
@@ -663,6 +728,7 @@ async fn drive(
                 file_cache: qloop.file_cache.clone(),
                 permissions: qloop.permissions.clone(),
                 hooks: qloop.hooks.clone(),
+                task_depth: qloop.task_depth,
             };
             let mut exec_stream = ToolExecutor::dispatch(
                 surviving.clone(),
@@ -954,6 +1020,39 @@ fn retry_backoff(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+/// Actual delay before retry `attempt`. Server guidance wins: providers embed
+/// the `Retry-After` header as a `retry-after=<secs>` token in the error text
+/// (the response object doesn't survive the error path), honored up to 120s.
+/// Otherwise [`retry_backoff`] with EQUAL JITTER — uniform in
+/// `[base/2, base]` — so a fleet of agents retrying the same outage doesn't
+/// stampede the recovering endpoint in lockstep.
+fn retry_delay(attempt: u32, error: &AgentError) -> std::time::Duration {
+    if let AgentError::Provider { message, .. } = error {
+        if let Some(secs) = parse_retry_after(message) {
+            return std::time::Duration::from_secs(secs.min(120));
+        }
+    }
+    let base_ms = retry_backoff(attempt).as_millis() as u64;
+    let half = base_ms / 2;
+    // Cheap jitter without a rand dependency: subsecond clock noise.
+    let noise = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()))
+        .unwrap_or(0);
+    std::time::Duration::from_millis(half + noise % (half + 1))
+}
+
+/// Parse the numeric `retry-after=<secs>` token a provider embedded in an
+/// error message. HTTP-date forms are ignored (backoff covers those).
+fn parse_retry_after(message: &str) -> Option<u64> {
+    let idx = message.find("retry-after=")?;
+    let digits: String = message[idx + "retry-after=".len()..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
+}
+
 fn push(store: &Arc<Mutex<MessageStore>>, msg: Message) -> Result<(), AgentError> {
     let mut s = store
         .lock()
@@ -962,10 +1061,7 @@ fn push(store: &Arc<Mutex<MessageStore>>, msg: Message) -> Result<(), AgentError
 }
 
 fn child_header(store: &Arc<Mutex<MessageStore>>) -> Header {
-    let parent = store
-        .lock()
-        .ok()
-        .and_then(|s| s.iter().last().map(|m| m.uuid()));
+    let parent = store.lock().ok().and_then(|s| s.last().map(|m| m.uuid()));
     match parent {
         Some(p) => Header::child_of(p),
         None => Header::new(),
@@ -1078,25 +1174,18 @@ async fn maybe_auto_compact(
             .map_err(|_| AgentError::other("compact state lock poisoned"))?;
         s.evaluate(current_tokens, qloop.model_max_tokens)
     };
-    if !decision.should_compact {
-        return Ok(());
-    }
-    // Defense in depth: evaluate() should already have masked these,
-    // but guard against future refactors changing the surface.
-    if matches!(
-        decision.reason,
-        AutoCompactReason::CircuitBreakerOpen { .. } | AutoCompactReason::NoProgress
-    ) {
-        return Ok(());
-    }
 
     // ----- Ladder step ①: microcompact (no LLM call) -----
-    // Clearing old tool-result payloads is free. When it alone drops the
-    // total back under the threshold, skip LLM compaction this turn.
-    // Deliberately NOT recorded as success/failure: the circuit breaker
-    // tracks LLM compaction attempts only.
+    // Clearing old tool-result payloads is free, so it runs from the
+    // WARNING threshold up — well before LLM summarization is needed —
+    // instead of waiting for the auto-compact threshold. When it alone
+    // keeps the total under the auto threshold, LLM compaction is skipped
+    // this turn. Deliberately NOT recorded as success/failure: the
+    // circuit breaker tracks LLM compaction attempts only.
     let mut snapshot = snapshot;
-    if qloop.microcompact_enabled {
+    if qloop.microcompact_enabled
+        && current_tokens >= crate::compact::warning_threshold(qloop.model_max_tokens)
+    {
         let threshold = crate::compact::auto_compact_threshold(qloop.model_max_tokens);
         let (mc, new_total, new_snapshot) = {
             let mut store = qloop
@@ -1124,6 +1213,18 @@ async fn maybe_auto_compact(
                 return Ok(());
             }
         }
+    }
+
+    if !decision.should_compact {
+        return Ok(());
+    }
+    // Defense in depth: evaluate() should already have masked these,
+    // but guard against future refactors changing the surface.
+    if matches!(
+        decision.reason,
+        AutoCompactReason::CircuitBreakerOpen { .. } | AutoCompactReason::NoProgress
+    ) {
+        return Ok(());
     }
 
     // Run the compaction. `EarliestHalf` keeps the recent half — vital
@@ -1287,6 +1388,35 @@ mod tests {
         assert!(s(2) > s(1) && s(3) > s(2)); // each longer than the last…
         assert_eq!(s(7), 60); // …until the 60s cap
         assert_eq!(s(10), 60);
+    }
+
+    #[test]
+    fn retry_delay_honors_server_retry_after() {
+        // A provider that embedded Retry-After overrides the backoff curve.
+        let e = AgentError::provider("anthropic", "HTTP 429 retry-after=7: slow down");
+        assert_eq!(retry_delay(1, &e).as_secs(), 7);
+        // Clamped to 120s so a hostile header can't park the loop forever.
+        let e = AgentError::provider("anthropic", "HTTP 503 retry-after=9999: x");
+        assert_eq!(retry_delay(1, &e).as_secs(), 120);
+    }
+
+    #[test]
+    fn retry_delay_jitters_within_equal_jitter_band() {
+        // No server hint → equal jitter in [base/2, base] for the attempt.
+        let e = AgentError::provider("x", "HTTP 500: boom");
+        let base = retry_backoff(4).as_millis() as u64; // 8000ms
+        for _ in 0..50 {
+            let d = retry_delay(4, &e).as_millis() as u64;
+            assert!(d >= base / 2 && d <= base, "delay {d} out of band");
+        }
+    }
+
+    #[test]
+    fn parse_retry_after_extracts_seconds() {
+        assert_eq!(parse_retry_after("HTTP 429 retry-after=12: x"), Some(12));
+        assert_eq!(parse_retry_after("HTTP 500: no header"), None);
+        // HTTP-date form is ignored (non-numeric) — backoff covers it.
+        assert_eq!(parse_retry_after("retry-after=Wed, 21 Oct"), None);
     }
 
     #[derive(Debug)]
@@ -1819,6 +1949,57 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn steer_injects_a_user_message_before_the_next_round_trip() {
+        // A message sent into the steer inbox is drained at the top of the
+        // loop and appended as a User turn before the request snapshot, so
+        // the model sees it. Sending it before run() means iteration 1 picks
+        // it up deterministically.
+        let provider = Arc::new(MockProvider::with_turns(vec![vec![
+            Event::TextDelta { delta: "ok".into() },
+            Event::Result {
+                data: ResultData {
+                    stop_reason: Some("end_turn".into()),
+                    ..Default::default()
+                },
+            },
+        ]]));
+        let store = preload_store(vec![]);
+        let (tx_steer, rx_steer) = mpsc::unbounded::<Vec<ContentBlock>>();
+        tx_steer
+            .unbounded_send(vec![ContentBlock::Text {
+                text: "actually, also do X".into(),
+            }])
+            .unwrap();
+        let qloop = QueryLoop::builder(provider, "mock")
+            .permissions(Arc::new(
+                PermissionManager::new().with_mode(PermissionMode::Bypass),
+            ))
+            .store(store.clone())
+            .steer(Arc::new(std::sync::Mutex::new(rx_steer)))
+            .build();
+
+        let mut stream = qloop.run("hi", AbortController::new()).await.unwrap();
+        let mut saw_steer_notice = false;
+        while let Some(item) = stream.next().await {
+            if let Ok(Event::Notice { code, .. }) = &item {
+                if code == "agent.steer" {
+                    saw_steer_notice = true;
+                }
+            }
+        }
+        assert!(saw_steer_notice, "a steer notice should be emitted");
+        // The injected message is in the store as a User turn.
+        let snap: Vec<_> = store.lock().unwrap().iter().cloned().collect();
+        let injected = snap.iter().any(|m| match m {
+            Message::User { content, .. } => content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("also do X"))),
+            _ => false,
+        });
+        assert!(injected, "steered message must land in the store");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn auto_compact_fires_on_threshold_hit_and_rewrites_store() {
         // Provider scripts: turn 0 = compaction summary (consumed by
         // compact_with_hooks), turn 1 = the regular assistant streaming
@@ -1842,12 +2023,13 @@ mod tests {
                 },
             ],
         ]));
-        // Preload 4 messages so EarliestHalf compacts 2 (mid = 4/2)
-        // and preserves the trailing 2 verbatim. After run() pushes
-        // the user prompt, snapshot length is 5, mid = 2, replaced = 2.
+        // Preload 4 messages whose token mass sits in the FIRST two, so
+        // EarliestHalf (token-midpoint split) compacts exactly those and
+        // preserves the small trailing 2 verbatim. After run() pushes
+        // the user prompt, snapshot length is 5, replaced = 2.
         let store = preload_store(vec![
-            user_text("u1"),
-            assistant_text("a1"),
+            user_text(&"u1 ".repeat(200)),
+            assistant_text(&"a1 ".repeat(200)),
             user_text("u2"),
             assistant_text("a2"),
         ]);

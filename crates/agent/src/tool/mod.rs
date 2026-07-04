@@ -36,6 +36,11 @@ pub struct ToolUseContext {
     pub permissions: Arc<PermissionManager>,
     /// Typed hook registry (Phase 3 stub today; real impl in 3.x).
     pub hooks: Arc<HookRunner>,
+    /// Sub-agent nesting depth of the loop dispatching this tool call:
+    /// 0 for the root agent, +1 per Task-spawned child. Explicitly
+    /// threaded (a thread-local would not survive the child loop's
+    /// `tokio::spawn` / work-stealing) so recursion guards actually hold.
+    pub task_depth: usize,
 }
 
 impl ToolUseContext {
@@ -52,6 +57,7 @@ impl ToolUseContext {
             )),
             permissions: Arc::new(PermissionManager::new()),
             hooks: Arc::new(HookRunner::new()),
+            task_depth: 0,
         }
     }
 }

@@ -54,6 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )),
         permissions: Arc::new(PermissionManager::new()),
         hooks: Arc::new(HookRunner::new()),
+        task_depth: 0,
     };
 
     let result = tool

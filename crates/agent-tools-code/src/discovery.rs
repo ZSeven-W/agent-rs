@@ -332,6 +332,7 @@ mod tests {
             )),
             permissions: Arc::new(agent::permission::PermissionManager::new()),
             hooks: Arc::new(agent::hook::HookRunner::new()),
+            task_depth: 0,
         }
     }
 

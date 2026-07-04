@@ -93,6 +93,12 @@ impl MessageStore {
         self.messages.iter()
     }
 
+    /// The most recently pushed message, O(1) — prefer over
+    /// `iter().last()`, which walks the whole slice.
+    pub fn last(&self) -> Option<&Message> {
+        self.messages.last()
+    }
+
     pub fn len(&self) -> usize {
         self.messages.len()
     }

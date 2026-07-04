@@ -603,6 +603,7 @@ mod tests {
             )),
             permissions: Arc::new(PermissionManager::new()),
             hooks: Arc::new(HookRunner::new()),
+            task_depth: 0,
         }
     }
 

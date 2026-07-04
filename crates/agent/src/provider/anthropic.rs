@@ -45,7 +45,7 @@ impl AnthropicProvider {
     /// Construct with the given API key. Uses the default `api.anthropic.com`
     /// base URL.
     pub fn new(api_key: impl Into<String>) -> Self {
-        Self::with_client(api_key, reqwest::Client::new())
+        Self::with_client(api_key, super::default_http_client())
     }
 
     pub fn with_client(api_key: impl Into<String>, client: reqwest::Client) -> Self {
@@ -146,21 +146,33 @@ impl Provider for AnthropicProvider {
             );
         }
 
-        let response = self
-            .client
-            .post(&url)
-            .headers(headers)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AgentError::provider("anthropic", e.to_string()))?;
+        // Wrap request initiation in an abort select: without this, a hung
+        // TLS handshake or stalled first byte blocks past the user's cancel
+        // until the (connect/read) timeouts fire — abort only became
+        // observable once SSE bytes flowed.
+        let send = self.client.post(&url).headers(headers).json(&body).send();
+        let response = tokio::select! {
+            biased;
+            _ = abort.cancelled() => {
+                return Err(AgentError::Aborted("request cancelled".into()));
+            }
+            r = send => r.map_err(|e| AgentError::provider("anthropic", e.to_string()))?,
+        };
 
         let status = response.status();
         if !status.is_success() {
+            // Keep the server's retry guidance in the (string) error so the
+            // retry loop can honor it — the response object dies here.
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| format!(" retry-after={s}"))
+                .unwrap_or_default();
             let body = response.text().await.unwrap_or_default();
             return Err(AgentError::provider(
                 "anthropic",
-                format!("HTTP {status}: {body}"),
+                format!("HTTP {status}{retry_after}: {body}"),
             ));
         }
 
@@ -326,8 +338,11 @@ fn render_messages(messages: &[Message], cache: bool) -> Vec<serde_json::Value> 
         .iter()
         .enumerate()
         .map(|(i, (role, content))| {
-            // Mark only the final user message's final block with cache_control.
-            let mark_cache = cache && i + 1 == len && *role == "user";
+            // Mark the FINAL message's final block with cache_control —
+            // regardless of role: a compacted/odd history can end on an
+            // assistant turn, and skipping the breakpoint there would pay
+            // full input price on the whole message portion that turn.
+            let mark_cache = cache && i + 1 == len;
             serde_json::json!({"role": role, "content": render_content(content, mark_cache)})
         })
         .collect()
@@ -575,6 +590,7 @@ async fn parse_sse_into_events<S>(
     let mut model: Option<String> = None;
     let mut stop_reason: Option<String> = None;
     let mut total_usage = AccumulatedUsage::default();
+    let mut saw_usage = false;
 
     loop {
         let item = tokio::select! {
@@ -617,6 +633,7 @@ async fn parse_sse_into_events<S>(
                 model = message.model.or(model);
                 if let Some(u) = message.usage {
                     total_usage.merge(&u);
+                    saw_usage = true;
                 }
             }
             SseEvent::ContentBlockStart {
@@ -712,7 +729,15 @@ async fn parse_sse_into_events<S>(
                     stop_reason = Some(reason);
                 }
                 if let Some(u) = usage {
+                    // Accumulate only; ONE consolidated Usage goes out at
+                    // message_stop. Emitting every cumulative frame made
+                    // consumers that sum Usage events overcount.
                     total_usage.merge(&u);
+                    saw_usage = true;
+                }
+            }
+            SseEvent::MessageStop => {
+                if saw_usage {
                     let _ = tx.unbounded_send(Ok(Event::Usage {
                         input_tokens: total_usage.input_tokens,
                         output_tokens: total_usage.output_tokens,
@@ -720,8 +745,6 @@ async fn parse_sse_into_events<S>(
                         cache_create: total_usage.cache_create,
                     }));
                 }
-            }
-            SseEvent::MessageStop => {
                 let _ = tx.unbounded_send(Ok(Event::Result {
                     data: ResultData {
                         stop_reason: stop_reason.clone(),
