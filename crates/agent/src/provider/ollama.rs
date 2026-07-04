@@ -80,6 +80,7 @@ impl OllamaProvider {
                 // (128k) or qwen2.5:72b (32k).
                 max_context_tokens: 8_192,
                 needs_placeholder_text_before_tool_use: false,
+                tool_result_images: false,
             },
         }
     }

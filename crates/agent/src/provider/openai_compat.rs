@@ -139,6 +139,7 @@ impl OpenAiCompatProvider {
                 supports_images,
                 max_context_tokens: 128_000,
                 needs_placeholder_text_before_tool_use: false,
+                tool_result_images: false,
             },
         }
     }
