@@ -129,6 +129,9 @@ fn compress_git_status(stdout: &str) -> Compressed {
         {
             staged += 1;
             files.push(t.to_string());
+        } else if in_untracked && (t.starts_with("nothing ") || t.starts_with("no changes")) {
+            in_untracked = false;
+            continue;
         } else if in_untracked && !t.is_empty() && !t.starts_with('(') {
             untracked += 1;
             files.push(format!("? {t}"));

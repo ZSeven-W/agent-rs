@@ -189,11 +189,19 @@ const MODEL_TAIL_BYTES: usize = 3 * 1024;
 #[derive(Debug)]
 pub struct BashTool {
     policy: Arc<WorkspacePolicy>,
+    compress_output: bool,
 }
 
 impl BashTool {
     pub fn new(policy: Arc<WorkspacePolicy>) -> Self {
-        Self { policy }
+        Self::with_compress_output(policy, true)
+    }
+
+    pub fn with_compress_output(policy: Arc<WorkspacePolicy>, compress_output: bool) -> Self {
+        Self {
+            policy,
+            compress_output,
+        }
     }
 }
 
@@ -257,6 +265,21 @@ pub(crate) fn cap_for_model(s: &str) -> (String, bool) {
         &s[tail_start..],
     );
     (out, true)
+}
+
+pub(crate) fn model_stdout(command: &str, raw: &str, compress: bool) -> (String, bool) {
+    if compress {
+        if let Some(compressed) = crate::compress_command(command, raw) {
+            let body = if compressed.note.is_empty() {
+                compressed.text
+            } else {
+                format!("{}\n{}", compressed.text, compressed.note)
+            };
+            let (capped, _) = cap_for_model(&body);
+            return (capped, true);
+        }
+    }
+    cap_for_model(raw)
 }
 
 #[async_trait]
@@ -405,7 +428,8 @@ impl Tool for BashTool {
 
         let stdout_str = format_capture(stdout_bytes, stdout_truncated);
         let stderr_str = format_capture(stderr_bytes, stderr_truncated);
-        let (stdout_str, stdout_capped) = cap_for_model(&stdout_str);
+        let (stdout_str, stdout_capped) =
+            model_stdout(&parsed.command, &stdout_str, self.compress_output);
         let (stderr_str, stderr_capped) = cap_for_model(&stderr_str);
         let stdout_truncated = stdout_truncated || stdout_capped;
         let stderr_truncated = stderr_truncated || stderr_capped;
@@ -796,6 +820,30 @@ mod tests {
         assert!(stdout.contains("output truncated"));
         assert!(stdout.contains("FileRead"));
         assert!(stdout.len() < 20_000);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_compresses_recognized_command_stdout() {
+        let dir = TempDir::new().unwrap();
+        std::process::Command::new("git")
+            .arg("init")
+            .current_dir(dir.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
+
+        let tool = BashTool::new(policy_for(dir.path()));
+        let out = tool
+            .call(&ctx(), json!({"command": "git status"}))
+            .await
+            .unwrap();
+        let stdout = out["stdout"].as_str().unwrap();
+        assert!(stdout.contains("git status:"), "{stdout}");
+        assert!(stdout.contains("compressed git status"), "{stdout}");
+        assert!(stdout.contains("1 untracked"), "{stdout}");
     }
 
     #[cfg(unix)]

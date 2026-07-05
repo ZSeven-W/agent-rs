@@ -339,11 +339,19 @@ fn random_id() -> String {
 #[derive(Debug)]
 pub struct BashOutputTool {
     registry: BashSessionRegistry,
+    compress_output: bool,
 }
 
 impl BashOutputTool {
     pub fn new(registry: BashSessionRegistry) -> Self {
-        Self { registry }
+        Self::with_compress_output(registry, true)
+    }
+
+    pub fn with_compress_output(registry: BashSessionRegistry, compress_output: bool) -> Self {
+        Self {
+            registry,
+            compress_output,
+        }
     }
 }
 
@@ -454,7 +462,8 @@ impl Tool for BashOutputTool {
 
         let stdout_raw = String::from_utf8_lossy(&stdout_bytes).into_owned();
         let stderr_raw = String::from_utf8_lossy(&stderr_bytes).into_owned();
-        let (stdout_str, stdout_capped) = crate::shell::cap_for_model(&stdout_raw);
+        let (stdout_str, stdout_capped) =
+            crate::shell::model_stdout(&command, &stdout_raw, self.compress_output);
         let (stderr_str, stderr_capped) = crate::shell::cap_for_model(&stderr_raw);
         stdout_trunc |= stdout_capped;
         stderr_trunc |= stderr_capped;
@@ -702,6 +711,48 @@ mod tests {
         assert!(stdout.contains("output truncated"));
         assert!(stdout.contains("FileRead"));
         assert!(stdout.len() < 20_000);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn output_compresses_recognized_command_stdout() {
+        let dir = TempDir::new().unwrap();
+        std::process::Command::new("git")
+            .arg("init")
+            .current_dir(dir.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
+
+        let registry = BashSessionRegistry::new();
+        let run = BashRunTool::new(policy_for(dir.path()), registry.clone());
+        let out = BashOutputTool::new(registry);
+        let started = run
+            .call(&ctx(), json!({"command": "git status"}))
+            .await
+            .unwrap();
+        let shell_id = started["shell_id"].as_str().unwrap().to_string();
+
+        let mut polled = out
+            .call(&ctx(), json!({"shell_id": &shell_id, "wait_ms": 1000}))
+            .await
+            .unwrap();
+        for _ in 0..20 {
+            if polled["running"] == false {
+                break;
+            }
+            polled = out
+                .call(&ctx(), json!({"shell_id": &shell_id, "wait_ms": 1000}))
+                .await
+                .unwrap();
+        }
+
+        let stdout = polled["stdout"].as_str().unwrap();
+        assert!(stdout.contains("git status:"), "{stdout}");
+        assert!(stdout.contains("compressed git status"), "{stdout}");
+        assert!(stdout.contains("1 untracked"), "{stdout}");
     }
 
     #[tokio::test]
