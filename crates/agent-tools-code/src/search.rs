@@ -24,7 +24,7 @@ use agent::error::AgentError;
 use agent::tool::{SafetyClass, Tool, ToolUseContext};
 use async_trait::async_trait;
 use grep::regex::RegexMatcherBuilder;
-use grep::searcher::{Searcher, SearcherBuilder, Sink, SinkMatch};
+use grep::searcher::{Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
 use ignore::WalkBuilder;
 use serde::Deserialize;
 use serde_json::json;
@@ -264,6 +264,9 @@ struct GrepInput {
     /// Max matches to return. Default 1000.
     #[serde(default)]
     max_matches: Option<usize>,
+    /// Lines of context around each match (like `rg -C`). Default 0.
+    #[serde(default)]
+    context: Option<usize>,
 }
 
 /// `grep-searcher` sink that collects `(path, line_no, match_text)` rows into
@@ -293,8 +296,26 @@ impl Sink for CollectSink<'_> {
                 "path": self.path.display().to_string(),
                 "line_no": first.map(|n| n + offset as u64),
                 "match_text": text,
+                "kind": "match",
             }));
         }
+        Ok(true)
+    }
+
+    fn context(&mut self, _s: &Searcher, c: &SinkContext<'_>) -> Result<bool, std::io::Error> {
+        if self.matches.len() >= self.max_matches {
+            *self.truncated = true;
+            return Ok(false);
+        }
+        let text = String::from_utf8_lossy(c.bytes());
+        let text = text.strip_suffix('\n').unwrap_or(&text);
+        let text = text.strip_suffix('\r').unwrap_or(text);
+        self.matches.push(json!({
+            "path": self.path.display().to_string(),
+            "line_no": c.line_number(),
+            "match_text": text,
+            "kind": "context",
+        }));
         Ok(true)
     }
 }
@@ -320,7 +341,8 @@ impl Tool for GrepTool {
                 "include": {"type": "string", "description": "Substring filter on file path (NOT a glob — pass '.rs' not '*.rs')."},
                 "ignore_case": {"type": "boolean", "default": false},
                 "respect_gitignore": {"type": "boolean", "default": true},
-                "max_matches": {"type": "integer", "minimum": 1}
+                "max_matches": {"type": "integer", "minimum": 1},
+                "context": {"type": "integer", "minimum": 0, "description": "Lines of context around each match (like rg -C). Default 0."}
             },
             "required": ["pattern"]
         })
@@ -353,6 +375,7 @@ impl Tool for GrepTool {
         let policy = self.policy.clone();
         let include_filter = parsed.include.clone();
         let respect_gi = parsed.respect_gitignore;
+        let ctx_lines = parsed.context.unwrap_or(0);
 
         // Walk + read on a blocking pool so the async runtime stays
         // free. `ignore::WalkBuilder` is sync; tokio::task::spawn_blocking
@@ -435,7 +458,11 @@ impl Tool for GrepTool {
                 if std::str::from_utf8(&bytes).is_err() {
                     continue;
                 }
-                let mut searcher = SearcherBuilder::new().line_number(true).build();
+                let mut searcher = SearcherBuilder::new()
+                    .line_number(true)
+                    .before_context(ctx_lines)
+                    .after_context(ctx_lines)
+                    .build();
                 let mut sink = CollectSink {
                     path,
                     matches: &mut matches,
@@ -775,6 +802,28 @@ mod tests {
         assert!(matches
             .iter()
             .all(|m| m["path"].as_str().unwrap().ends_with(".rs")));
+    }
+
+    #[tokio::test]
+    async fn grep_context_returns_surrounding_lines() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\nHIT\nfour\nfive\n").unwrap();
+        let tool = GrepTool::new(policy_for(dir.path()));
+        let out = tool
+            .call(
+                &ctx(),
+                json!({"pattern": "HIT", "path": dir.path(), "context": 1}),
+            )
+            .await
+            .unwrap();
+        let rows = out["matches"].as_array().unwrap();
+        let texts: Vec<&str> = rows
+            .iter()
+            .map(|r| r["match_text"].as_str().unwrap())
+            .collect();
+        assert_eq!(texts, vec!["two", "HIT", "four"]);
+        assert_eq!(rows[1]["kind"], "match");
+        assert_eq!(rows[0]["kind"], "context");
     }
 
     #[tokio::test]
