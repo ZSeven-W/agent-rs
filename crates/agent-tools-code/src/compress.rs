@@ -164,10 +164,40 @@ fn compress_git_status(stdout: &str) -> Compressed {
     }
 }
 
-fn compress_ls(s: &str) -> Compressed {
+const LS_SUMMARIZE_AT: usize = 40;
+
+fn compress_ls(stdout: &str) -> Compressed {
+    let entries: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+    if entries.len() <= LS_SUMMARIZE_AT {
+        return Compressed {
+            text: stdout.trim_end().to_string(),
+            note: String::new(),
+        };
+    }
+
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for entry in &entries {
+        let name = entry.rsplit('/').next().unwrap_or(entry);
+        let ext = name
+            .rsplit_once('.')
+            .map(|(_, ext)| format!(".{ext}"))
+            .unwrap_or_else(|| "<no-ext>".to_string());
+        *counts.entry(ext).or_default() += 1;
+    }
+    let hist: Vec<String> = counts
+        .iter()
+        .map(|(ext, count)| format!("{ext} x{count}"))
+        .collect();
+    let (sample, elided) = truncate_middle(&entries, 15, 0);
+    let text = format!(
+        "ls: {} entries - {}\nsample:\n{}",
+        entries.len(),
+        hist.join(", "),
+        sample
+    );
     Compressed {
-        text: s.to_string(),
-        note: String::new(),
+        text,
+        note: format!("compressed ls ({elided} entries elided; re-run raw `ls` for the full list)"),
     }
 }
 
@@ -234,5 +264,29 @@ Untracked files:\n\
         assert!(out.text.contains("2 modified"), "{}", out.text);
         assert!(out.text.contains("3 untracked"), "{}", out.text);
         assert!(out.note.contains("git status"));
+    }
+
+    #[test]
+    fn ls_groups_by_extension_when_large() {
+        let mut raw = String::new();
+        for i in 0..80 {
+            raw.push_str(&format!("file{i}.rs\n"));
+        }
+        for i in 0..10 {
+            raw.push_str(&format!("mod{i}.toml\n"));
+        }
+        let out = compress_command("ls", &raw).unwrap();
+        assert!(out.text.contains("90 entries"), "{}", out.text);
+        assert!(out.text.contains(".rs x80"), "{}", out.text);
+        assert!(out.text.contains(".toml x10"), "{}", out.text);
+        assert!(out.text.len() < raw.len());
+    }
+
+    #[test]
+    fn ls_small_listing_is_passed_through() {
+        let raw = "a.rs\nb.rs\n";
+        let out = compress_command("ls", raw).unwrap();
+        assert!(out.text.contains("a.rs"));
+        assert!(out.text.contains("b.rs"));
     }
 }
