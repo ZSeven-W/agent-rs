@@ -40,7 +40,7 @@ use crate::compact::{
 use crate::error::AgentError;
 use crate::file_cache::FileStateCache;
 use crate::hook::{HookEvent, HookOutcome, HookRunner};
-use crate::message::{ContentBlock, Header, Message, MessageStore, ToolResultContent};
+use crate::message::{ContentBlock, Header, ImageSource, Message, MessageStore, ToolResultContent};
 use crate::permission::{PermissionDecision, PermissionManager};
 use crate::provider::{Provider, StreamRequest, ToolDefinition};
 use crate::stream::{Event, EventStream, RequestedToolUse, ResultData, ToolExecutor};
@@ -859,13 +859,14 @@ async fn drive(
         }
 
         // ----- YieldingResult phase: feed tool_results back to provider -----
+        let allow_images = qloop.provider.capabilities().tool_result_images;
         let next_user = Message::User {
             header: child_header(&qloop.store),
             content: tool_results
                 .into_iter()
                 .map(|(id, ok, output)| ContentBlock::ToolResult {
                     tool_use_id: id,
-                    content: ToolResultContent::Text(output.to_string()),
+                    content: tool_result_content(ok, &output, allow_images),
                     is_error: !ok,
                 })
                 .collect(),
@@ -1165,6 +1166,63 @@ fn child_header(store: &Arc<Mutex<MessageStore>>) -> Header {
     match parent {
         Some(p) => Header::child_of(p),
         None => Header::new(),
+    }
+}
+
+/// Reserved key a tool can put in its JSON output to return rich content
+/// blocks. Exact shape required: a top-level object holding only this key
+/// (an array of Text/Image blocks) plus an optional "text" fallback string.
+/// Anything else falls back to plain text.
+pub(crate) const CONTENT_BLOCKS_KEY: &str = "__agent_content_blocks__";
+
+/// Convert one tool output into ToolResultContent, honoring the content-blocks
+/// sentinel when the provider can preserve image tool results. Error results
+/// never parse the sentinel.
+fn tool_result_content(
+    ok: bool,
+    output: &serde_json::Value,
+    allow_images: bool,
+) -> ToolResultContent {
+    let plain = || ToolResultContent::Text(output.to_string());
+    if !ok {
+        return plain();
+    }
+    let Some(obj) = output.as_object() else {
+        return plain();
+    };
+    if !obj.contains_key(CONTENT_BLOCKS_KEY) {
+        return plain();
+    }
+    if !obj.keys().all(|k| k == CONTENT_BLOCKS_KEY || k == "text") {
+        return plain();
+    }
+    let text_fallback = || {
+        ToolResultContent::Text(
+            obj.get("text")
+                .and_then(|t| t.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        )
+    };
+    let Ok(blocks) = serde_json::from_value::<Vec<ContentBlock>>(obj[CONTENT_BLOCKS_KEY].clone())
+    else {
+        return text_fallback();
+    };
+    let valid = !blocks.is_empty()
+        && blocks.iter().all(|b| match b {
+            ContentBlock::Text { .. } => true,
+            ContentBlock::Image {
+                source: ImageSource::Base64 { data, .. },
+            } => data.len() / 4 * 3 <= crate::attachments::MAX_INLINE_IMAGE_BYTES,
+            _ => false,
+        });
+    if !valid {
+        return text_fallback();
+    }
+    if allow_images {
+        ToolResultContent::Blocks(blocks)
+    } else {
+        text_fallback()
     }
 }
 
@@ -1573,6 +1631,95 @@ mod tests {
         assert_eq!(parse_retry_after("retry-after=Wed, 21 Oct"), None);
     }
 
+    fn img_sentinel(extra_key: bool) -> serde_json::Value {
+        let mut o = serde_json::json!({
+            CONTENT_BLOCKS_KEY: [
+                { "type": "image",
+                  "source": { "type": "base64", "media_type": "image/png",
+                              "data": "iVBORw0KGgoAAAANSUhEUg==" } }
+            ],
+            "text": "screenshot saved: /tmp/s.png",
+        });
+        if extra_key {
+            o.as_object_mut().unwrap().insert("rogue".into(), 1.into());
+        }
+        o
+    }
+
+    #[test]
+    fn sentinel_converts_to_blocks_when_images_allowed() {
+        let c = tool_result_content(true, &img_sentinel(false), true);
+        match c {
+            ToolResultContent::Blocks(b) => {
+                assert_eq!(b.len(), 1);
+                assert!(matches!(b[0], ContentBlock::Image { .. }));
+            }
+            other => panic!("expected Blocks, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sentinel_strips_to_text_fallback_when_images_disallowed() {
+        let c = tool_result_content(true, &img_sentinel(false), false);
+        assert_eq!(
+            c,
+            ToolResultContent::Text("screenshot saved: /tmp/s.png".into())
+        );
+    }
+
+    #[test]
+    fn sentinel_requires_exact_shape() {
+        let v = img_sentinel(true);
+        assert_eq!(
+            tool_result_content(true, &v, true),
+            ToolResultContent::Text(v.to_string())
+        );
+    }
+
+    #[test]
+    fn sentinel_ignored_on_error_results() {
+        let v = img_sentinel(false);
+        assert_eq!(
+            tool_result_content(false, &v, true),
+            ToolResultContent::Text(v.to_string())
+        );
+    }
+
+    #[test]
+    fn sentinel_rejects_non_text_image_blocks() {
+        let v = serde_json::json!({
+            CONTENT_BLOCKS_KEY: [ { "type": "thinking", "thinking": "x", "signature": null } ],
+            "text": "fallback",
+        });
+        assert_eq!(
+            tool_result_content(true, &v, true),
+            ToolResultContent::Text("fallback".into())
+        );
+    }
+
+    #[test]
+    fn sentinel_rejects_oversized_inline_image() {
+        let big = "A".repeat((crate::attachments::MAX_INLINE_IMAGE_BYTES / 3 + 2) * 4);
+        let v = serde_json::json!({
+            CONTENT_BLOCKS_KEY: [ { "type": "image",
+                "source": { "type": "base64", "media_type": "image/png", "data": big } } ],
+            "text": "fallback",
+        });
+        assert_eq!(
+            tool_result_content(true, &v, true),
+            ToolResultContent::Text("fallback".into())
+        );
+    }
+
+    #[test]
+    fn plain_output_unchanged() {
+        let v = serde_json::json!({"ok": true});
+        assert_eq!(
+            tool_result_content(true, &v, true),
+            ToolResultContent::Text(v.to_string())
+        );
+    }
+
     #[derive(Debug)]
     struct EchoTool {
         name: String,
@@ -1669,6 +1816,89 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct ScriptedCapturingProvider {
+        captured: Arc<std::sync::Mutex<Vec<StreamRequest>>>,
+        capabilities: ProviderCapabilities,
+        turns: std::sync::Mutex<Vec<Vec<Event>>>,
+    }
+
+    #[async_trait]
+    impl Provider for ScriptedCapturingProvider {
+        fn id(&self) -> &str {
+            "scripted-capturing"
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            self.capabilities
+        }
+
+        async fn stream(
+            &self,
+            req: StreamRequest,
+            _abort: AbortController,
+        ) -> Result<Box<dyn EventStream>, AgentError> {
+            self.captured.lock().unwrap().push(req);
+            let turn = {
+                let mut turns = self.turns.lock().unwrap();
+                if turns.is_empty() {
+                    Vec::new()
+                } else {
+                    turns.remove(0)
+                }
+            };
+            Ok(Box::new(futures::stream::iter(turn.into_iter().map(Ok))))
+        }
+    }
+
+    fn sentinel_capture_provider(
+        captured: Arc<std::sync::Mutex<Vec<StreamRequest>>>,
+        tool_result_images: bool,
+    ) -> Arc<ScriptedCapturingProvider> {
+        Arc::new(ScriptedCapturingProvider {
+            captured,
+            capabilities: ProviderCapabilities {
+                supports_tool_use: true,
+                tool_result_images,
+                ..Default::default()
+            },
+            turns: std::sync::Mutex::new(vec![
+                vec![
+                    Event::ToolUse {
+                        id: "tu_screenshot".into(),
+                        name: "sentinel".into(),
+                        input: img_sentinel(false),
+                    },
+                    Event::Result {
+                        data: ResultData {
+                            stop_reason: Some("tool_use".into()),
+                            ..Default::default()
+                        },
+                    },
+                ],
+                vec![Event::Result {
+                    data: ResultData {
+                        stop_reason: Some("end_turn".into()),
+                        ..Default::default()
+                    },
+                }],
+            ]),
+        })
+    }
+
+    fn latest_tool_result_content(captured: &[StreamRequest]) -> &ToolResultContent {
+        let Some(StreamRequest { messages, .. }) = captured.last() else {
+            panic!("expected a captured follow-up request");
+        };
+        let Some(Message::User { content, .. }) = messages.last() else {
+            panic!("expected latest message to be user tool results");
+        };
+        let Some(ContentBlock::ToolResult { content, .. }) = content.first() else {
+            panic!("expected a tool result block");
+        };
+        content
+    }
+
     #[tokio::test]
     async fn loop_forwards_registered_tools_to_provider() {
         let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1720,6 +1950,57 @@ mod tests {
             panic!("expected user message");
         };
         assert_eq!(observed, &content);
+    }
+
+    #[tokio::test]
+    async fn tool_result_sentinel_reaches_provider_as_blocks_when_supported() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = sentinel_capture_provider(captured.clone(), true);
+        let registry = echo_registry("sentinel", Arc::new(AtomicUsize::new(0)));
+        let perms = Arc::new(PermissionManager::new().allow(RuleSource::User, "sentinel"));
+        let qloop = QueryLoop::builder(provider, "mock")
+            .tools(registry)
+            .permissions(perms)
+            .build();
+
+        let mut stream = qloop
+            .run("screenshot", AbortController::new())
+            .await
+            .unwrap();
+        while stream.next().await.is_some() {}
+
+        let captured = captured.lock().unwrap();
+        match latest_tool_result_content(&captured) {
+            ToolResultContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 1);
+                assert!(matches!(blocks[0], ContentBlock::Image { .. }));
+            }
+            other => panic!("expected Blocks, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_result_sentinel_falls_back_to_text_when_unsupported() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = sentinel_capture_provider(captured.clone(), false);
+        let registry = echo_registry("sentinel", Arc::new(AtomicUsize::new(0)));
+        let perms = Arc::new(PermissionManager::new().allow(RuleSource::User, "sentinel"));
+        let qloop = QueryLoop::builder(provider, "mock")
+            .tools(registry)
+            .permissions(perms)
+            .build();
+
+        let mut stream = qloop
+            .run("screenshot", AbortController::new())
+            .await
+            .unwrap();
+        while stream.next().await.is_some() {}
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(
+            latest_tool_result_content(&captured),
+            &ToolResultContent::Text("screenshot saved: /tmp/s.png".into())
+        );
     }
 
     #[tokio::test]
