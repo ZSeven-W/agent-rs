@@ -201,10 +201,25 @@ fn compress_ls(stdout: &str) -> Compressed {
     }
 }
 
-fn compress_cargo_test(s: &str) -> Compressed {
+fn compress_cargo_test(stdout: &str) -> Compressed {
+    let mut kept: Vec<&str> = Vec::new();
+    let mut dropped = 0usize;
+    for line in stdout.lines() {
+        let t = line.trim_start();
+        let is_pass = (t.starts_with("test ")
+            && (t.ends_with("... ok") || t.ends_with("... ignored")))
+            || (t.starts_with("running ") && t.ends_with(" tests"));
+        if is_pass {
+            dropped += 1;
+            continue;
+        }
+        kept.push(line);
+    }
     Compressed {
-        text: s.to_string(),
-        note: String::new(),
+        text: kept.join("\n"),
+        note: format!(
+            "compressed cargo test ({dropped} passing/ignored lines dropped; failures kept)"
+        ),
     }
 }
 
@@ -288,5 +303,26 @@ Untracked files:\n\
         let out = compress_command("ls", raw).unwrap();
         assert!(out.text.contains("a.rs"));
         assert!(out.text.contains("b.rs"));
+    }
+
+    #[test]
+    fn cargo_test_keeps_failures_drops_passes() {
+        let raw = "\
+running 3 tests\n\
+test foo ... ok\n\
+test bar ... ok\n\
+test baz ... FAILED\n\
+\n\
+failures:\n\
+\n\
+---- baz stdout ----\n\
+assertion failed: 1 == 2\n\
+\n\
+test result: FAILED. 2 passed; 1 failed; 0 ignored\n";
+        let out = compress_command("cargo test", raw).unwrap();
+        assert!(out.text.contains("test result: FAILED"));
+        assert!(out.text.contains("baz"));
+        assert!(out.text.contains("assertion failed"));
+        assert!(!out.text.contains("test foo ... ok"));
     }
 }
