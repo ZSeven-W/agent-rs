@@ -36,6 +36,13 @@ fn detect(command: &str) -> Option<Kind> {
     None
 }
 
+fn is_porcelain_status(status: &str) -> bool {
+    status.len() == 2
+        && status
+            .chars()
+            .all(|c| matches!(c, ' ' | 'M' | 'A' | 'D' | 'R' | 'C' | 'U' | '?' | '!'))
+}
+
 #[allow(dead_code)]
 pub(crate) fn dedup_consecutive(text: &str) -> (String, usize) {
     let mut out: Vec<String> = Vec::new();
@@ -67,7 +74,6 @@ pub(crate) fn dedup_consecutive(text: &str) -> (String, usize) {
     (out.join("\n"), removed)
 }
 
-#[allow(dead_code)]
 pub(crate) fn truncate_middle(
     lines: &[&str],
     keep_head: usize,
@@ -93,10 +99,68 @@ pub fn compress_command(command: &str, stdout: &str) -> Option<Compressed> {
     }
 }
 
-fn compress_git_status(s: &str) -> Compressed {
+fn compress_git_status(stdout: &str) -> Compressed {
+    let mut modified = 0usize;
+    let mut untracked = 0usize;
+    let mut staged = 0usize;
+    let mut files: Vec<String> = Vec::new();
+    let mut in_untracked = false;
+
+    for line in stdout.lines() {
+        let t = line.trim();
+        if t.starts_with("Untracked files:") {
+            in_untracked = true;
+            continue;
+        }
+        if t.starts_with("Changes to be committed:") {
+            in_untracked = false;
+            continue;
+        }
+        if t.starts_with("Changes not staged") {
+            in_untracked = false;
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("modified:") {
+            modified += 1;
+            files.push(format!("M {}", rest.trim()));
+        } else if t.starts_with("new file:")
+            || t.starts_with("deleted:")
+            || t.starts_with("renamed:")
+        {
+            staged += 1;
+            files.push(t.to_string());
+        } else if in_untracked && !t.is_empty() && !t.starts_with('(') {
+            untracked += 1;
+            files.push(format!("? {t}"));
+        } else if let Some((status, path)) = t.split_once(' ') {
+            if status == "??" && !path.trim().is_empty() {
+                untracked += 1;
+                files.push(format!("? {}", path.trim()));
+            } else if is_porcelain_status(status) && !path.trim().is_empty() {
+                let mut chars = status.chars();
+                let index = chars.next().unwrap_or(' ');
+                let worktree = chars.next().unwrap_or(' ');
+                if index != ' ' {
+                    staged += 1;
+                    files.push(format!("{index} {}", path.trim()));
+                }
+                if worktree != ' ' {
+                    modified += 1;
+                    files.push(format!("{worktree} {}", path.trim()));
+                }
+            }
+        }
+    }
+
+    let file_refs: Vec<&str> = files.iter().map(String::as_str).collect();
+    let (list, elided) = truncate_middle(&file_refs, 20, 0);
+    let text =
+        format!("git status: {modified} modified, {staged} staged, {untracked} untracked\n{list}");
     Compressed {
-        text: s.to_string(),
-        note: String::new(),
+        text,
+        note: format!(
+            "compressed git status ({elided} filenames elided; re-run raw `git status` for full detail)"
+        ),
     }
 }
 
@@ -154,5 +218,21 @@ mod tests {
         assert_eq!(elided, 95);
         assert!(out.starts_with("x\nx\nx\n"));
         assert!(out.trim_end().ends_with("x"));
+    }
+
+    #[test]
+    fn git_status_summarizes_counts() {
+        let raw = "On branch main\n\
+Changes not staged for commit:\n\
+\tmodified:   a.rs\n\
+\tmodified:   b.rs\n\
+Untracked files:\n\
+\tc.rs\n\
+\td.rs\n\
+\te.rs\n";
+        let out = compress_command("git status", raw).unwrap();
+        assert!(out.text.contains("2 modified"), "{}", out.text);
+        assert!(out.text.contains("3 untracked"), "{}", out.text);
+        assert!(out.note.contains("git status"));
     }
 }
