@@ -59,8 +59,7 @@
 pub mod discovery;
 pub mod policy;
 
-#[cfg(any(feature = "shell", feature = "bash-async"))]
-mod process;
+mod compress;
 
 #[cfg(feature = "fs")]
 pub mod fs;
@@ -92,6 +91,7 @@ pub mod web;
 #[cfg(feature = "web-search")]
 pub mod web_search;
 
+pub use compress::{compress_command, Compressed};
 pub use discovery::ToolSearchTool;
 pub use policy::{DirectFsSink, FsSink, PolicyError, WorkspacePolicy};
 
