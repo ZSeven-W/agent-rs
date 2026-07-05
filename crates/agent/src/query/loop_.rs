@@ -32,16 +32,17 @@ use futures::StreamExt;
 
 use crate::abort::AbortController;
 use crate::compact::{
-    apply_compaction_to_store, apply_microcompact_to_store, compact_with_hooks, estimate_tokens,
-    promote_to_store, AutoCompactReason, AutoCompactState, CompactError, CompactTrigger,
-    CompactWithHooksRequest, MicrocompactConfig, PartialCompactDirection, SessionMemoryStore,
+    apply_compaction_to_store, apply_microcompact_to_store, compact_with_hooks,
+    estimate_text_tokens, estimate_tokens, promote_to_store, AutoCompactReason, AutoCompactState,
+    CompactError, CompactTrigger, CompactWithHooksRequest, MicrocompactConfig,
+    PartialCompactDirection, SessionMemoryStore,
 };
 use crate::error::AgentError;
 use crate::file_cache::FileStateCache;
 use crate::hook::{HookEvent, HookOutcome, HookRunner};
 use crate::message::{ContentBlock, Header, Message, MessageStore, ToolResultContent};
 use crate::permission::{PermissionDecision, PermissionManager};
-use crate::provider::{Provider, StreamRequest};
+use crate::provider::{Provider, StreamRequest, ToolDefinition};
 use crate::stream::{Event, EventStream, RequestedToolUse, ResultData, ToolExecutor};
 use crate::tool::{ToolRegistry, ToolUseContext};
 
@@ -461,6 +462,16 @@ async fn drive(
     // call rebuilds and re-sorts every tool's JSON schema).
     let tool_defs = qloop.tools.definitions();
 
+    // Fixed per-request overhead the message-store token estimate omits: the
+    // system prompt and the serialized tool schemas. Constant across iterations.
+    let overhead_tokens = estimate_prompt_overhead(qloop.system.as_deref(), &tool_defs);
+    // Delta calibration for the output clamp: `(actual_prompt, msg_estimate)`
+    // from the previous request. The store only grows within a turn, so
+    // `actual_prev + (msg_estimate_now - msg_estimate_prev)` predicts the
+    // current prompt accurately — it folds in the true system/tool overhead the
+    // provider counted rather than trusting our estimate of it.
+    let mut prompt_calibration: Option<(u32, u32)> = None;
+
     loop {
         if abort.is_aborted() {
             let _ = tx.unbounded_send(Err(AgentError::Aborted(
@@ -536,8 +547,31 @@ async fn drive(
                 return;
             }
         };
+        // Clamp `max_tokens` so `prompt + max_tokens` cannot overflow the
+        // context window. `max_output_tokens` is a static per-model ceiling
+        // (e.g. 384k on a ~1M window); without this, a turn whose tool results
+        // grow the store past `window - max_output` mid-flight hard-400s on the
+        // very next request. Estimate the current prompt (calibrated against the
+        // last request's provider-reported count) and cap the completion to the
+        // room left. Recomputed every iteration because the store grows within a
+        // turn.
+        let msg_estimate: u32 = messages
+            .iter()
+            .map(estimate_tokens)
+            .fold(0, u32::saturating_add);
+        let prompt_estimate = match prompt_calibration {
+            Some((actual_prev, est_prev)) => {
+                actual_prev.saturating_add(msg_estimate.saturating_sub(est_prev))
+            }
+            None => msg_estimate.saturating_add(overhead_tokens),
+        };
+        let effective_output = clamp_output_to_window(
+            qloop.max_output_tokens,
+            prompt_estimate,
+            qloop.model_max_tokens,
+        );
         let mut req = StreamRequest::new(qloop.model.clone(), messages)
-            .with_max_output_tokens(qloop.max_output_tokens);
+            .with_max_output_tokens(effective_output);
         if let Some(t) = qloop.temperature {
             req = req.with_temperature(t);
         }
@@ -592,10 +626,16 @@ async fn drive(
             pending_tool_uses,
             stop_reason,
             model,
+            prompt_tokens,
         } = match consume_turn(upstream, &tx, &abort).await {
             Ok(s) => s,
             Err(()) => return, // already-emitted error or aborted
         };
+        // Calibrate the next iteration's clamp on the provider's actual prompt
+        // count paired with our estimate of the messages we just sent.
+        if let Some(actual) = prompt_tokens {
+            prompt_calibration = Some((actual, msg_estimate));
+        }
         if let Some(m) = model {
             final_result.model = Some(m);
         }
@@ -865,12 +905,54 @@ async fn drive(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Reserve held back from the context window when clamping a request's
+/// completion size, covering residual estimator bias. Scales with the window —
+/// a 1M window's prompt estimate can be off by more in absolute terms than a
+/// 200k one — with a floor so small windows stay safe.
+const OUTPUT_CLAMP_RESERVE_DIVISOR: u32 = 32;
+const OUTPUT_CLAMP_RESERVE_FLOOR: u32 = 8_192;
+
+/// Never request fewer than this many output tokens: providers reject
+/// `max_tokens=0`, and a handful is useless. If the prompt is so large that even
+/// this floor overflows the window the request may still 400 — but reactive
+/// auto-compaction runs first each iteration, so the store should already have
+/// been trimmed before we get here.
+const MIN_CLAMPED_OUTPUT: u32 = 512;
+
+/// Estimate the fixed per-request overhead the message-store token estimate
+/// omits: the system prompt plus the serialized tool schemas. Byte-rate (÷4)
+/// matches [`estimate_text_tokens`]'s ASCII path — good enough for a reserve.
+fn estimate_prompt_overhead(system: Option<&str>, tools: &[ToolDefinition]) -> u32 {
+    let sys = system.map(estimate_text_tokens).unwrap_or(0);
+    let tool_bytes = serde_json::to_string(tools).map(|s| s.len()).unwrap_or(0);
+    sys.saturating_add((tool_bytes as u32) / 4)
+}
+
+/// Shrink a request's completion budget so `prompt + max_tokens` fits inside the
+/// context `window`. `configured` is the static per-model output ceiling;
+/// `prompt` is the (calibrated) current occupancy. Returns the room left after a
+/// scaled reserve, never above `configured` nor below [`MIN_CLAMPED_OUTPUT`]. A
+/// degenerate window (0/1) is left alone. Over-clamping only shortens a
+/// completion (the loop continues); under-clamping hard-400s.
+fn clamp_output_to_window(configured: u32, prompt: u32, window: u32) -> u32 {
+    if window <= 1 {
+        return configured;
+    }
+    let reserve = (window / OUTPUT_CLAMP_RESERVE_DIVISOR).max(OUTPUT_CLAMP_RESERVE_FLOOR);
+    let headroom = window.saturating_sub(prompt).saturating_sub(reserve);
+    configured.min(headroom).max(MIN_CLAMPED_OUTPUT)
+}
+
 #[derive(Debug, Default)]
 struct TurnSummary {
     assistant_blocks: Vec<ContentBlock>,
     pending_tool_uses: Vec<RequestedToolUse>,
     stop_reason: Option<String>,
     model: Option<String>,
+    /// Full prompt occupancy the provider reported for this request (non-cached
+    /// input + both cache tiers), if a Usage event arrived. Feeds the next
+    /// iteration's output-clamp calibration.
+    prompt_tokens: Option<u32>,
 }
 
 async fn consume_turn(
@@ -925,8 +1007,26 @@ async fn consume_turn(
                     // emits a single final Result after the whole loop
                     // settles.
                 }
-                Event::Usage { .. }
-                | Event::Error { .. }
+                Event::Usage {
+                    input_tokens,
+                    cache_read,
+                    cache_create,
+                    ..
+                } => {
+                    // Record the provider's own prompt count (fields are Copy, so
+                    // `event` stays intact to forward). The next iteration uses it
+                    // to size `max_tokens` so `prompt + max_tokens` stays under the
+                    // context window.
+                    summary.prompt_tokens = Some(
+                        input_tokens
+                            .saturating_add(cache_read)
+                            .saturating_add(cache_create),
+                    );
+                    if tx.unbounded_send(Ok(event)).is_err() {
+                        return Err(());
+                    }
+                }
+                Event::Error { .. }
                 | Event::Notice { .. }
                 | Event::ToolResult { .. }
                 | Event::Unknown => {
@@ -1344,6 +1444,60 @@ mod tests {
     use crate::provider::ProviderCapabilities;
     use crate::testing::MockProvider;
     use crate::tool::Tool;
+
+    #[test]
+    fn clamp_output_keeps_prompt_plus_completion_within_window() {
+        // The reported failure: ~1M window, 384k output ceiling, a mid-turn
+        // history of 900_839 tokens. 900_839 + 384_000 = 1_284_839 > 1_048_565.
+        let window = 1_048_565;
+        let prompt = 900_839;
+        let out = clamp_output_to_window(384_000, prompt, window);
+        assert!(out < 384_000, "must clamp below the static ceiling");
+        assert!(
+            prompt + out < window,
+            "prompt {prompt} + completion {out} must fit window {window}"
+        );
+        // Reserve is window/32 here (32_767 > 8_192 floor).
+        assert_eq!(out, window - prompt - window / OUTPUT_CLAMP_RESERVE_DIVISOR);
+    }
+
+    #[test]
+    fn clamp_output_is_a_noop_with_headroom_and_never_zero() {
+        // Small prompt on a large window → the full configured ceiling.
+        assert_eq!(clamp_output_to_window(384_000, 40_000, 1_048_565), 384_000);
+        // Prompt fills the window → floored, never max_tokens=0.
+        assert_eq!(
+            clamp_output_to_window(16_384, 1_048_000, 1_048_565),
+            MIN_CLAMPED_OUTPUT
+        );
+        // Degenerate window is left untouched (no real model has one).
+        assert_eq!(clamp_output_to_window(16_384, 0, 1), 16_384);
+    }
+
+    #[test]
+    fn delta_calibration_predicts_grown_prompt() {
+        // Iteration 1: 100k message estimate, provider counted 130k (30k of
+        // system + tools). Iteration 2's store grew to 880k of messages.
+        let (actual_prev, est_prev) = (130_000u32, 100_000u32);
+        let msg_now = 880_000u32;
+        let predicted = actual_prev.saturating_add(msg_now.saturating_sub(est_prev));
+        // Additive overhead carries forward (not multiplied): ~910k, not 1.14M.
+        assert_eq!(predicted, 910_000);
+        let out = clamp_output_to_window(384_000, predicted, 1_048_565);
+        assert!(predicted + out < 1_048_565, "calibrated request must fit");
+    }
+
+    #[test]
+    fn overhead_estimate_counts_system_and_tools() {
+        let tools = vec![ToolDefinition::new(
+            "grep",
+            "search files",
+            serde_json::json!({"type": "object"}),
+        )];
+        let with = estimate_prompt_overhead(Some("you are a helpful agent"), &tools);
+        let without = estimate_prompt_overhead(None, &[]);
+        assert!(with > without, "system + tools must add to the estimate");
+    }
 
     #[test]
     fn retryable_classifies_http_statuses() {
