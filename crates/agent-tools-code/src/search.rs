@@ -23,8 +23,9 @@ use std::sync::Arc;
 use agent::error::AgentError;
 use agent::tool::{SafetyClass, Tool, ToolUseContext};
 use async_trait::async_trait;
+use grep::regex::RegexMatcherBuilder;
+use grep::searcher::{Searcher, SearcherBuilder, Sink, SinkMatch};
 use ignore::WalkBuilder;
-use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -265,6 +266,39 @@ struct GrepInput {
     max_matches: Option<usize>,
 }
 
+/// `grep-searcher` sink that collects `(path, line_no, match_text)` rows into
+/// the same JSON shape the tool has always returned, enforcing the global
+/// `max_matches` cap.
+struct CollectSink<'a> {
+    path: &'a std::path::Path,
+    matches: &'a mut Vec<serde_json::Value>,
+    max_matches: usize,
+    truncated: &'a mut bool,
+}
+
+impl Sink for CollectSink<'_> {
+    type Error = std::io::Error;
+
+    fn matched(&mut self, _s: &Searcher, m: &SinkMatch<'_>) -> Result<bool, std::io::Error> {
+        let first = m.line_number();
+        for (offset, line) in m.lines().enumerate() {
+            if self.matches.len() >= self.max_matches {
+                *self.truncated = true;
+                return Ok(false);
+            }
+            let text = String::from_utf8_lossy(line);
+            let text = text.strip_suffix('\n').unwrap_or(&text);
+            let text = text.strip_suffix('\r').unwrap_or(text);
+            self.matches.push(json!({
+                "path": self.path.display().to_string(),
+                "line_no": first.map(|n| n + offset as u64),
+                "match_text": text,
+            }));
+        }
+        Ok(true)
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -307,15 +341,12 @@ impl Tool for GrepTool {
             .resolve_read(root_str)
             .map_err(policy_to_agent_err)?;
 
-        // Use RegexBuilder so case-insensitivity is enforced at the
-        // engine level — a user pattern starting with `(?-i)` would
-        // otherwise cancel an inline `(?i)` prefix. The size_limit
-        // cap rejects pathologically large compiled regexes (huge
-        // alternations / deeply nested captures) before we run.
-        let regex = RegexBuilder::new(&parsed.pattern)
+        // Build through ripgrep's matcher so Grep uses the same core search
+        // engine while keeping the existing path walk and policy guards.
+        let matcher = RegexMatcherBuilder::new()
             .case_insensitive(parsed.ignore_case)
             .size_limit(REGEX_SIZE_LIMIT)
-            .build()
+            .build(&parsed.pattern)
             .map_err(|e| AgentError::other(format!("Grep invalid pattern: {e}")))?;
 
         let max_matches = parsed.max_matches.unwrap_or(MAX_RESULTS).min(MAX_RESULTS);
@@ -400,23 +431,19 @@ impl Tool for GrepTool {
                     Ok(b) if (b.len() as u64) <= policy.max_file_size_bytes => b,
                     _ => continue,
                 };
-                let text = match String::from_utf8(bytes) {
-                    Ok(t) => t,
-                    Err(_) => continue, // skip non-UTF-8 files silently
+                // Preserve the historical "skip non-UTF-8 files" behavior.
+                if std::str::from_utf8(&bytes).is_err() {
+                    continue;
+                }
+                let mut searcher = SearcherBuilder::new().line_number(true).build();
+                let mut sink = CollectSink {
+                    path,
+                    matches: &mut matches,
+                    max_matches,
+                    truncated: &mut truncated,
                 };
-                for (i, line) in text.lines().enumerate() {
-                    if regex.is_match(line) {
-                        if matches.len() >= max_matches {
-                            truncated = true;
-                            break;
-                        }
-                        matches.push(grep_match_row(
-                            path,
-                            (i as u64).saturating_add(1),
-                            line,
-                            first_match_range(&regex, line),
-                        ));
-                    }
+                if searcher.search_slice(&matcher, &bytes, &mut sink).is_err() {
+                    continue;
                 }
                 if truncated {
                     break;

@@ -79,6 +79,7 @@ assert_fs = "1"
 # agent-tools-code feature deps
 regex = "1"
 ignore = "0.4"
+grep = "0.3"
 shell-words = "1"
 
 # Real BPE tokenizer for the optional `tiktoken` feature on `agent`.

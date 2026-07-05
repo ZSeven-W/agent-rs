@@ -32,8 +32,8 @@ shell = ["dep:shell-words"]
 # spawns + polls instead of blocking. No extra deps; all tokio.
 bash-async = []
 
-# Search: Grep + Glob. Pulls regex (~5 MB) + ignore.
-search = ["dep:regex", "dep:ignore"]
+# Search: Grep + Glob. Pulls regex (~5 MB) + ignore + ripgrep engine.
+search = ["dep:regex", "dep:ignore", "dep:grep"]
 
 # Web: WebFetch (HTTP GET → text). Pulls reqwest + futures for
 # streaming the response body so we can enforce the size cap
@@ -79,6 +79,7 @@ schemars = { workspace = true }
 # Feature-gated optional deps
 regex = { workspace = true, optional = true }
 ignore = { workspace = true, optional = true }
+grep = { workspace = true, optional = true }
 shell-words = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
