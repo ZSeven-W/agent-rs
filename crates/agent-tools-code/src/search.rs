@@ -267,6 +267,9 @@ struct GrepInput {
     /// Lines of context around each match (like `rg -C`). Default 0.
     #[serde(default)]
     context: Option<usize>,
+    /// Allow a pattern to match across line boundaries. Default false.
+    #[serde(default)]
+    multiline: bool,
 }
 
 /// `grep-searcher` sink that collects `(path, line_no, match_text)` rows into
@@ -342,7 +345,8 @@ impl Tool for GrepTool {
                 "ignore_case": {"type": "boolean", "default": false},
                 "respect_gitignore": {"type": "boolean", "default": true},
                 "max_matches": {"type": "integer", "minimum": 1},
-                "context": {"type": "integer", "minimum": 0, "description": "Lines of context around each match (like rg -C). Default 0."}
+                "context": {"type": "integer", "minimum": 0, "description": "Lines of context around each match (like rg -C). Default 0."},
+                "multiline": {"type": "boolean", "default": false, "description": "Allow the pattern to match across line boundaries."}
             },
             "required": ["pattern"]
         })
@@ -367,6 +371,8 @@ impl Tool for GrepTool {
         // engine while keeping the existing path walk and policy guards.
         let matcher = RegexMatcherBuilder::new()
             .case_insensitive(parsed.ignore_case)
+            .multi_line(parsed.multiline)
+            .dot_matches_new_line(parsed.multiline)
             .size_limit(REGEX_SIZE_LIMIT)
             .build(&parsed.pattern)
             .map_err(|e| AgentError::other(format!("Grep invalid pattern: {e}")))?;
@@ -376,6 +382,7 @@ impl Tool for GrepTool {
         let include_filter = parsed.include.clone();
         let respect_gi = parsed.respect_gitignore;
         let ctx_lines = parsed.context.unwrap_or(0);
+        let multiline = parsed.multiline;
 
         // Walk + read on a blocking pool so the async runtime stays
         // free. `ignore::WalkBuilder` is sync; tokio::task::spawn_blocking
@@ -462,6 +469,7 @@ impl Tool for GrepTool {
                     .line_number(true)
                     .before_context(ctx_lines)
                     .after_context(ctx_lines)
+                    .multi_line(multiline)
                     .build();
                 let mut sink = CollectSink {
                     path,
@@ -824,6 +832,22 @@ mod tests {
         assert_eq!(texts, vec!["two", "HIT", "four"]);
         assert_eq!(rows[1]["kind"], "match");
         assert_eq!(rows[0]["kind"], "context");
+    }
+
+    #[tokio::test]
+    async fn grep_multiline_matches_across_lines() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "start\nfoo\nbar\nend\n").unwrap();
+        let tool = GrepTool::new(policy_for(dir.path()));
+        let out = tool
+            .call(
+                &ctx(),
+                json!({"pattern": "foo\\nbar", "path": dir.path(), "multiline": true}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["matches"].as_array().unwrap().len(), 2);
+        assert_eq!(out["matches"][0]["line_no"], 2);
     }
 
     #[tokio::test]
