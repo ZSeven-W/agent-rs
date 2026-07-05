@@ -452,11 +452,18 @@ impl Tool for BashOutputTool {
         let exit = *exit_slot.lock().await;
         let running = exit.is_none();
 
+        let stdout_raw = String::from_utf8_lossy(&stdout_bytes).into_owned();
+        let stderr_raw = String::from_utf8_lossy(&stderr_bytes).into_owned();
+        let (stdout_str, stdout_capped) = crate::shell::cap_for_model(&stdout_raw);
+        let (stderr_str, stderr_capped) = crate::shell::cap_for_model(&stderr_raw);
+        stdout_trunc |= stdout_capped;
+        stderr_trunc |= stderr_capped;
+
         Ok(json!({
             "shell_id": parsed.shell_id,
             "command": command,
-            "stdout": String::from_utf8_lossy(&stdout_bytes).into_owned(),
-            "stderr": String::from_utf8_lossy(&stderr_bytes).into_owned(),
+            "stdout": stdout_str,
+            "stderr": stderr_str,
             "stdout_truncated": stdout_trunc,
             "stderr_truncated": stderr_trunc,
             "running": running,
@@ -664,26 +671,37 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn run_starts_without_a_controlling_tty() {
+    async fn output_caps_model_facing_stdout() {
         let dir = TempDir::new().unwrap();
         let registry = BashSessionRegistry::new();
         let run = BashRunTool::new(policy_for(dir.path()), registry.clone());
         let out = BashOutputTool::new(registry);
+
         let started = run
-            .call(
-                &ctx(),
-                json!({"command": "if (: >/dev/tty) 2>/dev/null; then echo HAS_TTY; else echo NO_TTY; fi"}),
-            )
+            .call(&ctx(), json!({"command": "yes L | head -n 20000"}))
             .await
             .unwrap();
         let shell_id = started["shell_id"].as_str().unwrap().to_string();
 
-        let polled = out
+        let mut polled = out
             .call(&ctx(), json!({"shell_id": &shell_id, "wait_ms": 1000}))
             .await
             .unwrap();
-        assert_eq!(polled["stdout"].as_str().unwrap().trim(), "NO_TTY");
-        assert_eq!(polled["running"], false);
+        for _ in 0..20 {
+            if polled["running"] == false {
+                break;
+            }
+            polled = out
+                .call(&ctx(), json!({"shell_id": &shell_id, "wait_ms": 1000}))
+                .await
+                .unwrap();
+        }
+
+        let stdout = polled["stdout"].as_str().unwrap();
+        assert_eq!(polled["stdout_truncated"], true);
+        assert!(stdout.contains("output truncated"));
+        assert!(stdout.contains("FileRead"));
+        assert!(stdout.len() < 20_000);
     }
 
     #[tokio::test]

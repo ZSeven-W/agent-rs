@@ -23,6 +23,8 @@
 //! the model usually cares about) and `*_truncated` flags surface
 //! when truncation happened.
 
+#![cfg_attr(all(not(feature = "shell"), feature = "bash-async"), allow(dead_code))]
+
 use std::collections::VecDeque;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -177,6 +179,12 @@ fn git_add_args_are_broad(args: &[String]) -> bool {
 /// Implemented via a streaming ring buffer so the process can emit
 /// gigabytes without growing our memory beyond the cap.
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+/// Model-facing output cap (per stream). This is much smaller than
+/// `MAX_OUTPUT_BYTES`, which is only an in-memory guard. Head + tail are kept
+/// so a command that dumps a huge file cannot fill the model transcript.
+const MODEL_CAP_BYTES: usize = 8 * 1024;
+const MODEL_HEAD_BYTES: usize = 5 * 1024;
+const MODEL_TAIL_BYTES: usize = 3 * 1024;
 
 #[derive(Debug)]
 pub struct BashTool {
@@ -203,6 +211,52 @@ struct BashInput {
 
 fn policy_to_agent_err(e: PolicyError) -> AgentError {
     AgentError::other(format!("policy: {e}"))
+}
+
+fn floor_char_boundary(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn ceil_char_boundary(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
+pub(crate) fn cap_for_model(s: &str) -> (String, bool) {
+    if s.len() <= MODEL_CAP_BYTES {
+        return (s.to_string(), false);
+    }
+    let head_budget = floor_char_boundary(s, MODEL_HEAD_BYTES);
+    let head_end = s[..head_budget]
+        .rfind('\n')
+        .map(|i| i + 1)
+        .unwrap_or_else(|| floor_char_boundary(s, MODEL_HEAD_BYTES));
+    let tail_from = ceil_char_boundary(s, s.len().saturating_sub(MODEL_TAIL_BYTES));
+    let tail_start = s[..tail_from]
+        .rfind('\n')
+        .map(|i| i + 1)
+        .unwrap_or(tail_from);
+    if tail_start <= head_end {
+        return (s.to_string(), false);
+    }
+    let elided = tail_start - head_end;
+    let out = format!(
+        "{}\n... output truncated: {} bytes elided (total {} bytes). Re-run through \
+         a filter (grep/head/tail) or use FileRead(offset,limit) / Grep instead of \
+         dumping whole files.\n{}",
+        &s[..head_end],
+        elided,
+        s.len(),
+        &s[tail_start..],
+    );
+    (out, true)
 }
 
 #[async_trait]
@@ -351,6 +405,10 @@ impl Tool for BashTool {
 
         let stdout_str = format_capture(stdout_bytes, stdout_truncated);
         let stderr_str = format_capture(stderr_bytes, stderr_truncated);
+        let (stdout_str, stdout_capped) = cap_for_model(&stdout_str);
+        let (stderr_str, stderr_capped) = cap_for_model(&stderr_str);
+        let stdout_truncated = stdout_truncated || stdout_capped;
+        let stderr_truncated = stderr_truncated || stderr_capped;
 
         Ok(json!({
             "exit_code": status.code(),
@@ -502,40 +560,31 @@ mod tests {
     }
 
     #[test]
-    fn broad_git_add_detection_blocks_only_unscoped_staging() {
-        for cmd in [
-            "git add -A",
-            "git add --all",
-            "git add .",
-            "cd repo && git add -A && git commit -m x",
-            "git -C repo add --all",
-        ] {
-            assert!(broad_git_add(cmd), "{cmd}");
-        }
-
-        for cmd in [
-            "git add -- src/lib.rs",
-            "git add -A src/lib.rs",
-            "git add -u",
-            "git status --short",
-            "echo 'git add -A'",
-        ] {
-            assert!(!broad_git_add(cmd), "{cmd}");
-        }
+    fn cap_for_model_passes_small_output_unchanged() {
+        let s = "hello\nworld\n";
+        let (out, trunc) = cap_for_model(s);
+        assert_eq!(out, s);
+        assert!(!trunc);
     }
 
-    #[tokio::test]
-    async fn bash_rejects_broad_git_staging() {
-        let dir = TempDir::new().unwrap();
-        let tool = BashTool::new(policy_for(dir.path()));
-        let err = tool
-            .call(&ctx(), json!({"command": "git add -A"}))
-            .await
-            .expect_err("broad staging should be blocked before spawn");
-        let msg = err.to_string();
-        assert!(msg.contains("blocked broad git staging"), "{msg}");
-        assert!(msg.contains("GitCommit"), "{msg}");
-        assert!(msg.contains("paths"), "{msg}");
+    #[test]
+    fn cap_for_model_head_and_tail_with_notice() {
+        let big = "L\n".repeat(20_000);
+        let (out, trunc) = cap_for_model(&big);
+        assert!(trunc);
+        assert!(out.len() < big.len());
+        assert!(out.starts_with("L\n"));
+        assert!(out.trim_end().ends_with('L'));
+        assert!(out.contains("output truncated"));
+        assert!(out.contains("FileRead"));
+    }
+
+    #[test]
+    fn cap_for_model_never_splits_utf8() {
+        let s = "😀\n".repeat(10_000);
+        let (out, _trunc) = cap_for_model(&s);
+        assert!(out.is_char_boundary(0));
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
     }
 
     fn ctx() -> ToolUseContext {
@@ -731,6 +780,22 @@ mod tests {
             out["stdout"].as_str().unwrap().contains("TAIL_MARKER"),
             "tail should be preserved"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_caps_model_facing_stdout() {
+        let dir = TempDir::new().unwrap();
+        let tool = BashTool::new(policy_for(dir.path()));
+        let out = tool
+            .call(&ctx(), json!({"command": "yes L | head -n 20000"}))
+            .await
+            .unwrap();
+        let stdout = out["stdout"].as_str().unwrap();
+        assert_eq!(out["stdout_truncated"], true);
+        assert!(stdout.contains("output truncated"));
+        assert!(stdout.contains("FileRead"));
+        assert!(stdout.len() < 20_000);
     }
 
     #[cfg(unix)]

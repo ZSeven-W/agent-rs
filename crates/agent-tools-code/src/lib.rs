@@ -71,6 +71,9 @@ pub mod search;
 #[cfg(feature = "shell")]
 pub mod shell;
 
+#[cfg(all(not(feature = "shell"), feature = "bash-async"))]
+mod shell;
+
 #[cfg(feature = "bash-async")]
 pub mod bash_async;
 
@@ -134,8 +137,7 @@ use std::sync::Arc;
     feature = "web",
     feature = "todo",
     feature = "notebook",
-    feature = "task",
-    feature = "bash-async"
+    feature = "task"
 ))]
 use agent::tool::Tool;
 use agent::tool::ToolRegistry;
