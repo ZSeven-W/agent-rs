@@ -357,13 +357,13 @@ impl Tool for FileEditTool {
         let count = text.matches(&parsed.old_string).count();
         if count == 0 {
             return Err(AgentError::other(format!(
-                "FileEdit: old_string not found in '{}'",
+                "FileEdit: old_string not found in '{}'. The file likely changed or the snippet is stale; run FileRead on this file with a focused offset/limit around the intended edit, then retry with the exact current text.",
                 parsed.path
             )));
         }
         if count > 1 && !parsed.replace_all {
             return Err(AgentError::other(format!(
-                "FileEdit: old_string is ambiguous in '{}' ({count} matches). Pass replace_all=true to replace every occurrence."
+                "FileEdit: old_string is ambiguous in '{}' ({count} matches). Add more surrounding context to old_string so it matches exactly once, or pass replace_all=true only if every occurrence should change."
             , parsed.path)));
         }
         let new_text = if parsed.replace_all {
@@ -845,7 +845,29 @@ mod tests {
             )
             .await
             .expect_err("ambiguous");
-        assert!(err.to_string().contains("ambiguous"));
+        let msg = err.to_string();
+        assert!(msg.contains("ambiguous"));
+        assert!(msg.contains("replace_all=true"), "{msg}");
+        assert!(msg.contains("more surrounding context"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn file_edit_not_found_error_suggests_rereading_context() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "current text\n").unwrap();
+        let tool = FileEditTool::new(policy_for(&dir));
+        let err = tool
+            .call(
+                &ctx_for(&dir),
+                json!({"path": "a.txt", "old_string": "stale text", "new_string": "new text"}),
+            )
+            .await
+            .expect_err("not found");
+        let msg = err.to_string();
+        assert!(msg.contains("old_string not found"), "{msg}");
+        assert!(msg.contains("FileRead"), "{msg}");
+        assert!(msg.contains("offset"), "{msg}");
+        assert!(msg.contains("limit"), "{msg}");
     }
 
     #[tokio::test]

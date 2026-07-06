@@ -53,11 +53,14 @@
 //! Hosts compose these with [`agent::permission::PermissionMatcher`]
 //! rules to add path / command allowlists per their threat model.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![warn(missing_debug_implementations, rust_2018_idioms)]
 
 pub mod discovery;
 pub mod policy;
+
+#[cfg(any(feature = "shell", feature = "bash-async"))]
+mod process;
 
 #[cfg(feature = "fs")]
 pub mod fs;

@@ -21,10 +21,10 @@
 //! `BashOutput` is read-then-clear, so the model's window stays
 //! bounded even on a chatty long-running build.
 //!
-//! Process-group hygiene matches `BashTool`: on Unix the child
-//! is `setpgid(0)`'d via `Command::process_group(0)` and
-//! `KillShell` `/bin/kill -9 -<pgid>`s the whole tree. On Windows
-//! we just drop the `Child` (with `kill_on_drop(true)`).
+//! Process hygiene matches `BashTool`: on Unix the child is started
+//! in a new session, so it has no controlling TTY and its pid is also
+//! the process-group id that `KillShell` can `/bin/kill -9 -<pgid>`.
+//! On Windows we just drop the `Child` (with `kill_on_drop(true)`).
 //!
 //! Hosts that don't enable both this and the `shell` feature get
 //! the BashTool's existing one-shot semantics. The async trio is
@@ -214,8 +214,7 @@ impl Tool for BashRunTool {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
-        #[cfg(unix)]
-        cmd.process_group(0);
+        crate::process::detach_from_controlling_tty(&mut cmd);
 
         let mut child = cmd
             .spawn()
@@ -661,6 +660,30 @@ mod tests {
             .await
             .expect_err("should be gone");
         assert!(err.to_string().contains("no shell"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_starts_without_a_controlling_tty() {
+        let dir = TempDir::new().unwrap();
+        let registry = BashSessionRegistry::new();
+        let run = BashRunTool::new(policy_for(dir.path()), registry.clone());
+        let out = BashOutputTool::new(registry);
+        let started = run
+            .call(
+                &ctx(),
+                json!({"command": "if (: >/dev/tty) 2>/dev/null; then echo HAS_TTY; else echo NO_TTY; fi"}),
+            )
+            .await
+            .unwrap();
+        let shell_id = started["shell_id"].as_str().unwrap().to_string();
+
+        let polled = out
+            .call(&ctx(), json!({"shell_id": &shell_id, "wait_ms": 1000}))
+            .await
+            .unwrap();
+        assert_eq!(polled["stdout"].as_str().unwrap().trim(), "NO_TTY");
+        assert_eq!(polled["running"], false);
     }
 
     #[tokio::test]

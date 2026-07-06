@@ -108,6 +108,69 @@ fn default_timeout_for(command: &str) -> u64 {
         DEFAULT_TIMEOUT_SECS
     }
 }
+
+fn broad_git_add(command: &str) -> bool {
+    let words = match shell_words::split(command) {
+        Ok(words) => words,
+        Err(_) => command.split_whitespace().map(str::to_string).collect(),
+    };
+    for segment in words.split(|w| matches!(w.as_str(), "&&" | "||" | ";")) {
+        if git_add_is_broad(segment) {
+            return true;
+        }
+    }
+    false
+}
+
+fn git_add_is_broad(words: &[String]) -> bool {
+    let Some(mut i) = words
+        .iter()
+        .position(|w| w.eq_ignore_ascii_case("git"))
+        .map(|idx| idx + 1)
+    else {
+        return false;
+    };
+    while i < words.len() {
+        let word = words[i].as_str();
+        if word.eq_ignore_ascii_case("add") {
+            return git_add_args_are_broad(&words[i + 1..]);
+        }
+        match word {
+            "-C" | "-c" | "--git-dir" | "--work-tree" if i + 1 < words.len() => i += 2,
+            _ if word.starts_with("--git-dir=")
+                || word.starts_with("--work-tree=")
+                || word.starts_with("-c") =>
+            {
+                i += 1
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn git_add_args_are_broad(args: &[String]) -> bool {
+    let mut broad_flag = false;
+    let mut specific_path = false;
+    for arg in args {
+        let arg = arg.as_str();
+        if matches!(arg, "&&" | "||" | ";") {
+            break;
+        }
+        if matches!(arg, "-A" | "--all") {
+            broad_flag = true;
+            continue;
+        }
+        if matches!(arg, "." | "./" | ":/") {
+            return true;
+        }
+        if arg == "--" || arg.starts_with('-') {
+            continue;
+        }
+        specific_path = true;
+    }
+    broad_flag && !specific_path
+}
 /// Per-stream capture cap. Above this, output truncates; the tail
 /// (the last `MAX_OUTPUT_BYTES` bytes of the stream) is what we
 /// surface, since panic / error messages are usually at the end.
@@ -174,6 +237,11 @@ impl Tool for BashTool {
         if parsed.command.trim().is_empty() {
             return Err(AgentError::other("Bash command must be non-empty"));
         }
+        if broad_git_add(&parsed.command) {
+            return Err(AgentError::other(
+                "Bash blocked broad git staging (`git add -A`, `git add --all`, or `git add .`). Stage explicit paths with `git add -- <paths>` or use GitCommit with `paths` so unrelated files such as node_modules, dist, or IDE metadata are not included.",
+            ));
+        }
         let timeout_secs = parsed
             .timeout_secs
             .unwrap_or_else(|| default_timeout_for(&parsed.command))
@@ -210,12 +278,7 @@ impl Tool for BashTool {
             )
             .env("GCM_INTERACTIVE", "never");
 
-        // On Unix, put the child in its own process group so we can
-        // kill descendants on timeout/abort, not just the direct
-        // shell. `process_group(0)` is a safe API that calls
-        // `setpgid` after fork.
-        #[cfg(unix)]
-        cmd.process_group(0);
+        crate::process::detach_from_controlling_tty(&mut cmd);
 
         let mut child = cmd
             .spawn()
@@ -279,7 +342,7 @@ impl Tool for BashTool {
                         #[cfg(unix)]
                         kill_process_group(child_pid);
                         return Err(AgentError::other(format!(
-                            "Bash command timed out after {timeout_secs}s"
+                            "Bash command timed out after {timeout_secs}s. no shell_id was created for this foreground Bash call; BashOutput can only poll commands started with BashRun. For long-running commands, start them with BashRun and then poll that shell_id with BashOutput."
                         )));
                     }
                 }
@@ -438,6 +501,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn broad_git_add_detection_blocks_only_unscoped_staging() {
+        for cmd in [
+            "git add -A",
+            "git add --all",
+            "git add .",
+            "cd repo && git add -A && git commit -m x",
+            "git -C repo add --all",
+        ] {
+            assert!(broad_git_add(cmd), "{cmd}");
+        }
+
+        for cmd in [
+            "git add -- src/lib.rs",
+            "git add -A src/lib.rs",
+            "git add -u",
+            "git status --short",
+            "echo 'git add -A'",
+        ] {
+            assert!(!broad_git_add(cmd), "{cmd}");
+        }
+    }
+
+    #[tokio::test]
+    async fn bash_rejects_broad_git_staging() {
+        let dir = TempDir::new().unwrap();
+        let tool = BashTool::new(policy_for(dir.path()));
+        let err = tool
+            .call(&ctx(), json!({"command": "git add -A"}))
+            .await
+            .expect_err("broad staging should be blocked before spawn");
+        let msg = err.to_string();
+        assert!(msg.contains("blocked broad git staging"), "{msg}");
+        assert!(msg.contains("GitCommit"), "{msg}");
+        assert!(msg.contains("paths"), "{msg}");
+    }
+
     fn ctx() -> ToolUseContext {
         ToolUseContext {
             cwd: std::env::current_dir().unwrap(),
@@ -512,6 +612,21 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_runs_without_a_controlling_tty() {
+        let dir = TempDir::new().unwrap();
+        let tool = BashTool::new(policy_for(dir.path()));
+        let out = tool
+            .call(
+                &ctx(),
+                json!({"command": "if (: >/dev/tty) 2>/dev/null; then echo HAS_TTY; else echo NO_TTY; fi"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["stdout"].as_str().unwrap().trim(), "NO_TTY");
+    }
+
     // Same Windows/MSYS pwd issue as above — gate cfg(unix).
     #[cfg(unix)]
     #[tokio::test]
@@ -565,6 +680,9 @@ mod tests {
             .await
             .expect_err("timeout");
         assert!(err.to_string().contains("timed out"), "got {err}");
+        assert!(err.to_string().contains("no shell_id"), "got {err}");
+        assert!(err.to_string().contains("BashRun"), "got {err}");
+        assert!(err.to_string().contains("BashOutput"), "got {err}");
     }
 
     #[cfg(unix)]
