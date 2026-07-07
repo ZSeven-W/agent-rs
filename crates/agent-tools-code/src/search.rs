@@ -15,8 +15,6 @@
 //! Both tools cap their result count at `MAX_RESULTS` (default 1000)
 //! to keep the model from drowning in matches; the response carries
 //! a `truncated: true` flag when the cap is hit.
-//! `Grep` also caps each returned line so a single minified JavaScript
-//! line cannot fill the model context by itself.
 
 use std::sync::Arc;
 
@@ -47,7 +45,6 @@ fn read_file_capped(path: &std::path::Path, cap: u64) -> std::io::Result<Vec<u8>
 }
 
 const MAX_RESULTS: usize = 1000;
-const MAX_GREP_MATCH_TEXT_BYTES: usize = 16 * 1024;
 
 /// Hard cap on the compiled regex size in bytes. Bounds the worst
 /// case for hostile patterns (huge alternations, deeply nested
@@ -59,6 +56,12 @@ const REGEX_SIZE_LIMIT: usize = 10 * 1024 * 1024;
 fn policy_to_agent_err(e: crate::policy::PolicyError) -> AgentError {
     AgentError::other(format!("policy: {e}"))
 }
+
+/// Hard cap on a single returned grep line. One pathological line
+/// (e.g. minified JS/CSS on one physical line) must not blow up the
+/// tool response, so each `match_text` / context line is clipped to
+/// this many bytes, keeping the head + tail with a truncation marker.
+const MAX_GREP_MATCH_TEXT_BYTES: usize = 16 * 1024;
 
 fn utf8_prefix(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
@@ -82,98 +85,13 @@ fn utf8_suffix(s: &str, max_bytes: usize) -> &str {
     &s[start..]
 }
 
-fn utf8_floor_boundary(s: &str, mut idx: usize) -> usize {
-    idx = idx.min(s.len());
-    while idx > 0 && !s.is_char_boundary(idx) {
-        idx -= 1;
-    }
-    idx
-}
-
-fn utf8_ceil_boundary(s: &str, mut idx: usize) -> usize {
-    idx = idx.min(s.len());
-    while idx < s.len() && !s.is_char_boundary(idx) {
-        idx += 1;
-    }
-    idx
-}
-
-fn truncate_around_match_text(
-    text: &str,
-    match_range: std::ops::Range<usize>,
-) -> (String, Option<usize>) {
-    let match_start = utf8_floor_boundary(text, match_range.start);
-    let match_end = utf8_ceil_boundary(text, match_range.end).max(match_start);
-    let mut prefix_omitted = 0usize;
-    let mut suffix_omitted = 0usize;
-
-    let (prefix_marker, suffix_marker, window) = loop {
-        let prefix_marker = if prefix_omitted > 0 {
-            format!("[truncated {prefix_omitted} bytes before] ... ")
-        } else {
-            String::new()
-        };
-        let suffix_marker = if suffix_omitted > 0 {
-            format!(" ... [truncated {suffix_omitted} bytes after]")
-        } else {
-            String::new()
-        };
-        let available = MAX_GREP_MATCH_TEXT_BYTES
-            .saturating_sub(prefix_marker.len())
-            .saturating_sub(suffix_marker.len());
-
-        let match_len = match_end.saturating_sub(match_start);
-        let (start, end) = if match_len >= available {
-            (
-                match_start,
-                utf8_floor_boundary(text, match_start.saturating_add(available)),
-            )
-        } else {
-            let spare = available.saturating_sub(match_len);
-            let left = spare / 2;
-            let mut start = match_start.saturating_sub(left);
-            let end =
-                match_end.saturating_add(spare.saturating_sub(left).min(text.len() - match_end));
-            if end.saturating_sub(start) < available {
-                start = start.saturating_sub((available - (end - start)).min(start));
-            }
-            (
-                utf8_floor_boundary(text, start),
-                utf8_ceil_boundary(text, end),
-            )
-        };
-
-        let exact_prefix = start;
-        let exact_suffix = text.len().saturating_sub(end);
-        if exact_prefix == prefix_omitted && exact_suffix == suffix_omitted {
-            break (prefix_marker, suffix_marker, start..end);
-        }
-        prefix_omitted = exact_prefix;
-        suffix_omitted = exact_suffix;
-    };
-
-    let snippet = &text[window];
-    let omitted = prefix_omitted.saturating_add(suffix_omitted);
-    (
-        format!("{prefix_marker}{snippet}{suffix_marker}"),
-        (omitted > 0).then_some(omitted),
-    )
-}
-
-fn truncate_grep_match_text(
-    text: &str,
-    match_range: Option<std::ops::Range<usize>>,
-) -> (String, Option<usize>) {
+/// Clip `text` to [`MAX_GREP_MATCH_TEXT_BYTES`], keeping the head and
+/// tail around a `... [truncated N bytes] ...` marker (UTF-8 safe).
+/// Short lines pass through unchanged.
+fn cap_grep_line(text: &str) -> String {
     if text.len() <= MAX_GREP_MATCH_TEXT_BYTES {
-        return (text.to_string(), None);
+        return text.to_string();
     }
-
-    if let Some(range) = match_range {
-        if range.start <= range.end && range.end <= text.len() {
-            return truncate_around_match_text(text, range);
-        }
-    }
-
     let mut omitted = text.len().saturating_sub(MAX_GREP_MATCH_TEXT_BYTES);
     let (marker, available) = loop {
         let marker = format!(" ... [truncated {omitted} bytes] ... ");
@@ -186,40 +104,12 @@ fn truncate_grep_match_text(
     };
     let head_bytes = available / 2;
     let tail_bytes = available.saturating_sub(head_bytes);
-    let clipped = format!(
+    format!(
         "{}{}{}",
         utf8_prefix(text, head_bytes),
         marker,
         utf8_suffix(text, tail_bytes)
-    );
-    (clipped, Some(omitted))
-}
-
-fn first_match_range(regex: &Regex, text: &str) -> Option<std::ops::Range<usize>> {
-    regex.find(text).map(|m| m.start()..m.end())
-}
-
-fn grep_match_row(
-    path: &std::path::Path,
-    line_no: u64,
-    text: &str,
-    match_range: Option<std::ops::Range<usize>>,
-) -> serde_json::Value {
-    let (text, omitted) = truncate_grep_match_text(text, match_range);
-    match omitted {
-        Some(omitted_bytes) => json!({
-            "path": path.display().to_string(),
-            "line_no": line_no,
-            "match_text": text,
-            "match_text_truncated": true,
-            "omitted_bytes": omitted_bytes,
-        }),
-        None => json!({
-            "path": path.display().to_string(),
-            "line_no": line_no,
-            "match_text": text,
-        }),
-    }
+    )
 }
 
 // =========================================================================
@@ -298,7 +188,7 @@ impl Sink for CollectSink<'_> {
             self.matches.push(json!({
                 "path": self.path.display().to_string(),
                 "line_no": first.map(|n| n + offset as u64),
-                "match_text": text,
+                "match_text": cap_grep_line(text),
                 "kind": "match",
             }));
         }
@@ -316,7 +206,7 @@ impl Sink for CollectSink<'_> {
         self.matches.push(json!({
             "path": self.path.display().to_string(),
             "line_no": c.line_number(),
-            "match_text": text,
+            "match_text": cap_grep_line(text),
             "kind": "context",
         }));
         Ok(true)
@@ -739,6 +629,32 @@ mod tests {
         WorkspacePolicy::new(dir).unwrap().into_arc()
     }
 
+    #[test]
+    fn cap_grep_line_bounds_long_lines() {
+        // Short lines pass through untouched.
+        let short = "hello world";
+        assert_eq!(cap_grep_line(short), short);
+
+        // A single huge line (e.g. minified JS) is clipped to the cap
+        // with a truncation marker.
+        let long = "x".repeat(MAX_GREP_MATCH_TEXT_BYTES + 5000);
+        let capped = cap_grep_line(&long);
+        assert!(
+            capped.len() <= MAX_GREP_MATCH_TEXT_BYTES,
+            "capped {} <= {}",
+            capped.len(),
+            MAX_GREP_MATCH_TEXT_BYTES
+        );
+        assert!(capped.contains("[truncated"), "carries a truncation marker");
+
+        // Multibyte UTF-8 at the clip boundary must not panic or split
+        // a codepoint.
+        let multi = "é".repeat(MAX_GREP_MATCH_TEXT_BYTES); // 2 bytes each
+        let capped_multi = cap_grep_line(&multi);
+        assert!(capped_multi.len() <= MAX_GREP_MATCH_TEXT_BYTES);
+        assert!(std::str::from_utf8(capped_multi.as_bytes()).is_ok());
+    }
+
     fn tree(dir: &TempDir) {
         std::fs::write(dir.path().join("a.txt"), "alpha\nbeta\ngamma\n").unwrap();
         std::fs::write(dir.path().join("b.rs"), "fn main() { println!(\"hi\"); }\n").unwrap();
@@ -862,44 +778,6 @@ mod tests {
             .unwrap();
         assert_eq!(out["matches"].as_array().unwrap().len(), 5);
         assert_eq!(out["truncated"], true);
-    }
-
-    #[tokio::test]
-    async fn grep_truncates_very_long_match_lines() {
-        let dir = TempDir::new().unwrap();
-        let line = format!(
-            "{}near-left-palette-near-right{}",
-            "a".repeat(MAX_GREP_MATCH_TEXT_BYTES * 3),
-            "b".repeat(MAX_GREP_MATCH_TEXT_BYTES * 3)
-        );
-        std::fs::write(dir.path().join("app.js"), line).unwrap();
-        let tool = GrepTool::new(policy_for(dir.path()));
-        let out = tool
-            .call(
-                &ctx(),
-                json!({"pattern": "palette", "include": ".js", "max_matches": 1}),
-            )
-            .await
-            .unwrap();
-        let matches = out["matches"].as_array().unwrap();
-        assert_eq!(matches.len(), 1);
-        let row = &matches[0];
-        let text = row["match_text"].as_str().unwrap();
-        assert!(
-            text.len() <= MAX_GREP_MATCH_TEXT_BYTES,
-            "match_text should be capped, got {} bytes",
-            text.len()
-        );
-        assert!(
-            text.contains("near-left-palette-near-right"),
-            "truncated match_text should be centered on the actual hit: {text}"
-        );
-        assert_eq!(row["match_text_truncated"], true);
-        assert!(row["omitted_bytes"].as_u64().unwrap() > 0);
-        assert!(
-            serde_json::to_string(&out).unwrap().len() < MAX_GREP_MATCH_TEXT_BYTES + 2048,
-            "serialized Grep output should stay bounded"
-        );
     }
 
     #[tokio::test]

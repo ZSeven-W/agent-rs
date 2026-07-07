@@ -60,6 +60,7 @@ pub mod discovery;
 pub mod policy;
 
 mod compress;
+mod process;
 
 #[cfg(feature = "fs")]
 pub mod fs;
