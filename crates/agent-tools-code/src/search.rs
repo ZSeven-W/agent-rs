@@ -85,12 +85,89 @@ fn utf8_suffix(s: &str, max_bytes: usize) -> &str {
     &s[start..]
 }
 
-/// Clip `text` to [`MAX_GREP_MATCH_TEXT_BYTES`], keeping the head and
-/// tail around a `... [truncated N bytes] ...` marker (UTF-8 safe).
-/// Short lines pass through unchanged.
-fn cap_grep_line(text: &str) -> String {
+fn utf8_floor_boundary(s: &str, mut idx: usize) -> usize {
+    idx = idx.min(s.len());
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+fn utf8_ceil_boundary(s: &str, mut idx: usize) -> usize {
+    idx = idx.min(s.len());
+    while idx < s.len() && !s.is_char_boundary(idx) {
+        idx += 1;
+    }
+    idx
+}
+
+/// Keep a [`MAX_GREP_MATCH_TEXT_BYTES`] window centered on the match so
+/// the match itself stays visible even when it sits deep inside a huge
+/// (e.g. minified) line, with `[truncated N bytes before/after]` markers.
+/// UTF-8 safe.
+fn truncate_around_match(text: &str, match_range: std::ops::Range<usize>) -> String {
+    let match_start = utf8_floor_boundary(text, match_range.start);
+    let match_end = utf8_ceil_boundary(text, match_range.end).max(match_start);
+    let mut prefix_omitted = 0usize;
+    let mut suffix_omitted = 0usize;
+    let (prefix_marker, suffix_marker, window) = loop {
+        let prefix_marker = if prefix_omitted > 0 {
+            format!("[truncated {prefix_omitted} bytes before] ... ")
+        } else {
+            String::new()
+        };
+        let suffix_marker = if suffix_omitted > 0 {
+            format!(" ... [truncated {suffix_omitted} bytes after]")
+        } else {
+            String::new()
+        };
+        let available = MAX_GREP_MATCH_TEXT_BYTES
+            .saturating_sub(prefix_marker.len())
+            .saturating_sub(suffix_marker.len());
+        let match_len = match_end.saturating_sub(match_start);
+        let (start, end) = if match_len >= available {
+            (
+                match_start,
+                utf8_floor_boundary(text, match_start.saturating_add(available)),
+            )
+        } else {
+            let spare = available.saturating_sub(match_len);
+            let left = spare / 2;
+            let mut start = match_start.saturating_sub(left);
+            let end =
+                match_end.saturating_add(spare.saturating_sub(left).min(text.len() - match_end));
+            if end.saturating_sub(start) < available {
+                start = start.saturating_sub((available - (end - start)).min(start));
+            }
+            (
+                utf8_floor_boundary(text, start),
+                utf8_ceil_boundary(text, end),
+            )
+        };
+        let exact_prefix = start;
+        let exact_suffix = text.len().saturating_sub(end);
+        if exact_prefix == prefix_omitted && exact_suffix == suffix_omitted {
+            break (prefix_marker, suffix_marker, start..end);
+        }
+        prefix_omitted = exact_prefix;
+        suffix_omitted = exact_suffix;
+    };
+    format!("{prefix_marker}{}{suffix_marker}", &text[window])
+}
+
+/// Clip `text` to [`MAX_GREP_MATCH_TEXT_BYTES`]. When `match_range` locates
+/// the match inside `text`, keep a window centered on the match (so a match
+/// buried in a giant line stays visible); otherwise (e.g. context lines with
+/// no match) keep head + tail around a `... [truncated N bytes] ...` marker.
+/// Short lines pass through unchanged. UTF-8 safe.
+fn cap_grep_line(text: &str, match_range: Option<std::ops::Range<usize>>) -> String {
     if text.len() <= MAX_GREP_MATCH_TEXT_BYTES {
         return text.to_string();
+    }
+    if let Some(range) = match_range {
+        if range.start <= range.end && range.end <= text.len() {
+            return truncate_around_match(text, range);
+        }
     }
     let mut omitted = text.len().saturating_sub(MAX_GREP_MATCH_TEXT_BYTES);
     let (marker, available) = loop {
@@ -167,6 +244,7 @@ struct GrepInput {
 /// `max_matches` cap.
 struct CollectSink<'a> {
     path: &'a std::path::Path,
+    matcher: &'a grep::regex::RegexMatcher,
     matches: &'a mut Vec<serde_json::Value>,
     max_matches: usize,
     truncated: &'a mut bool,
@@ -176,19 +254,31 @@ impl Sink for CollectSink<'_> {
     type Error = std::io::Error;
 
     fn matched(&mut self, _s: &Searcher, m: &SinkMatch<'_>) -> Result<bool, std::io::Error> {
+        use grep::matcher::Matcher;
         let first = m.line_number();
         for (offset, line) in m.lines().enumerate() {
             if self.matches.len() >= self.max_matches {
                 *self.truncated = true;
                 return Ok(false);
             }
+            // Locate the match within this line so an over-cap line is
+            // clipped around the match, not blindly head/tail (which could
+            // drop the match). Files are UTF-8 (checked before search), so
+            // byte offsets from the matcher map straight onto `text`.
+            let match_range = self
+                .matcher
+                .find(line)
+                .ok()
+                .flatten()
+                .map(|mm| mm.start()..mm.end());
             let text = String::from_utf8_lossy(line);
             let text = text.strip_suffix('\n').unwrap_or(&text);
             let text = text.strip_suffix('\r').unwrap_or(text);
+            let range = match_range.filter(|r| r.end <= text.len());
             self.matches.push(json!({
                 "path": self.path.display().to_string(),
                 "line_no": first.map(|n| n + offset as u64),
-                "match_text": cap_grep_line(text),
+                "match_text": cap_grep_line(text, range),
                 "kind": "match",
             }));
         }
@@ -203,10 +293,11 @@ impl Sink for CollectSink<'_> {
         let text = String::from_utf8_lossy(c.bytes());
         let text = text.strip_suffix('\n').unwrap_or(&text);
         let text = text.strip_suffix('\r').unwrap_or(text);
+        // Context lines carry no match to center on → head/tail clip.
         self.matches.push(json!({
             "path": self.path.display().to_string(),
             "line_no": c.line_number(),
-            "match_text": cap_grep_line(text),
+            "match_text": cap_grep_line(text, None),
             "kind": "context",
         }));
         Ok(true)
@@ -363,6 +454,7 @@ impl Tool for GrepTool {
                     .build();
                 let mut sink = CollectSink {
                     path,
+                    matcher: &matcher,
                     matches: &mut matches,
                     max_matches,
                     truncated: &mut truncated,
@@ -633,12 +725,12 @@ mod tests {
     fn cap_grep_line_bounds_long_lines() {
         // Short lines pass through untouched.
         let short = "hello world";
-        assert_eq!(cap_grep_line(short), short);
+        assert_eq!(cap_grep_line(short, None), short);
 
         // A single huge line (e.g. minified JS) is clipped to the cap
         // with a truncation marker.
         let long = "x".repeat(MAX_GREP_MATCH_TEXT_BYTES + 5000);
-        let capped = cap_grep_line(&long);
+        let capped = cap_grep_line(&long, None);
         assert!(
             capped.len() <= MAX_GREP_MATCH_TEXT_BYTES,
             "capped {} <= {}",
@@ -650,9 +742,26 @@ mod tests {
         // Multibyte UTF-8 at the clip boundary must not panic or split
         // a codepoint.
         let multi = "é".repeat(MAX_GREP_MATCH_TEXT_BYTES); // 2 bytes each
-        let capped_multi = cap_grep_line(&multi);
+        let capped_multi = cap_grep_line(&multi, None);
         assert!(capped_multi.len() <= MAX_GREP_MATCH_TEXT_BYTES);
         assert!(std::str::from_utf8(capped_multi.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn cap_grep_line_keeps_a_buried_match_visible() {
+        // A needle deep in the middle of a giant line must survive the cap
+        // — a blind head/tail clip would drop it.
+        let needle = "NEEDLE_abc123";
+        let filler = "x".repeat(MAX_GREP_MATCH_TEXT_BYTES * 3);
+        let text = format!("{filler}{needle}{filler}");
+        let start = filler.len();
+        let capped = cap_grep_line(&text, Some(start..start + needle.len()));
+        assert!(capped.len() <= MAX_GREP_MATCH_TEXT_BYTES);
+        assert!(
+            capped.contains(needle),
+            "centered cap must keep the match visible"
+        );
+        assert!(capped.contains("[truncated"));
     }
 
     fn tree(dir: &TempDir) {
