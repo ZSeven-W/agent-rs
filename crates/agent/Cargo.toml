@@ -21,7 +21,7 @@ default = ["anthropic"]
 
 # Provider gates (Phase 2 / 5)
 anthropic = ["dep:reqwest", "dep:eventsource-stream", "dep:bytes"]
-openai = ["dep:async-openai"]
+openai = ["dep:async-openai", "dep:reqwest"]
 ollama = ["dep:ollama-rs"]
 
 # Adjacent capability gates

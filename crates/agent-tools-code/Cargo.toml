@@ -29,8 +29,8 @@ shell = ["dep:shell-words"]
 
 # Background shells: BashRun + BashOutput + KillShell. Shares the
 # ring-buffer + process-group-kill machinery from `shell` but
-# spawns + polls instead of blocking. No extra deps; all tokio.
-bash-async = []
+# spawns + polls instead of blocking.
+bash-async = ["dep:shell-words"]
 
 # Search: Grep + Glob. Pulls regex (~5 MB) + ignore + ripgrep engine.
 search = ["dep:regex", "dep:ignore", "dep:grep"]
