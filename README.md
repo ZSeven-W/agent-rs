@@ -12,6 +12,8 @@ Multi-provider · tool-capable end-to-end · structured permissions · real MCP 
 [![Unsafe](https://img.shields.io/badge/unsafe-forbidden-success?style=flat&logo=rust&logoColor=white)](https://github.com/ZSeven-W/agent-rs/blob/main/crates/agent/src/lib.rs)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat)](./LICENSE)
 
+**Languages:** [English](./README.md) · [简体中文](./docs/readme/README.zh.md) · [繁體中文](./docs/readme/README.zh-TW.md) · [日本語](./docs/readme/README.ja.md) · [한국어](./docs/readme/README.ko.md) · [Français](./docs/readme/README.fr.md) · [Español](./docs/readme/README.es.md) · [Deutsch](./docs/readme/README.de.md) · [Português](./docs/readme/README.pt.md) · [Русский](./docs/readme/README.ru.md) · [हिन्दी](./docs/readme/README.hi.md) · [Türkçe](./docs/readme/README.tr.md) · [ไทย](./docs/readme/README.th.md) · [Tiếng Việt](./docs/readme/README.vi.md) · [Bahasa Indonesia](./docs/readme/README.id.md)
+
 ```text
 ┌─ user ──┐    ┌─── QueryLoop ───────────────────────────────────────┐
 │ prompt  │───▶│ Streaming → ToolDispatch → ToolCollecting → Yield │──▶ Event::*
@@ -44,6 +46,17 @@ while let Some(event) = futures::StreamExt::next(&mut stream).await {
 ```
 
 That's a complete agent — provider streaming, tool dispatch, hooks, permissions, auto-compaction, USD cost tracking — all wired up. Drop in Files API attachments, MCP servers, or the bundled coding tool pack with one extra line each.
+
+---
+
+## ZSeven-W Products
+
+`agent-rs` is part of the ZSeven-W AI-native product family:
+
+- [zode](https://github.com/ZSeven-W/zode) - an AI-native coding CLI for terminal workflows, built around a Rust microkernel, plugins, multi-provider models, and a full-screen TUI.
+- [jian](https://github.com/ZSeven-W/jian) - a Rust-native cross-platform UI framework where an `.op` file can be an app.
+- [noema](https://github.com/ZSeven-W/noema) - local-first, non-vector memory for coding agents, including review queues, lexical recall, MCP, S3 offload, and enterprise policy controls.
+- [OpenPencil](https://github.com/ZSeven-W/openpencil) - an open-source AI-native vector design tool for design-as-code workflows and concurrent Agent Teams.
 
 ---
 
