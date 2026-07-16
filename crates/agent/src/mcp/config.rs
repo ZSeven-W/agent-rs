@@ -113,7 +113,7 @@ impl McpServerConfig {
                 for a in args {
                     expand(a, env);
                 }
-                for (_, v) in e.iter_mut() {
+                for v in e.values_mut() {
                     expand(v, env);
                 }
                 if let Some(c) = cwd.as_mut() {
@@ -122,7 +122,7 @@ impl McpServerConfig {
             }
             Self::Sse { url, headers, .. } | Self::WebSocket { url, headers, .. } => {
                 expand(url, env);
-                for (_, v) in headers.iter_mut() {
+                for v in headers.values_mut() {
                     expand(v, env);
                 }
             }

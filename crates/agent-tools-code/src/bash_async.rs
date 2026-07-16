@@ -681,30 +681,27 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn output_caps_model_facing_stdout() {
-        let dir = TempDir::new().unwrap();
         let registry = BashSessionRegistry::new();
-        let run = BashRunTool::new(policy_for(dir.path()), registry.clone());
+        let shell_id = "model-cap-test".to_string();
+        let stdout = Arc::new(AsyncMutex::new(TailBuffer::default()));
+        stdout.lock().await.push_chunk(&vec![b'L'; 20_000]);
+        registry.inner.write().await.insert(
+            shell_id.clone(),
+            BashSession {
+                command: "synthetic-large-output".to_string(),
+                child: Arc::new(AsyncMutex::new(None)),
+                pgid: None,
+                stdout,
+                stderr: Arc::new(AsyncMutex::new(TailBuffer::default())),
+                exit: Arc::new(AsyncMutex::new(None)),
+            },
+        );
         let out = BashOutputTool::new(registry);
 
-        let started = run
-            .call(&ctx(), json!({"command": "yes L | head -n 20000"}))
+        let polled = out
+            .call(&ctx(), json!({"shell_id": &shell_id, "wait_ms": 0}))
             .await
             .unwrap();
-        let shell_id = started["shell_id"].as_str().unwrap().to_string();
-
-        let mut polled = out
-            .call(&ctx(), json!({"shell_id": &shell_id, "wait_ms": 1000}))
-            .await
-            .unwrap();
-        for _ in 0..20 {
-            if polled["running"] == false {
-                break;
-            }
-            polled = out
-                .call(&ctx(), json!({"shell_id": &shell_id, "wait_ms": 1000}))
-                .await
-                .unwrap();
-        }
 
         let stdout = polled["stdout"].as_str().unwrap();
         assert_eq!(polled["stdout_truncated"], true);
