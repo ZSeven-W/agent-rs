@@ -94,6 +94,9 @@ pub struct StreamRequest {
     pub temperature: Option<f32>,
     pub stop_sequences: Vec<String>,
     pub thinking: Option<ThinkingConfig>,
+    /// OpenAI-style reasoning effort ("low" | "medium" | "high"). Serialized
+    /// only by providers that support it; ignored elsewhere.
+    pub reasoning_effort: Option<String>,
     /// Hint to attach `cache_control` markers (Anthropic-specific; other
     /// providers ignore). The actual placement is provider-implementation
     /// detail (typically last system prompt + last user message).
@@ -119,6 +122,7 @@ impl StreamRequest {
             temperature: None,
             stop_sequences: Vec::new(),
             thinking: None,
+            reasoning_effort: None,
             use_prompt_cache: false,
             tools: Vec::new(),
             tool_choice: None,
@@ -142,6 +146,11 @@ impl StreamRequest {
 
     pub fn with_thinking(mut self, cfg: ThinkingConfig) -> Self {
         self.thinking = Some(cfg);
+        self
+    }
+
+    pub fn with_reasoning_effort(mut self, effort: impl Into<String>) -> Self {
+        self.reasoning_effort = Some(effort.into());
         self
     }
 
@@ -348,6 +357,12 @@ mod tests {
         assert!(req.use_prompt_cache);
         assert!(req.tools.is_empty());
         assert!(req.tool_choice.is_none());
+    }
+
+    #[test]
+    fn stream_request_carries_reasoning_effort() {
+        let req = StreamRequest::new("m", vec![]).with_reasoning_effort("high");
+        assert_eq!(req.reasoning_effort.as_deref(), Some("high"));
     }
 
     #[test]

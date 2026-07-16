@@ -26,7 +26,6 @@ use crate::stream::{Event, EventStream, ResultData};
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const PROMPT_CACHING_BETA: &str = "prompt-caching-2024-07-31";
-const EXTENDED_THINKING_BETA: &str = "extended-thinking-2025-05-01";
 /// Required to reference Files API uploads (`file_id` sources) from
 /// Messages requests. We send it whenever any block in the request
 /// uses a `File` source; sending it spuriously is harmless on
@@ -132,9 +131,6 @@ impl Provider for AnthropicProvider {
         if req.use_prompt_cache {
             betas.push(PROMPT_CACHING_BETA);
         }
-        if req.thinking.is_some() {
-            betas.push(EXTENDED_THINKING_BETA);
-        }
         if request_uses_file_sources(&req) {
             betas.push(FILES_API_BETA);
         }
@@ -220,6 +216,24 @@ fn request_uses_file_sources(req: &StreamRequest) -> bool {
     false
 }
 
+/// Models that support (and for the newest, require) adaptive thinking.
+/// Manual {enabled, budget_tokens} 400s on fable-5/mythos-5/sonnet-5/opus-4-8/
+/// opus-4-7 and is deprecated on opus-4-6/sonnet-4-6, so all of these get
+/// {"type":"adaptive"}; older models keep the manual budget shape.
+fn prefers_adaptive_thinking(model: &str) -> bool {
+    [
+        "fable-5",
+        "mythos-5",
+        "sonnet-5",
+        "opus-4-8",
+        "opus-4-7",
+        "opus-4-6",
+        "sonnet-4-6",
+    ]
+    .iter()
+    .any(|m| model.contains(m))
+}
+
 /// Build the JSON body for `POST /v1/messages`.
 fn build_request_body(req: &StreamRequest) -> serde_json::Value {
     let mut body = serde_json::json!({
@@ -239,10 +253,39 @@ fn build_request_body(req: &StreamRequest) -> serde_json::Value {
         body["stop_sequences"] = serde_json::json!(req.stop_sequences);
     }
     if let Some(thinking) = req.thinking {
-        body["thinking"] = serde_json::json!({
-            "type": "enabled",
-            "budget_tokens": thinking.max_tokens,
-        });
+        if prefers_adaptive_thinking(&req.model) {
+            // Adaptive thinking never sends budget_tokens, so it is never
+            // gated on the per-request output budget below.
+            body["thinking"] = serde_json::json!({"type": "adaptive"});
+            if let Some(effort) = &req.reasoning_effort {
+                body["output_config"] = serde_json::json!({"effort": effort});
+            }
+        } else if thinking.max_tokens < req.max_output_tokens {
+            // Anthropic requires budget_tokens < max_tokens. The loop
+            // attaches `thinking` unconditionally (see
+            // `query::loop_::apply_temperature_and_thinking`); this is the
+            // one place that actually knows the wire shape, so the
+            // budget-fits-output check lives here rather than at the loop
+            // layer.
+            body["thinking"] = serde_json::json!({
+                "type": "enabled",
+                "budget_tokens": thinking.max_tokens,
+            });
+        } else {
+            // Budget wouldn't fit this request's (possibly clamped) output
+            // ceiling — omit thinking rather than send a request Anthropic
+            // will 400. Rare corner: the loop already dropped `temperature`
+            // on the assumption thinking would attach; that's an acceptable,
+            // observable cost (see loop_.rs doc comment).
+            tracing::warn!(
+                budget_tokens = thinking.max_tokens,
+                max_output_tokens = req.max_output_tokens,
+                model = %req.model,
+                "dropping thinking: budget_tokens must be < max_tokens on this \
+                 legacy (non-adaptive) model, and it doesn't fit this request's \
+                 effective output budget"
+            );
+        }
     }
     if !req.tools.is_empty() {
         body["tools"] = render_tools(&req.tools);
@@ -946,6 +989,87 @@ mod tests {
         assert_eq!(body["system"], serde_json::json!("you are concise"));
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["thinking"]["budget_tokens"], 2000);
+    }
+
+    #[test]
+    fn build_body_with_adaptive_thinking_model_and_effort() {
+        // fable-5 / mythos-5 / sonnet-5 / opus-4-8 / opus-4-7 / opus-4-6 /
+        // sonnet-4-6 all reject the manual {enabled, budget_tokens} shape —
+        // adaptive thinking is required (or, for the 4.6 family, preferred
+        // since manual is deprecated). Effort rides along as a separate
+        // top-level output_config field.
+        let req = StreamRequest::new("claude-opus-4-8", vec![])
+            .with_thinking(ThinkingConfig::new(2000))
+            .with_reasoning_effort("high");
+        let body = build_request_body(&req);
+        assert_eq!(body["thinking"], serde_json::json!({"type": "adaptive"}));
+        assert!(body["thinking"].get("budget_tokens").is_none());
+        assert_eq!(body["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn build_body_with_legacy_model_keeps_budget_shape() {
+        // Pre-4.6 models still require the manual budget shape and have no
+        // adaptive/effort support. budget_tokens must be < max_tokens, so
+        // give the request headroom above the 4096-token budget.
+        let req = StreamRequest::new("claude-sonnet-4-5", vec![])
+            .with_max_output_tokens(16_384)
+            .with_thinking(ThinkingConfig::new(4096))
+            .with_reasoning_effort("high");
+        let body = build_request_body(&req);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 4096);
+        assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn build_body_legacy_model_omits_thinking_when_budget_does_not_fit_output() {
+        // budget_tokens must be strictly < max_tokens. When the per-iteration
+        // effective output the loop set is too small for the configured
+        // budget, the provider must omit `thinking` entirely rather than
+        // send a request Anthropic will 400 (the loop layer no longer gates
+        // this — see apply_temperature_and_thinking in query/loop_.rs).
+        let req = StreamRequest::new("claude-sonnet-4-5", vec![])
+            .with_max_output_tokens(4096)
+            .with_thinking(ThinkingConfig::new(8192));
+        let body = build_request_body(&req);
+        assert!(
+            body.get("thinking").is_none(),
+            "thinking must be omitted: {body}"
+        );
+    }
+
+    #[test]
+    fn build_body_legacy_model_keeps_budget_shape_when_it_fits_larger_output() {
+        // Same budget as above, but with enough max_output_tokens headroom —
+        // the manual budget shape is sent normally.
+        let req = StreamRequest::new("claude-sonnet-4-5", vec![])
+            .with_max_output_tokens(16_384)
+            .with_thinking(ThinkingConfig::new(8192));
+        let body = build_request_body(&req);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 8192);
+    }
+
+    #[test]
+    fn build_body_adaptive_model_ignores_output_budget_gate() {
+        // Adaptive-mode models never send budget_tokens, so they are never
+        // gated on max_output_tokens — the adaptive shape must still be
+        // present even with a small effective output.
+        let req = StreamRequest::new("claude-opus-4-8", vec![])
+            .with_max_output_tokens(4096)
+            .with_thinking(ThinkingConfig::new(8192));
+        let body = build_request_body(&req);
+        assert_eq!(body["thinking"], serde_json::json!({"type": "adaptive"}));
+    }
+
+    #[test]
+    fn build_body_with_adaptive_thinking_no_effort_omits_output_config() {
+        let req =
+            StreamRequest::new("claude-sonnet-5", vec![]).with_thinking(ThinkingConfig::new(2000));
+        let body = build_request_body(&req);
+        assert_eq!(body["thinking"], serde_json::json!({"type": "adaptive"}));
+        assert!(body.get("output_config").is_none());
     }
 
     #[test]

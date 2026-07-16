@@ -28,8 +28,9 @@ use async_openai::types::chat::{
     ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
     ChatCompletionRequestUserMessageArgs, ChatCompletionRequestUserMessageContent,
     ChatCompletionRequestUserMessageContentPart, ChatCompletionStreamOptions, ChatCompletionTool,
-    ChatCompletionToolChoiceOption, ChatCompletionTools, CreateChatCompletionRequestArgs,
-    FinishReason, FunctionCall, FunctionName, FunctionObject, ImageUrl, ToolChoiceOptions,
+    ChatCompletionToolChoiceOption, ChatCompletionTools, CreateChatCompletionRequest,
+    CreateChatCompletionRequestArgs, FinishReason, FunctionCall, FunctionName, FunctionObject,
+    ImageUrl, ReasoningEffort, ToolChoiceOptions,
 };
 use async_openai::Client;
 use async_trait::async_trait;
@@ -171,41 +172,7 @@ impl Provider for OpenAiCompatProvider {
     ) -> Result<Box<dyn EventStream>, AgentError> {
         let client = self.build_client();
 
-        let messages = render_messages(&req.system, &req.messages)?;
-        let mut builder = CreateChatCompletionRequestArgs::default();
-        builder
-            .model(&req.model)
-            .messages(messages)
-            .max_tokens(req.max_output_tokens)
-            .stream(true)
-            // Ask for a final usage chunk so we can surface token + cache
-            // counts (DeepSeek reports prompt_tokens_details.cached_tokens here).
-            .stream_options(ChatCompletionStreamOptions {
-                include_usage: Some(true),
-                include_obfuscation: None,
-            });
-        if let Some(temp) = req.temperature {
-            builder.temperature(temp);
-        }
-        if !req.stop_sequences.is_empty() {
-            builder.stop(req.stop_sequences.clone());
-        }
-        if !req.tools.is_empty() {
-            builder.tools(render_tools(&req.tools));
-        }
-        if let Some(choice) = &req.tool_choice {
-            // OpenAI rejects `tool_choice` if no tools are present (the
-            // server returns "tool_choice: none/required is not allowed
-            // when tools is not specified"). Drop it silently to match
-            // Anthropic's behavior.
-            if !req.tools.is_empty() {
-                builder.tool_choice(render_tool_choice(choice));
-            }
-        }
-
-        let request = builder
-            .build()
-            .map_err(|e| AgentError::provider("openai-compat", format!("build request: {e}")))?;
+        let request = build_chat_request(&req)?;
 
         // Wrap request initiation in an abort select — without it, a hung
         // connection blocks past the user's cancel until transport timeouts.
@@ -380,6 +347,83 @@ fn accumulate_tool_call(
         }
         if let Some(args) = function.arguments {
             entry.arguments.push_str(&args);
+        }
+    }
+}
+
+/// Build the wire-level Chat Completions request from a provider-neutral
+/// [`StreamRequest`]. Extracted from `stream()` so the shape (in particular,
+/// whether `reasoning_effort` is present in the serialized body) can be
+/// asserted on directly in tests without standing up a fake HTTP server.
+fn build_chat_request(req: &StreamRequest) -> Result<CreateChatCompletionRequest, AgentError> {
+    let messages = render_messages(&req.system, &req.messages)?;
+    let mut builder = CreateChatCompletionRequestArgs::default();
+    builder
+        .model(&req.model)
+        .messages(messages)
+        .stream(true)
+        // Ask for a final usage chunk so we can surface token + cache
+        // counts (DeepSeek reports prompt_tokens_details.cached_tokens here).
+        .stream_options(ChatCompletionStreamOptions {
+            include_usage: Some(true),
+            include_obfuscation: None,
+        });
+    // o-series/reasoning models reject `max_tokens` and require
+    // `max_completion_tokens` instead. `reasoning_effort` being set is our
+    // signal that this is a reasoning request; non-reasoning requests (and
+    // older OpenAI-compatible gateways that don't know about
+    // `max_completion_tokens`) keep the historical `max_tokens` field.
+    if req.reasoning_effort.is_some() {
+        builder.max_completion_tokens(req.max_output_tokens);
+    } else {
+        builder.max_tokens(req.max_output_tokens);
+    }
+    if let Some(temp) = req.temperature {
+        builder.temperature(temp);
+    }
+    if let Some(effort) = &req.reasoning_effort {
+        builder.reasoning_effort(map_reasoning_effort(effort));
+    }
+    if !req.stop_sequences.is_empty() {
+        builder.stop(req.stop_sequences.clone());
+    }
+    if !req.tools.is_empty() {
+        builder.tools(render_tools(&req.tools));
+    }
+    if let Some(choice) = &req.tool_choice {
+        // OpenAI rejects `tool_choice` if no tools are present (the
+        // server returns "tool_choice: none/required is not allowed
+        // when tools is not specified"). Drop it silently to match
+        // Anthropic's behavior.
+        if !req.tools.is_empty() {
+            builder.tool_choice(render_tool_choice(choice));
+        }
+    }
+
+    builder
+        .build()
+        .map_err(|e| AgentError::provider("openai-compat", format!("build request: {e}")))
+}
+
+/// Map our provider-neutral `reasoning_effort` string onto async-openai's
+/// typed enum. Case-insensitive; unrecognized values fall back to `Medium`
+/// (the same default async-openai itself uses) with a `warn!` log message.
+/// This ensures invalid/misspelled effort levels are visible rather than
+/// silently dropping the hint.
+fn map_reasoning_effort(effort: &str) -> ReasoningEffort {
+    match effort.to_ascii_lowercase().as_str() {
+        "none" => ReasoningEffort::None,
+        "minimal" => ReasoningEffort::Minimal,
+        "low" => ReasoningEffort::Low,
+        "medium" => ReasoningEffort::Medium,
+        "high" => ReasoningEffort::High,
+        "xhigh" => ReasoningEffort::Xhigh,
+        unknown => {
+            tracing::warn!(
+                reasoning_effort = unknown,
+                "unrecognized reasoning_effort value, falling back to Medium"
+            );
+            ReasoningEffort::Medium
         }
     }
 }
@@ -748,6 +792,39 @@ mod tests {
         assert!(json["function"].get("description").is_none());
     }
 
+    /// Build the request the same way `stream()` does and serialize it to a
+    /// plain JSON value for shape assertions.
+    fn build_test_body(req: StreamRequest) -> serde_json::Value {
+        let request = build_chat_request(&req).expect("build_chat_request");
+        serde_json::to_value(&request).expect("serialize request")
+    }
+
+    #[test]
+    fn body_includes_reasoning_effort_only_when_set() {
+        let with = build_test_body(StreamRequest::new("m", vec![]).with_reasoning_effort("low"));
+        assert_eq!(with["reasoning_effort"], "low");
+        let without = build_test_body(StreamRequest::new("m", vec![]));
+        assert!(without.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn body_uses_max_completion_tokens_for_reasoning_requests() {
+        // o-series/reasoning models reject `max_tokens` and require
+        // `max_completion_tokens` instead.
+        let body = build_test_body(StreamRequest::new("m", vec![]).with_reasoning_effort("high"));
+        assert_eq!(body["max_completion_tokens"], 4096);
+        assert!(body.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn body_uses_max_tokens_when_reasoning_effort_unset() {
+        // Non-reasoning requests (and older OpenAI-compatible gateways) keep
+        // the historical `max_tokens` field.
+        let body = build_test_body(StreamRequest::new("m", vec![]));
+        assert_eq!(body["max_tokens"], 4096);
+        assert!(body.get("max_completion_tokens").is_none());
+    }
+
     #[test]
     fn render_tool_choice_modes() {
         let auto = serde_json::to_value(render_tool_choice(&ToolChoice::Auto)).unwrap();
@@ -964,6 +1041,43 @@ mod tests {
         assert!(out.contains("hi"));
         assert!(out.contains("[image attachment]"), "got {out}");
         assert!(out.contains("[document attachment]"), "got {out}");
+    }
+
+    #[test]
+    fn map_reasoning_effort_explicit_medium() {
+        // Explicit "medium" arm should map correctly.
+        assert_eq!(map_reasoning_effort("medium"), ReasoningEffort::Medium);
+    }
+
+    #[test]
+    fn map_reasoning_effort_all_recognized_values() {
+        // Verify all recognized effort levels map correctly.
+        assert_eq!(map_reasoning_effort("none"), ReasoningEffort::None);
+        assert_eq!(map_reasoning_effort("minimal"), ReasoningEffort::Minimal);
+        assert_eq!(map_reasoning_effort("low"), ReasoningEffort::Low);
+        assert_eq!(map_reasoning_effort("medium"), ReasoningEffort::Medium);
+        assert_eq!(map_reasoning_effort("high"), ReasoningEffort::High);
+        assert_eq!(map_reasoning_effort("xhigh"), ReasoningEffort::Xhigh);
+    }
+
+    #[test]
+    fn map_reasoning_effort_case_insensitive() {
+        // Case-insensitive: uppercase, mixed case should all work.
+        assert_eq!(map_reasoning_effort("MEDIUM"), ReasoningEffort::Medium);
+        assert_eq!(map_reasoning_effort("MiXeD"), ReasoningEffort::Medium);
+        assert_eq!(map_reasoning_effort("HIGH"), ReasoningEffort::High);
+    }
+
+    #[test]
+    fn map_reasoning_effort_unknown_falls_back_to_medium() {
+        // Unrecognized values fall back to Medium (behavior unchanged from
+        // before; the difference is that a warn log is now emitted).
+        assert_eq!(map_reasoning_effort("unknown"), ReasoningEffort::Medium);
+        assert_eq!(
+            map_reasoning_effort("invalid-effort"),
+            ReasoningEffort::Medium
+        );
+        assert_eq!(map_reasoning_effort(""), ReasoningEffort::Medium);
     }
 
     #[test]

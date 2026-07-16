@@ -142,14 +142,18 @@ impl Tool for TaskTool {
         "Task"
     }
     fn description(&self) -> &str {
-        "Delegate a sub-task to a fresh child agent. Pick an `agent_type` registered with the host. The child runs to completion and returns its final assistant text."
+        "Delegate a sub-task to a fresh child agent that runs to completion and \
+         returns its final assistant text as this tool's result. The child starts \
+         with NO conversation context, so `prompt` must be fully self-contained. \
+         Use it to parallelize independent work or to isolate large explorations \
+         from the main context; pick an `agent_type` registered with the host."
     }
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
                 "description": {"type": "string", "description": "Short label for the sub-task (1 line)."},
-                "prompt": {"type": "string", "description": "Instructions for the child agent."},
+                "prompt": {"type": "string", "description": "Complete, self-contained instructions for the child agent. It cannot see the parent conversation — include the goal, relevant file paths, constraints, and the exact form of result to return."},
                 "agent_type": {"type": "string", "description": "Agent shape to summon (host-defined)."}
             },
             "required": ["prompt", "agent_type"]
@@ -595,5 +599,16 @@ mod tests {
                 "finish 1 the result is 42 err=-".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn task_description_demands_self_contained_prompt() {
+        let tool = TaskTool::new(factory("test"));
+        assert!(tool.description().contains("self-contained"));
+        let schema = tool.input_schema();
+        let prompt_desc = schema["properties"]["prompt"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(prompt_desc.contains("cannot see the parent conversation"));
     }
 }

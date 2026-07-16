@@ -114,7 +114,11 @@ impl Tool for TodoWriteTool {
         "TodoWrite"
     }
     fn description(&self) -> &str {
-        "Replace the planning todo list with `todos`. Each call should re-emit the full list with updated statuses."
+        "Replace the planning todo list with `todos` — each call re-emits the FULL \
+         list with updated statuses. Use for any task with 3+ distinct steps: create \
+         the list up front, keep exactly one item in_progress, and mark items \
+         completed as you finish them so the user can follow progress. Skip it for \
+         single-step tasks."
     }
     fn input_schema(&self) -> serde_json::Value {
         json!({
@@ -385,5 +389,12 @@ mod tests {
         let snap = state.snapshot().await;
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].subject, "host-injected");
+    }
+
+    #[test]
+    fn todo_description_says_when_to_use() {
+        let tool = TodoWriteTool::new(TodoState::new());
+        assert!(tool.description().contains("3+ distinct steps"));
+        assert!(tool.description().contains("one item in_progress"));
     }
 }

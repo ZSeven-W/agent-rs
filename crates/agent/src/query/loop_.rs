@@ -42,7 +42,7 @@ use crate::file_cache::FileStateCache;
 use crate::hook::{HookEvent, HookOutcome, HookRunner};
 use crate::message::{ContentBlock, Header, ImageSource, Message, MessageStore, ToolResultContent};
 use crate::permission::{PermissionDecision, PermissionManager};
-use crate::provider::{Provider, StreamRequest, ToolDefinition};
+use crate::provider::{Provider, StreamRequest, ThinkingConfig, ToolDefinition};
 use crate::stream::{Event, EventStream, RequestedToolUse, ResultData, ToolExecutor};
 use crate::tool::{ToolRegistry, ToolUseContext};
 
@@ -164,6 +164,12 @@ pub struct QueryLoop {
     pub compact_state: Arc<Mutex<AutoCompactState>>,
     /// Sampling temperature passed to the provider. `None` = provider default.
     pub temperature: Option<f32>,
+    /// Extended-thinking / reasoning token budget passed to the provider.
+    /// `None` = thinking disabled.
+    pub thinking: Option<ThinkingConfig>,
+    /// OpenAI-style reasoning effort ("low" | "medium" | "high") passed to
+    /// providers that support it. `None` = provider default.
+    pub reasoning_effort: Option<String>,
     /// Whether to request provider prompt caching (Anthropic `cache_control`).
     pub use_prompt_cache: bool,
     /// Whether the microcompact ladder step runs before LLM compaction:
@@ -251,6 +257,8 @@ pub struct QueryLoopBuilder {
     auto_compact_enabled: bool,
     compact_state: Option<Arc<Mutex<AutoCompactState>>>,
     temperature: Option<f32>,
+    thinking: Option<ThinkingConfig>,
+    reasoning_effort: Option<String>,
     use_prompt_cache: bool,
     microcompact_enabled: bool,
     compact_instructions: Option<String>,
@@ -279,6 +287,8 @@ impl QueryLoopBuilder {
             auto_compact_enabled: true,
             compact_state: None,
             temperature: None,
+            thinking: None,
+            reasoning_effort: None,
             use_prompt_cache: false,
             microcompact_enabled: false,
             compact_instructions: None,
@@ -290,6 +300,21 @@ impl QueryLoopBuilder {
     /// hosts set a low value (e.g. 0) for deterministic coding output.
     pub fn temperature(mut self, t: f32) -> Self {
         self.temperature = Some(t);
+        self
+    }
+
+    /// Extended-thinking / reasoning token budget. `None` (default) leaves
+    /// thinking disabled; providers that don't support it ignore the field.
+    pub fn thinking(mut self, cfg: ThinkingConfig) -> Self {
+        self.thinking = Some(cfg);
+        self
+    }
+
+    /// OpenAI-style reasoning effort ("low" | "medium" | "high"). `None`
+    /// (default) uses the provider's default; providers that don't support
+    /// it ignore the field.
+    pub fn reasoning_effort(mut self, effort: impl Into<String>) -> Self {
+        self.reasoning_effort = Some(effort.into());
         self
     }
 
@@ -433,6 +458,8 @@ impl QueryLoopBuilder {
                 .compact_state
                 .unwrap_or_else(|| Arc::new(Mutex::new(AutoCompactState::new()))),
             temperature: self.temperature,
+            thinking: self.thinking,
+            reasoning_effort: self.reasoning_effort,
             use_prompt_cache: self.use_prompt_cache,
             microcompact_enabled: self.microcompact_enabled,
             compact_instructions: self.compact_instructions,
@@ -572,8 +599,9 @@ async fn drive(
         );
         let mut req = StreamRequest::new(qloop.model.clone(), messages)
             .with_max_output_tokens(effective_output);
-        if let Some(t) = qloop.temperature {
-            req = req.with_temperature(t);
+        req = apply_temperature_and_thinking(req, qloop.temperature, qloop.thinking);
+        if let Some(e) = qloop.reasoning_effort.clone() {
+            req = req.with_reasoning_effort(e);
         }
         req = req.with_prompt_cache(qloop.use_prompt_cache);
         if let Some(s) = &qloop.system {
@@ -942,6 +970,49 @@ fn clamp_output_to_window(configured: u32, prompt: u32, window: u32) -> u32 {
     let reserve = (window / OUTPUT_CLAMP_RESERVE_DIVISOR).max(OUTPUT_CLAMP_RESERVE_FLOOR);
     let headroom = window.saturating_sub(prompt).saturating_sub(reserve);
     configured.min(headroom).max(MIN_CLAMPED_OUTPUT)
+}
+
+/// Applies the caller's `temperature` and `thinking` settings to `req`.
+///
+/// Anthropic rejects any request that enables extended thinking with a
+/// `temperature` other than the provider default (1.0) — thinking and a
+/// pinned sampling temperature are mutually exclusive on that API, and this
+/// holds for both the manual (`budget_tokens`) shape AND adaptive thinking:
+/// adaptive-only models also reject a non-default temperature. Thinking is
+/// attached to the request unconditionally whenever the caller configured
+/// it — whether the manual `budget_tokens` value actually fits the
+/// per-request output budget is a provider-shape concern (Anthropic requires
+/// `budget_tokens < max_tokens`; adaptive-mode models never send
+/// `budget_tokens` at all), not something the loop can decide without
+/// knowing which wire shape the provider will emit. See
+/// `provider::anthropic::build_request_body` for where that budget-fit rule
+/// now lives. When thinking is attached, an explicit temperature is dropped
+/// rather than sent, since an explicit effort/thinking setting is the
+/// stronger intent signal; a `tracing::warn!` is emitted only when a
+/// temperature was configured and actually got dropped, so silent overrides
+/// remain observable. When thinking is absent, `temperature` is applied
+/// exactly as before.
+fn apply_temperature_and_thinking(
+    mut req: StreamRequest,
+    temperature: Option<f32>,
+    thinking: Option<ThinkingConfig>,
+) -> StreamRequest {
+    let thinking_applies = thinking.is_some();
+
+    if thinking_applies {
+        if let Some(t) = temperature {
+            tracing::warn!(
+                temperature = t,
+                "dropping caller-set temperature: extended thinking is active and \
+                 Anthropic requires provider-default temperature when thinking is enabled"
+            );
+        }
+        req = req.with_thinking(thinking.expect("thinking_applies implies Some"));
+    } else if let Some(t) = temperature {
+        req = req.with_temperature(t);
+    }
+
+    req
 }
 
 #[derive(Debug, Default)]
@@ -1502,6 +1573,42 @@ mod tests {
     use crate::provider::ProviderCapabilities;
     use crate::testing::MockProvider;
     use crate::tool::Tool;
+
+    #[test]
+    fn builder_carries_thinking_and_reasoning_effort() {
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider::new(vec![]));
+        let b = QueryLoop::builder(provider, "m")
+            .thinking(ThinkingConfig::new(4096))
+            .reasoning_effort("high");
+        let ql = b.build();
+        assert_eq!(ql.thinking.map(|t| t.max_tokens), Some(4096));
+        assert_eq!(ql.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn temperature_dropped_when_thinking_is_applied() {
+        // Anthropic 400s if extended thinking and a non-default temperature
+        // are both set. Thinking is attached unconditionally now — whether
+        // the manual budget_tokens shape fits the request's output budget is
+        // a provider-shape concern handled in anthropic::build_request_body,
+        // not this loop-level guard — so an explicit temperature must still
+        // be omitted (provider default) rather than sent alongside it.
+        let req = StreamRequest::new("m", vec![]);
+        let tc = ThinkingConfig::new(2048);
+        let req = apply_temperature_and_thinking(req, Some(0.3), Some(tc));
+        assert!(req.thinking.is_some());
+        assert!(req.temperature.is_none());
+    }
+
+    #[test]
+    fn temperature_passes_through_when_thinking_absent() {
+        // No thinking configured: the caller's temperature must reach the
+        // request unchanged, exactly as before this guard was added.
+        let req = StreamRequest::new("m", vec![]);
+        let req = apply_temperature_and_thinking(req, Some(0.3), None);
+        assert!(req.thinking.is_none());
+        assert_eq!(req.temperature, Some(0.3));
+    }
 
     #[test]
     fn clamp_output_keeps_prompt_plus_completion_within_window() {

@@ -23,7 +23,11 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "session-jsonl")]
+use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "session-jsonl")]
+use std::fs::{File as StdFile, OpenOptions as StdOpenOptions};
 use thiserror::Error;
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -108,6 +112,7 @@ impl Session {
                 fs::create_dir_all(parent).await?;
             }
         }
+        let _lock = acquire_session_lock(path, LockMode::Exclusive).await?;
         let tmp = path.with_extension("jsonl.tmp");
 
         let header = SessionHeader::current();
@@ -145,10 +150,11 @@ impl Session {
         expected_existing: usize,
     ) -> Result<bool, SessionError> {
         let path = path.as_ref();
+        let _lock = acquire_session_lock(path, LockMode::Exclusive).await?;
         // Verify the file's current message count matches what the caller
         // believes is already persisted — otherwise appending would produce
         // a corrupt (misordered / duplicated) transcript.
-        let actual = match count_messages(path).await {
+        let actual = match count_messages_unlocked(path).await {
             Ok(Some(n)) => n,
             Ok(None) => return Ok(false), // missing / headerless → full save
             Err(e) => return Err(e),
@@ -177,7 +183,9 @@ impl Session {
     /// `MessageStore` with all messages in original order. Unknown
     /// schema → [`SessionError::UnsupportedVersion`].
     pub async fn load(path: impl AsRef<Path>) -> Result<MessageStore, SessionError> {
-        let file = fs::File::open(path.as_ref()).await?;
+        let path = path.as_ref();
+        let _lock = acquire_session_lock(path, LockMode::Shared).await?;
+        let file = fs::File::open(path).await?;
         let mut reader = BufReader::new(file);
 
         let mut header_line = String::new();
@@ -206,7 +214,20 @@ impl Session {
             if line.is_empty() {
                 continue;
             }
-            let msg: Message = serde_json::from_str(line)?;
+            let msg: Message = match serde_json::from_str(line) {
+                Ok(message) => message,
+                // `append` is intentionally incremental, so a process crash
+                // can leave only its final JSON line incomplete. Preserve all
+                // earlier messages; the next full save rewrites a clean file.
+                Err(error) if !buf.ends_with('\n') => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "ignoring incomplete final session line: {error}"
+                    );
+                    break;
+                }
+                Err(error) => return Err(error.into()),
+            };
             store.push(msg).map_err(|e| match e {
                 AgentError::DuplicateUuid(uuid) => {
                     SessionError::Other(format!("duplicate uuid {uuid} in session file"))
@@ -222,7 +243,7 @@ impl Session {
 /// `Ok(None)` when the file is missing or has no valid header — the caller
 /// treats that as "can't append, do a full save". Cheap: reads line
 /// boundaries without deserializing message bodies.
-async fn count_messages(path: &Path) -> Result<Option<usize>, SessionError> {
+async fn count_messages_unlocked(path: &Path) -> Result<Option<usize>, SessionError> {
     let file = match fs::File::open(path).await {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -244,11 +265,52 @@ async fn count_messages(path: &Path) -> Result<Option<usize>, SessionError> {
         if reader.read_line(&mut buf).await? == 0 {
             break;
         }
+        if !buf.ends_with('\n') {
+            // Session writers always terminate complete records with a newline.
+            // Refuse to append after a possibly torn tail; the caller will
+            // publish a clean full snapshot instead.
+            return Ok(None);
+        }
         if !buf.trim_end().is_empty() {
             count += 1;
         }
     }
     Ok(Some(count))
+}
+
+#[derive(Clone, Copy)]
+enum LockMode {
+    Shared,
+    Exclusive,
+}
+
+#[cfg(feature = "session-jsonl")]
+async fn acquire_session_lock(path: &Path, mode: LockMode) -> Result<StdFile, SessionError> {
+    let lock_path = path.with_extension("jsonl.lock");
+    let parent = lock_path.parent().map(Path::to_path_buf);
+    tokio::task::spawn_blocking(move || {
+        if let Some(parent) = parent.filter(|parent| !parent.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = StdOpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)?;
+        match mode {
+            LockMode::Shared => FileExt::lock_shared(&file)?,
+            LockMode::Exclusive => FileExt::lock_exclusive(&file)?,
+        }
+        Ok(file)
+    })
+    .await
+    .map_err(|error| SessionError::Other(format!("session lock worker failed: {error}")))?
+}
+
+#[cfg(not(feature = "session-jsonl"))]
+async fn acquire_session_lock(_path: &Path, _mode: LockMode) -> Result<(), SessionError> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -337,6 +399,56 @@ mod tests {
         let path = dir.path().join("nope.jsonl");
         let ok = Session::append(&path, &[user("x")], 0).await.unwrap();
         assert!(!ok, "missing file → full save, not append");
+    }
+
+    #[tokio::test]
+    async fn load_preserves_history_before_an_incomplete_final_line() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("torn.jsonl");
+        let mut store = MessageStore::new();
+        let complete = user("keep this");
+        store.push(complete.clone()).unwrap();
+        Session::save(&path, &store).await.unwrap();
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .await
+            .unwrap();
+        file.write_all(br#"{"type":"assistant","header":{"uuid":"#)
+            .await
+            .unwrap();
+        file.flush().await.unwrap();
+        drop(file);
+
+        let loaded = Session::load(&path).await.unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded.iter().next(), Some(&complete));
+        assert!(!Session::append(&path, &[assistant("new")], 1)
+            .await
+            .unwrap());
+        Session::save(&path, &loaded).await.unwrap();
+        assert_eq!(Session::load(&path).await.unwrap().len(), 1);
+    }
+
+    #[cfg(feature = "session-jsonl")]
+    #[tokio::test]
+    async fn concurrent_full_saves_publish_one_complete_snapshot() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("shared.jsonl");
+        let mut first = MessageStore::new();
+        first.push(user("first")).unwrap();
+        let mut second = MessageStore::new();
+        second.push(user("second")).unwrap();
+        second.push(assistant("second reply")).unwrap();
+
+        let (left, right) =
+            tokio::join!(Session::save(&path, &first), Session::save(&path, &second));
+
+        left.unwrap();
+        right.unwrap();
+        let loaded = Session::load(&path).await.unwrap();
+        assert!(loaded.len() == 1 || loaded.len() == 2);
     }
 
     #[tokio::test]
