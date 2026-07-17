@@ -91,6 +91,18 @@ impl FileStateCache {
         }
     }
 
+    /// Drop every cached entry, resetting the byte budget to zero. Idempotent.
+    ///
+    /// Use when an out-of-band writer (e.g. an external agent process) may have
+    /// mutated an unknown set of files, so per-path invalidation can't be
+    /// enumerated reliably.
+    pub fn clear(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.cache.clear();
+            inner.current_size_bytes = 0;
+        }
+    }
+
     /// Currently cached entry count (after recent operations have settled).
     pub fn len(&self) -> usize {
         self.inner.lock().map(|i| i.cache.len()).unwrap_or(0)
