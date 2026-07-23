@@ -24,11 +24,14 @@
 // boundaries via mpsc, so a Box on the Ok variant doesn't materially
 // change runtime cost; consistent with `permission/external_queue.rs`.
 
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
 use futures::channel::mpsc;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 
 use crate::abort::AbortController;
 use crate::compact::{
@@ -127,6 +130,11 @@ pub struct QueryLoop {
     /// every [`ToolUseContext`] so the Task tool's recursion guard holds
     /// across the child loop's `tokio::spawn`.
     pub task_depth: usize,
+    /// Whether this loop owns the host-visible root turn boundary. Only the
+    /// outermost loop waits for all shared TurnActivity workers before EOF;
+    /// nested Task/team loops must set this to `false` to avoid waiting on
+    /// their still-active parent tool task.
+    pub root_turn_owner: bool,
     /// Optional mid-turn steering inbox: user messages injected while a
     /// multi-step turn runs. Drained at the top of each loop iteration and
     /// appended to the store before the next provider round-trip. Shared
@@ -230,10 +238,229 @@ impl QueryLoop {
             store.push(user_message)?;
         }
 
+        let store = self.store.clone();
+        let await_quiescence = self.root_turn_owner;
+        let repair_from = store.lock().map(|store| store.len()).unwrap_or(0);
+        let repair_fence = Arc::new(Mutex::new(()));
         let (tx, rx) = mpsc::unbounded::<Result<Event, AgentError>>();
-        tokio::spawn(drive(self, tx, abort));
-        Ok(Box::new(rx))
+        let driver_abort = abort.clone();
+        let driver_repair_fence = repair_fence.clone();
+        let driver_work = abort.activity().track_worker();
+        let driver = tokio::spawn(async move {
+            let _work = driver_work;
+            drive(self, tx, abort, driver_repair_fence).await;
+        });
+        Ok(Box::new(DriverStream {
+            rx,
+            driver: Some(driver),
+            abort: driver_abort,
+            store,
+            repair_from,
+            repair_fence,
+            quiescence: None,
+            terminal_error: None,
+            await_quiescence,
+            completed: false,
+        }))
     }
+}
+
+/// Owns the real query driver. Dropping a host's event stream is a hard
+/// cancellation boundary, not permission for a detached zombie driver to
+/// keep mutating the shared store while a replacement turn starts.
+struct DriverStream {
+    rx: mpsc::UnboundedReceiver<Result<Event, AgentError>>,
+    driver: Option<tokio::task::JoinHandle<()>>,
+    abort: AbortController,
+    store: Arc<Mutex<MessageStore>>,
+    repair_from: usize,
+    repair_fence: Arc<Mutex<()>>,
+    quiescence: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+    terminal_error: Option<AgentError>,
+    await_quiescence: bool,
+    completed: bool,
+}
+
+impl Stream for DriverStream {
+    type Item = Result<Event, AgentError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(quiescence) = self.quiescence.as_mut() {
+            if quiescence.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+            self.quiescence.take();
+            self.completed = true;
+            return match self.terminal_error.take() {
+                Some(error) => Poll::Ready(Some(Err(error))),
+                None => Poll::Ready(None),
+            };
+        }
+        match Pin::new(&mut self.rx).poll_next(cx) {
+            Poll::Ready(Some(Err(error))) => {
+                // Errors are terminal, but publishing one makes most hosts
+                // drop the stream immediately. Hold it until the driver has
+                // joined and root quiescence is acknowledged.
+                if self.terminal_error.is_none() {
+                    self.terminal_error = Some(error);
+                }
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Poll::Ready(Some(Ok(_))) if self.terminal_error.is_some() => {
+                // Discard any producer bug/cleanup event emitted after the
+                // first terminal error while still draining toward EOF.
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Poll::Ready(Some(item)) => Poll::Ready(Some(item)),
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => {
+                let Some(driver) = self.driver.as_mut() else {
+                    self.completed = true;
+                    return Poll::Ready(None);
+                };
+                match Pin::new(driver).poll(cx) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(result) => {
+                        self.driver.take();
+                        if let Err(error) = result {
+                            self.terminal_error = Some(AgentError::other(format!(
+                                "query driver task failed: {error}"
+                            )));
+                        }
+                        if !self.await_quiescence {
+                            self.completed = true;
+                            return match self.terminal_error.take() {
+                                Some(error) => Poll::Ready(Some(Err(error))),
+                                None => Poll::Ready(None),
+                            };
+                        }
+                        let activity = self.abort.activity();
+                        self.quiescence = Some(Box::pin(async move {
+                            activity.wait_for_quiescence().await;
+                        }));
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Drop for DriverStream {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        self.abort
+            .abort_with_reason("query event stream dropped by host");
+        if let Some(driver) = self.driver.as_ref() {
+            driver.abort();
+        }
+        // Coordinate with the assistant-tool-use append, then synchronously
+        // close any persisted gap before the outer worker JoinHandle can end.
+        let _fence = self.repair_fence.lock().ok();
+        repair_dangling_tool_uses(&self.store, self.repair_from, None);
+    }
+}
+
+/// Repairs the message store if the query driver itself is hard-aborted after
+/// it has persisted assistant tool-use blocks. The normal path disarms this
+/// only after the matching user tool-result message is committed.
+struct PendingToolRepair {
+    store: Arc<Mutex<MessageStore>>,
+    ids: Vec<String>,
+    armed: bool,
+}
+
+impl PendingToolRepair {
+    fn new(store: Arc<Mutex<MessageStore>>, ids: Vec<String>) -> Self {
+        Self {
+            store,
+            ids,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingToolRepair {
+    fn drop(&mut self) {
+        if !self.armed || self.ids.is_empty() {
+            return;
+        }
+        repair_dangling_tool_uses(&self.store, 0, Some(&self.ids));
+    }
+}
+
+fn repair_dangling_tool_uses(
+    store: &Arc<Mutex<MessageStore>>,
+    from: usize,
+    candidates: Option<&[String]>,
+) {
+    let Ok(mut store) = store.lock() else {
+        return;
+    };
+    let answered: std::collections::HashSet<&str> = store
+        .iter()
+        .filter_map(|message| match message {
+            Message::User { content, .. } => Some(content),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let requested: Vec<String> = match candidates {
+        Some(ids) => ids.to_vec(),
+        None => store
+            .iter()
+            .skip(from)
+            .filter_map(|message| match message {
+                Message::Assistant { content, .. } => Some(content),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect(),
+    };
+    let missing: Vec<String> = requested
+        .into_iter()
+        .filter(|id| !answered.contains(id.as_str()))
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    let header = store
+        .last()
+        .map(|message| Header::child_of(message.uuid()))
+        .unwrap_or_default();
+    let message = Message::User {
+        header,
+        content: missing
+            .into_iter()
+            .map(|id| ContentBlock::ToolResult {
+                tool_use_id: id,
+                content: tool_result_content(
+                    false,
+                    &serde_json::json!({ "error": "[interrupted]" }),
+                    false,
+                ),
+                is_error: true,
+            })
+            .collect(),
+    };
+    let _ = store.push(message);
 }
 
 #[derive(Debug)]
@@ -248,6 +475,7 @@ pub struct QueryLoopBuilder {
     max_output_tokens: u32,
     max_concurrent_tools: usize,
     task_depth: usize,
+    root_turn_owner: bool,
     steer: Option<Arc<std::sync::Mutex<mpsc::UnboundedReceiver<Vec<ContentBlock>>>>>,
     max_iterations: usize,
     max_api_retries: u32,
@@ -278,6 +506,7 @@ impl QueryLoopBuilder {
             max_output_tokens: 4096,
             max_concurrent_tools: 8,
             task_depth: 0,
+            root_turn_owner: true,
             steer: None,
             max_iterations: usize::MAX,
             max_api_retries: 10,
@@ -355,6 +584,13 @@ impl QueryLoopBuilder {
     /// pass parent depth + 1). Feeds `ToolUseContext::task_depth`.
     pub fn task_depth(mut self, depth: usize) -> Self {
         self.task_depth = depth;
+        self
+    }
+
+    /// Declare whether this loop owns host-visible root-turn completion.
+    /// Nested loops must disable this even when they do not use Task depth.
+    pub fn root_turn_owner(mut self, owns_root: bool) -> Self {
+        self.root_turn_owner = owns_root;
         self
     }
 
@@ -447,6 +683,7 @@ impl QueryLoopBuilder {
             max_output_tokens: self.max_output_tokens,
             max_concurrent_tools: self.max_concurrent_tools,
             task_depth: self.task_depth,
+            root_turn_owner: self.root_turn_owner,
             steer: self.steer,
             max_iterations: self.max_iterations,
             max_api_retries: self.max_api_retries,
@@ -476,6 +713,7 @@ async fn drive(
     qloop: QueryLoop,
     tx: mpsc::UnboundedSender<Result<Event, AgentError>>,
     abort: AbortController,
+    repair_fence: Arc<Mutex<()>>,
 ) {
     let mut iter = 0usize;
     let mut final_result = ResultData {
@@ -671,20 +909,39 @@ async fn drive(
             final_result.stop_reason = Some(r);
         }
 
-        // Push assistant message with everything we collected.
+        let pending_ids: Vec<String> = pending_tool_uses
+            .iter()
+            .map(|tool| tool.id.clone())
+            .collect();
+
+        // Push the assistant tool-use blocks and arm their repair under the
+        // same fence used by DriverStream::drop. Once host shutdown holds this
+        // fence, the driver cannot create a new dangling tool-use afterward.
         let assistant = Message::Assistant {
             header: child_header(&qloop.store),
             content: assistant_blocks,
         };
-        if let Err(e) = push(&qloop.store, assistant) {
-            let _ = tx.unbounded_send(Err(e));
-            return;
-        }
+        let repair_guard = {
+            let Ok(_fence) = repair_fence.lock() else {
+                let _ =
+                    tx.unbounded_send(Err(AgentError::other("query repair fence lock poisoned")));
+                return;
+            };
+            if abort.is_aborted() {
+                return;
+            }
+            if let Err(e) = push(&qloop.store, assistant) {
+                let _ = tx.unbounded_send(Err(e));
+                return;
+            }
+            (!pending_ids.is_empty())
+                .then(|| PendingToolRepair::new(qloop.store.clone(), pending_ids))
+        };
 
         // No tool_uses → we're done.
-        if pending_tool_uses.is_empty() {
+        let Some(mut repair_guard) = repair_guard else {
             break;
-        }
+        };
 
         // ----- ToolDispatch phase: permission + BeforeToolUse hooks -----
         let mut surviving = Vec::with_capacity(pending_tool_uses.len());
@@ -702,10 +959,13 @@ async fn drive(
                 PermissionDecision::Ask(ask) => {
                     let _ = qloop
                         .hooks
-                        .run(&HookEvent::OnPermissionRequest {
-                            tool: tu.name.clone(),
-                            input: tu.input.clone(),
-                        })
+                        .run_with_abort(
+                            &HookEvent::OnPermissionRequest {
+                                tool: tu.name.clone(),
+                                input: tu.input.clone(),
+                            },
+                            &abort,
+                        )
                         .await;
                     let synthetic = synthetic_tool_result(
                         &tu,
@@ -721,10 +981,13 @@ async fn drive(
                     tool_results.push((tu.id.clone(), synthetic.0.ok, synthetic.0.output));
                     let _ = qloop
                         .hooks
-                        .run(&HookEvent::OnPermissionDenied {
-                            tool: tu.name.clone(),
-                            reason: ask.message_text.clone(),
-                        })
+                        .run_with_abort(
+                            &HookEvent::OnPermissionDenied {
+                                tool: tu.name.clone(),
+                                reason: ask.message_text.clone(),
+                            },
+                            &abort,
+                        )
                         .await;
                     continue;
                 }
@@ -740,10 +1003,13 @@ async fn drive(
                     tool_results.push((tu.id.clone(), synthetic.0.ok, synthetic.0.output));
                     let _ = qloop
                         .hooks
-                        .run(&HookEvent::OnPermissionDenied {
-                            tool: tu.name.clone(),
-                            reason: deny.message_text.clone(),
-                        })
+                        .run_with_abort(
+                            &HookEvent::OnPermissionDenied {
+                                tool: tu.name.clone(),
+                                reason: deny.message_text.clone(),
+                            },
+                            &abort,
+                        )
                         .await;
                     continue;
                 }
@@ -752,10 +1018,13 @@ async fn drive(
             // 2. BeforeToolUse hook.
             let hook_outcome = qloop
                 .hooks
-                .run(&HookEvent::BeforeToolUse {
-                    tool: tu.name.clone(),
-                    input: tu.input.clone(),
-                })
+                .run_with_abort(
+                    &HookEvent::BeforeToolUse {
+                        tool: tu.name.clone(),
+                        input: tu.input.clone(),
+                    },
+                    &abort,
+                )
                 .await;
             if matches!(hook_outcome, HookOutcome::Block) {
                 let synthetic = synthetic_tool_result(
@@ -772,9 +1041,12 @@ async fn drive(
 
             let _ = qloop
                 .hooks
-                .run(&HookEvent::OnPermissionAllowed {
-                    tool: tu.name.clone(),
-                })
+                .run_with_abort(
+                    &HookEvent::OnPermissionAllowed {
+                        tool: tu.name.clone(),
+                    },
+                    &abort,
+                )
                 .await;
             surviving.push(tu);
         }
@@ -820,25 +1092,31 @@ async fn drive(
                                 if *ok {
                                     let _ = qloop
                                         .hooks
-                                        .run(&HookEvent::AfterToolUse {
-                                            tool: matching.name.clone(),
-                                            input: matching.input.clone(),
-                                            output: output.clone(),
-                                            ok: *ok,
-                                        })
+                                        .run_with_abort(
+                                            &HookEvent::AfterToolUse {
+                                                tool: matching.name.clone(),
+                                                input: matching.input.clone(),
+                                                output: output.clone(),
+                                                ok: *ok,
+                                            },
+                                            &abort,
+                                        )
                                         .await;
                                 } else {
                                     let _ = qloop
                                         .hooks
-                                        .run(&HookEvent::PostToolUseFailure {
-                                            tool: matching.name.clone(),
-                                            input: matching.input.clone(),
-                                            error: output
-                                                .get("error")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("unknown")
-                                                .into(),
-                                        })
+                                        .run_with_abort(
+                                            &HookEvent::PostToolUseFailure {
+                                                tool: matching.name.clone(),
+                                                input: matching.input.clone(),
+                                                error: output
+                                                    .get("error")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("unknown")
+                                                    .into(),
+                                            },
+                                            &abort,
+                                        )
                                         .await;
                                 }
                             }
@@ -899,9 +1177,23 @@ async fn drive(
                 })
                 .collect(),
         };
-        if let Err(e) = push(&qloop.store, next_user) {
-            let _ = tx.unbounded_send(Err(e));
-            return;
+        {
+            let Ok(_fence) = repair_fence.lock() else {
+                let _ =
+                    tx.unbounded_send(Err(AgentError::other("query repair fence lock poisoned")));
+                return;
+            };
+            // DriverStream::drop sets abort before taking this same fence. If
+            // hard-drop won the race, its synthetic result is canonical and
+            // this driver must not append a duplicate real result afterward.
+            if abort.is_aborted() {
+                return;
+            }
+            if let Err(e) = push(&qloop.store, next_user) {
+                let _ = tx.unbounded_send(Err(e));
+                return;
+            }
+            repair_guard.disarm();
         }
 
         // A consumer-gone / executor-error / abort break repaired the store
@@ -1037,6 +1329,9 @@ async fn consume_turn(
     let mut accumulated_thinking: Option<String> = None;
 
     while let Some(item) = upstream.next().await {
+        // Pulse before forwarding so a slow host/UI consumer cannot make a
+        // healthy provider (including a nested Task loop) look inactive.
+        abort.pulse();
         if abort.is_aborted() {
             let _ = tx.unbounded_send(Err(AgentError::Aborted(
                 abort.reason().unwrap_or_else(|| "aborted".into()),
@@ -1870,6 +2165,41 @@ mod tests {
         abort: AbortController,
     }
 
+    #[derive(Debug)]
+    struct PendingDropTool {
+        started: Arc<tokio::sync::Notify>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Tool for PendingDropTool {
+        fn name(&self) -> &str {
+            "pending"
+        }
+        fn description(&self) -> &str {
+            "waits until its task is hard-cancelled"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn call(
+            &self,
+            _ctx: &ToolUseContext,
+            _input: serde_json::Value,
+        ) -> Result<serde_json::Value, AgentError> {
+            struct DropProbe(Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for DropProbe {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+            let _probe = DropProbe(self.dropped.clone());
+            self.started.notify_one();
+            futures::future::pending::<()>().await;
+            unreachable!()
+        }
+    }
+
     #[async_trait]
     impl Tool for AbortingTool {
         fn name(&self) -> &str {
@@ -2279,6 +2609,65 @@ mod tests {
                 "tool_use {id} must have a matching tool_result (no dangling)"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn hard_drop_reaches_nested_tool_quiescence_and_repairs_store() {
+        let provider = Arc::new(MockProvider::with_turns(vec![vec![
+            Event::ToolUse {
+                id: "tu_pending".into(),
+                name: "pending".into(),
+                input: serde_json::json!({}),
+            },
+            Event::Result {
+                data: ResultData {
+                    stop_reason: Some("tool_use".into()),
+                    ..Default::default()
+                },
+            },
+        ]]));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(PendingDropTool {
+            started: started.clone(),
+            dropped: dropped.clone(),
+        }));
+        let abort = AbortController::new();
+        let activity = abort.activity();
+        let qloop = QueryLoop::builder(provider, "mock")
+            .tools(Arc::new(registry))
+            .permissions(Arc::new(
+                PermissionManager::new().allow(RuleSource::User, "pending"),
+            ))
+            .build();
+        let store = qloop.store.clone();
+        let stream = qloop.run("go", abort).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+            .await
+            .expect("pending tool started");
+
+        drop(stream);
+
+        let has_repair = store.lock().unwrap().iter().any(|message| match message {
+            Message::User { content, .. } => content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::ToolResult { tool_use_id, is_error: true, .. }
+                        if tool_use_id == "tu_pending"
+                )
+            }),
+            _ => false,
+        });
+        assert!(has_repair, "store repair must be synchronous with drop");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            activity.wait_for_quiescence(),
+        )
+        .await
+        .expect("nested driver/tool cleanup reached quiescence");
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(activity.active_workers(), 0);
     }
 
     #[tokio::test]
@@ -3164,5 +3553,133 @@ mod tests {
         let captured = systems.lock().unwrap();
         let first = captured[0].as_deref().expect("compact call has a system");
         assert!(first.contains("ALWAYS TAG REQUIREMENT BULLETS"));
+    }
+
+    #[tokio::test]
+    async fn driver_stream_surfaces_driver_panics() {
+        let (tx, rx) = mpsc::unbounded();
+        let driver = tokio::spawn(async move {
+            drop(tx);
+            panic!("driver panic probe");
+        });
+        let mut stream = DriverStream {
+            rx,
+            driver: Some(driver),
+            abort: AbortController::new(),
+            store: Arc::new(Mutex::new(MessageStore::new())),
+            repair_from: 0,
+            repair_fence: Arc::new(Mutex::new(())),
+            quiescence: None,
+            terminal_error: None,
+            await_quiescence: true,
+            completed: false,
+        };
+
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("query driver task failed"));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn driver_stream_holds_terminal_error_until_quiescent() {
+        let abort = AbortController::new();
+        let work = abort.activity().track_worker();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let worker_release = release.clone();
+        tokio::spawn(async move {
+            worker_release.notified().await;
+            drop(work);
+        });
+        let (tx, rx) = mpsc::unbounded();
+        tx.unbounded_send(Err(AgentError::other("terminal probe")))
+            .unwrap();
+        drop(tx);
+        let driver = tokio::spawn(async {});
+        let mut stream = DriverStream {
+            rx,
+            driver: Some(driver),
+            abort,
+            store: Arc::new(Mutex::new(MessageStore::new())),
+            repair_from: 0,
+            repair_fence: Arc::new(Mutex::new(())),
+            quiescence: None,
+            terminal_error: None,
+            await_quiescence: true,
+            completed: false,
+        };
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), stream.next())
+                .await
+                .is_err(),
+            "terminal error must wait for nested cleanup"
+        );
+        release.notify_one();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("terminal probe"));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn dropping_driver_stream_repairs_store_synchronously() {
+        let store = Arc::new(Mutex::new(MessageStore::new()));
+        store
+            .lock()
+            .unwrap()
+            .push(Message::Assistant {
+                header: Header::new(),
+                content: vec![ContentBlock::ToolUse {
+                    id: "hard-drop-tool".into(),
+                    name: "slow".into(),
+                    input: serde_json::json!({}),
+                }],
+            })
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded();
+        let driver = tokio::spawn(async move {
+            let _tx = tx;
+            futures::future::pending::<()>().await;
+        });
+        let stream = DriverStream {
+            rx,
+            driver: Some(driver),
+            abort: AbortController::new(),
+            store: store.clone(),
+            repair_from: 0,
+            repair_fence: Arc::new(Mutex::new(())),
+            quiescence: None,
+            terminal_error: None,
+            await_quiescence: true,
+            completed: false,
+        };
+
+        drop(stream);
+        drop(PendingToolRepair::new(
+            store.clone(),
+            vec!["hard-drop-tool".into()],
+        ));
+
+        let repair_count = store
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|message| match message {
+                Message::User { content, .. } => Some(content),
+                _ => None,
+            })
+            .flatten()
+            .filter(|block| {
+                matches!(
+                    block,
+                    ContentBlock::ToolResult { tool_use_id, is_error: true, .. }
+                        if tool_use_id == "hard-drop-tool"
+                )
+            })
+            .count();
+        assert_eq!(repair_count, 1, "hard-drop repair must be idempotent");
     }
 }

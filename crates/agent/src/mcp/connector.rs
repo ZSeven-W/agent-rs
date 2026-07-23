@@ -24,8 +24,8 @@
 //! Our [`Connection::call_tool`] returns a single `serde_json::Value`.
 //! Projection rules (most-specific wins):
 //!
-//! 1. If `is_error == Some(true)` → return `Err(LifecycleError::Connector(...))`
-//!    so the host's permission/hook machinery sees a structured error.
+//! 1. If `is_error == Some(true)` → return `Err(LifecycleError::Tool(...))` so
+//!    hosts can distinguish a definite terminal response from transport loss.
 //! 2. If `structured_content` is `Some` → return it verbatim.
 //! 3. Else → return `serde_json::to_value(&content)` (an array of
 //!    `{type, text|image|...}` blocks).
@@ -484,7 +484,7 @@ fn project_tool_result(
                 }
             })
             .unwrap_or_else(|| "<no detail>".to_string());
-        return Err(LifecycleError::Connector(format!(
+        return Err(LifecycleError::Tool(format!(
             "MCP server '{server_name}' tool '{tool_name}' returned isError=true: {detail}"
         )));
     }
@@ -492,7 +492,7 @@ fn project_tool_result(
         return Ok(structured);
     }
     serde_json::to_value(&result.content).map_err(|e| {
-        LifecycleError::Connector(format!(
+        LifecycleError::Tool(format!(
             "serializing tool '{tool_name}' content from '{server_name}' failed: {e}"
         ))
     })
@@ -568,14 +568,14 @@ mod tests {
     }
 
     #[test]
-    fn project_tool_result_is_error_returns_connector_err() {
+    fn project_tool_result_is_error_returns_terminal_tool_err() {
         let mut r = CallToolResult::default();
         r.is_error = Some(true);
         r.structured_content = Some(serde_json::json!({"reason": "boom"}));
         let err = project_tool_result("calc", "demo", r).expect_err("should err");
         let msg = match err {
-            LifecycleError::Connector(m) => m,
-            other => panic!("expected Connector, got {other:?}"),
+            LifecycleError::Tool(m) => m,
+            other => panic!("expected Tool, got {other:?}"),
         };
         assert!(msg.contains("isError=true"));
         assert!(msg.contains("boom"));
@@ -593,8 +593,8 @@ mod tests {
         r.structured_content = Some(serde_json::json!({}));
         let err = project_tool_result("calc", "demo", r).expect_err("should err");
         let msg = match err {
-            LifecycleError::Connector(m) => m,
-            other => panic!("expected Connector, got {other:?}"),
+            LifecycleError::Tool(m) => m,
+            other => panic!("expected Tool, got {other:?}"),
         };
         assert!(msg.contains("isError=true"));
         assert!(msg.contains("{}"), "got: {msg}");
@@ -608,8 +608,8 @@ mod tests {
         // No content, no structured_content.
         let err = project_tool_result("ghost", "demo", r).expect_err("should err");
         let msg = match err {
-            LifecycleError::Connector(m) => m,
-            other => panic!("expected Connector, got {other:?}"),
+            LifecycleError::Tool(m) => m,
+            other => panic!("expected Tool, got {other:?}"),
         };
         assert!(msg.contains("<no detail>"), "got: {msg}");
     }

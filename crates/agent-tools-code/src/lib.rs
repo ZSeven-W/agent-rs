@@ -60,6 +60,8 @@ pub mod discovery;
 pub mod policy;
 
 mod compress;
+#[path = "fs-supervision.rs"]
+mod fs_supervision;
 mod process;
 
 #[cfg(feature = "fs")]

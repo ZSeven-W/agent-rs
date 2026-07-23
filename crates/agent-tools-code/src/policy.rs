@@ -22,6 +22,7 @@
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+use agent::abort::AbortController;
 use async_trait::async_trait;
 
 /// Performs the actual filesystem MUTATION on behalf of the fs tools, once a
@@ -43,6 +44,43 @@ pub trait FsSink: std::fmt::Debug + Send + Sync {
     /// Remove `path`. `is_dir` selects dir vs file removal; `recursive` removes
     /// a non-empty directory tree.
     async fn remove(&self, path: &Path, recursive: bool, is_dir: bool) -> std::io::Result<()>;
+
+    /// Tracked mutation variants let hosts keep detached OS workers visible to
+    /// the root turn after the calling tool future has been cancelled. Sinks
+    /// without detached work inherit the direct implementations above.
+    async fn write_file_tracked(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        _abort: &AbortController,
+    ) -> std::io::Result<()> {
+        self.write_file(path, bytes).await
+    }
+    async fn create_dir_tracked(
+        &self,
+        path: &Path,
+        recursive: bool,
+        _abort: &AbortController,
+    ) -> std::io::Result<()> {
+        self.create_dir(path, recursive).await
+    }
+    async fn rename_tracked(
+        &self,
+        from: &Path,
+        to: &Path,
+        _abort: &AbortController,
+    ) -> std::io::Result<()> {
+        self.rename(from, to).await
+    }
+    async fn remove_tracked(
+        &self,
+        path: &Path,
+        recursive: bool,
+        is_dir: bool,
+        _abort: &AbortController,
+    ) -> std::io::Result<()> {
+        self.remove(path, recursive, is_dir).await
+    }
 }
 
 /// Default sink: perform the mutation in-process via `tokio::fs`. Identical to
@@ -75,6 +113,40 @@ impl FsSink for DirectFsSink {
         } else {
             tokio::fs::remove_file(path).await
         }
+    }
+
+    async fn write_file_tracked(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        abort: &AbortController,
+    ) -> std::io::Result<()> {
+        crate::fs_supervision::write_file(path, bytes, abort).await
+    }
+    async fn create_dir_tracked(
+        &self,
+        path: &Path,
+        recursive: bool,
+        abort: &AbortController,
+    ) -> std::io::Result<()> {
+        crate::fs_supervision::create_dir(path, recursive, abort).await
+    }
+    async fn rename_tracked(
+        &self,
+        from: &Path,
+        to: &Path,
+        abort: &AbortController,
+    ) -> std::io::Result<()> {
+        crate::fs_supervision::rename(from, to, abort).await
+    }
+    async fn remove_tracked(
+        &self,
+        path: &Path,
+        recursive: bool,
+        is_dir: bool,
+        abort: &AbortController,
+    ) -> std::io::Result<()> {
+        crate::fs_supervision::remove(path, recursive, is_dir, abort).await
     }
 }
 
@@ -238,6 +310,44 @@ impl WorkspacePolicy {
     }
     pub async fn remove(&self, path: &Path, recursive: bool, is_dir: bool) -> std::io::Result<()> {
         self.fs_sink.remove(path, recursive, is_dir).await
+    }
+
+    pub async fn write_file_tracked(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        abort: &AbortController,
+    ) -> std::io::Result<()> {
+        self.fs_sink.write_file_tracked(path, bytes, abort).await
+    }
+    pub async fn create_dir_tracked(
+        &self,
+        path: &Path,
+        recursive: bool,
+        abort: &AbortController,
+    ) -> std::io::Result<()> {
+        self.fs_sink
+            .create_dir_tracked(path, recursive, abort)
+            .await
+    }
+    pub async fn rename_tracked(
+        &self,
+        from: &Path,
+        to: &Path,
+        abort: &AbortController,
+    ) -> std::io::Result<()> {
+        self.fs_sink.rename_tracked(from, to, abort).await
+    }
+    pub async fn remove_tracked(
+        &self,
+        path: &Path,
+        recursive: bool,
+        is_dir: bool,
+        abort: &AbortController,
+    ) -> std::io::Result<()> {
+        self.fs_sink
+            .remove_tracked(path, recursive, is_dir, abort)
+            .await
     }
 
     pub fn with_follow_symlinks(mut self, follow: bool) -> Self {

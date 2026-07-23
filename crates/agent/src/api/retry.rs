@@ -393,10 +393,13 @@ where
             prev_delay = delay;
             if let Some(h) = hooks {
                 let _ = h
-                    .run(&HookEvent::OnRetry {
-                        attempt,
-                        reason: format!("{classification:?}"),
-                    })
+                    .run_with_abort(
+                        &HookEvent::OnRetry {
+                            attempt,
+                            reason: format!("{classification:?}"),
+                        },
+                        abort,
+                    )
                     .await;
             }
             if !delay.is_zero() {

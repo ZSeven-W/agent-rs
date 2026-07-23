@@ -126,7 +126,7 @@ impl Tool for NotebookEditTool {
     fn safety_class(&self) -> SafetyClass {
         SafetyClass::Mutating
     }
-    async fn call(&self, _ctx: &ToolUseContext, input: Value) -> Result<Value, AgentError> {
+    async fn call(&self, ctx: &ToolUseContext, input: Value) -> Result<Value, AgentError> {
         let parsed: NotebookEditInput = serde_json::from_value(input)
             .map_err(|e| AgentError::other(format!("NotebookEdit invalid input: {e}")))?;
         let resolved = self
@@ -186,7 +186,7 @@ impl Tool for NotebookEditTool {
                 cells.insert(position, cell);
                 let out = serialize_notebook(&nb)?;
                 self.policy
-                    .write_file(&resolved, out.as_bytes())
+                    .write_file_tracked(&resolved, out.as_bytes(), &ctx.abort)
                     .await
                     .map_err(|e| io_to_agent_err("write", &parsed.path, e))?;
                 Ok(json!({
@@ -229,7 +229,7 @@ impl Tool for NotebookEditTool {
                     .map(|s| s.to_string());
                 let out = serialize_notebook(&nb)?;
                 self.policy
-                    .write_file(&resolved, out.as_bytes())
+                    .write_file_tracked(&resolved, out.as_bytes(), &ctx.abort)
                     .await
                     .map_err(|e| io_to_agent_err("write", &parsed.path, e))?;
                 Ok(json!({
@@ -249,7 +249,7 @@ impl Tool for NotebookEditTool {
                     .map(|s| s.to_string());
                 let out = serialize_notebook(&nb)?;
                 self.policy
-                    .write_file(&resolved, out.as_bytes())
+                    .write_file_tracked(&resolved, out.as_bytes(), &ctx.abort)
                     .await
                     .map_err(|e| io_to_agent_err("write", &parsed.path, e))?;
                 Ok(json!({

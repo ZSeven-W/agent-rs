@@ -12,13 +12,15 @@
 //! how the underlying tasks finished.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::channel::mpsc;
 use futures::stream::StreamExt;
 
+use crate::abort::AbortController;
 use crate::error::AgentError;
-use crate::stream::{Event, EventStream};
-use crate::tool::{ToolRegistry, ToolUseContext};
+use crate::stream::{Event, EventStream, TaskEventStream};
+use crate::tool::{SafetyClass, ToolRegistry, ToolUseContext};
 
 /// One requested tool call coming out of an LLM assistant turn.
 #[derive(Debug, Clone, PartialEq)]
@@ -30,6 +32,38 @@ pub struct RequestedToolUse {
 
 #[derive(Debug, Clone)]
 pub struct ToolExecutor;
+
+/// Give tools that observe `ctx.abort` time to run their own cleanup before
+/// the final drop-cancels fallback aborts their Tokio task. This is a global
+/// deadline for the whole batch, not a per-tool delay.
+const ABORT_DRAIN_GRACE: Duration = Duration::from_secs(7);
+
+/// A mutating tool that is dropped before returning may already have handed
+/// work to an OS thread, actor, browser extension, or remote server. Local
+/// worker-count quiescence cannot prove that work stopped, so scheduler hosts
+/// must keep the turn fail-closed until a human reviews it.
+struct UnresolvedEffectOnDrop {
+    abort: AbortController,
+    armed: bool,
+}
+
+impl UnresolvedEffectOnDrop {
+    fn new(abort: AbortController) -> Self {
+        Self { abort, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for UnresolvedEffectOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.abort.mark_unresolved_external_work();
+        }
+    }
+}
 
 impl ToolExecutor {
     /// Dispatch every tool use concurrently against `registry` using
@@ -57,8 +91,12 @@ impl ToolExecutor {
             return Box::new(rx);
         }
 
-        tokio::spawn(forward(tool_uses, registry, ctx, max_concurrent, tx));
-        Box::new(rx)
+        let forward_work = ctx.abort.activity().track_worker();
+        let forward = tokio::spawn(async move {
+            let _work = forward_work;
+            forward(tool_uses, registry, ctx, max_concurrent, tx).await;
+        });
+        Box::new(TaskEventStream::new(rx, forward, "tool dispatch"))
     }
 }
 
@@ -77,24 +115,45 @@ async fn forward(
         let registry = registry.clone();
         let ctx = ctx.clone();
         let panic_id = req.id.clone();
+        let tool_work = ctx.abort.activity().track_worker();
         // Each tool runs on its OWN spawned task: previously all buffered
         // futures were polled cooperatively on this one task, so a
         // CPU-bound or blocking-sync tool starved every concurrent peer.
         let handle = tokio::spawn(async move {
+            let _work = tool_work;
             let RequestedToolUse { id, name, input } = req;
             match registry.get(&name) {
-                Some(tool) => match tool.call(&ctx, input).await {
-                    Ok(output) => Event::ToolResult {
-                        id,
-                        ok: true,
-                        output,
-                    },
-                    Err(err) => Event::ToolResult {
-                        id,
-                        ok: false,
-                        output: serde_json::json!({ "error": err.to_string() }),
-                    },
-                },
+                Some(tool) => {
+                    ctx.abort.pulse();
+                    let mut unresolved = if !matches!(tool.safety_class(), SafetyClass::ReadOnly) {
+                        // Mark before entering user/tool code. A panic, abort,
+                        // or lost result must still fail closed for replay.
+                        ctx.abort.mark_side_effect_risk();
+                        Some(UnresolvedEffectOnDrop::new(ctx.abort.clone()))
+                    } else {
+                        None
+                    };
+                    let result = tool.call(&ctx, input).await;
+                    if let Some(unresolved) = &mut unresolved {
+                        // Returning from the tool is the adapter's declaration
+                        // that its mutation reached a terminal response. A
+                        // dropped/panicked call keeps the stronger latch set.
+                        unresolved.disarm();
+                    }
+                    ctx.abort.pulse();
+                    match result {
+                        Ok(output) => Event::ToolResult {
+                            id,
+                            ok: true,
+                            output,
+                        },
+                        Err(err) => Event::ToolResult {
+                            id,
+                            ok: false,
+                            output: serde_json::json!({ "error": err.to_string() }),
+                        },
+                    }
+                }
                 None => Event::ToolResult {
                     id,
                     ok: false,
@@ -131,19 +190,38 @@ async fn forward(
     });
 
     let mut buffered = stream.buffered(max_concurrent.max(1));
+    let mut abort_deadline = None;
     loop {
-        tokio::select! {
-            biased;
-            _ = abort.cancelled() => {
-                let _ = tx.unbounded_send(Err(AgentError::Aborted(
-                    abort.reason().unwrap_or_else(|| "tool dispatch aborted".into()),
-                )));
-                return;
-            }
-            next = buffered.next() => {
-                let Some(event) = next else { break };
-                if tx.unbounded_send(Ok(event)).is_err() {
+        if let Some(deadline) = abort_deadline {
+            match tokio::time::timeout_at(deadline, buffered.next()).await {
+                Ok(Some(event)) => {
+                    if tx.unbounded_send(Ok(event)).is_err() {
+                        return;
+                    }
+                }
+                Ok(None) | Err(_) => {
+                    let _ = tx.unbounded_send(Err(AgentError::Aborted(
+                        abort
+                            .reason()
+                            .unwrap_or_else(|| "tool dispatch aborted".into()),
+                    )));
                     return;
+                }
+            }
+        } else {
+            tokio::select! {
+                biased;
+                _ = abort.cancelled() => {
+                    // Keep polling the tool wrappers while their cooperative
+                    // abort cleanup runs. The wrapper KillOnDrop remains the
+                    // bounded hard-stop fallback when this deadline expires.
+                    abort_deadline = Some(tokio::time::Instant::now() + ABORT_DRAIN_GRACE);
+                }
+                next = buffered.next() => {
+                    let Some(event) = next else { break };
+                    if tx.unbounded_send(Ok(event)).is_err() {
+                        return;
+                    }
                 }
             }
         }
@@ -152,7 +230,7 @@ async fn forward(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -169,6 +247,41 @@ mod tests {
         name: String,
         sleep_ms: u64,
         completed: Arc<AtomicUsize>,
+    }
+
+    #[derive(Debug)]
+    struct PendingTool {
+        started: Arc<tokio::sync::Notify>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Tool for PendingTool {
+        fn name(&self) -> &str {
+            "pending"
+        }
+        fn description(&self) -> &str {
+            "never completes"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn call(
+            &self,
+            _ctx: &ToolUseContext,
+            _input: serde_json::Value,
+        ) -> Result<serde_json::Value, AgentError> {
+            struct DropProbe(Arc<AtomicBool>);
+            impl Drop for DropProbe {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+            let _probe = DropProbe(self.dropped.clone());
+            self.started.notify_one();
+            futures::future::pending::<()>().await;
+            unreachable!()
+        }
     }
 
     #[async_trait]
@@ -203,6 +316,42 @@ mod tests {
             }));
         }
         Arc::new(r)
+    }
+
+    #[tokio::test]
+    async fn dropping_dispatch_stream_hard_cancels_the_tool_task() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(PendingTool {
+            started: started.clone(),
+            dropped: dropped.clone(),
+        }));
+        let ctx = ToolUseContext::new("/tmp");
+        let activity = ctx.abort.activity();
+        let stream = ToolExecutor::dispatch(
+            vec![RequestedToolUse {
+                id: "p1".into(),
+                name: "pending".into(),
+                input: serde_json::json!({}),
+            }],
+            Arc::new(registry),
+            ctx,
+            1,
+        );
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("tool started");
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(1), activity.wait_for_quiescence())
+            .await
+            .expect("dispatch reached quiescence");
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(activity.active_workers(), 0);
+        assert!(
+            activity.unresolved_external_work(),
+            "dropping an unclassified tool cannot prove its external work stopped"
+        );
     }
 
     #[tokio::test]
@@ -314,6 +463,7 @@ mod tests {
             input: serde_json::json!({}),
         }];
         let ctx = ToolUseContext::new("/tmp");
+        let activity = ctx.abort.activity();
         let mut stream = ToolExecutor::dispatch(tool_uses, registry, ctx, 4);
         let item = stream.next().await.unwrap().unwrap();
         match item {
@@ -327,6 +477,10 @@ mod tests {
             }
             other => panic!("expected failed ToolResult, got {other:?}"),
         }
+        assert!(
+            !activity.unresolved_external_work(),
+            "a tool that returned reached its declared terminal boundary"
+        );
     }
 
     #[tokio::test]

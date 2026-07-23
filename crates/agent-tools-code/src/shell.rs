@@ -30,6 +30,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+use agent::abort::TurnActivity;
 use agent::error::AgentError;
 use agent::tool::{SafetyClass, Tool, ToolUseContext};
 use async_trait::async_trait;
@@ -52,6 +53,8 @@ const LONG_RUNNING_TIMEOUT_SECS: u64 = 5 * 60;
 /// Hard ceiling regardless of caller request. Stops a runaway
 /// command from pinning a runtime worker for an hour.
 const MAX_TIMEOUT_SECS: u64 = 10 * 60;
+const PROCESS_TREE_POLL: Duration = Duration::from_millis(20);
+const PROCESS_TREE_CLEANUP_GRACE: Duration = Duration::from_secs(5);
 
 /// Pick the default timeout when the caller didn't set `timeout_secs`. Network
 /// and build commands get [`LONG_RUNNING_TIMEOUT_SECS`] so a normal `git clone`
@@ -361,6 +364,14 @@ impl Tool for BashTool {
             .spawn()
             .map_err(|e| AgentError::other(format!("Bash spawn failed: {e}")))?;
 
+        // Arm descendant cleanup before doing anything that can return early.
+        // `kill_on_drop` covers only the direct child; this guard supplies the
+        // platform tree fallback for aborts, timeouts, hard future drops, and
+        // successful leaders that leave background children behind.
+        let child_pid = child.id();
+        let abort = ctx.abort.clone();
+        let mut process_tree_guard = ProcessTreeGuard::new(child_pid, abort.activity());
+
         let mut stdout = child
             .stdout
             .take()
@@ -370,61 +381,61 @@ impl Tool for BashTool {
             .take()
             .ok_or_else(|| AgentError::other("Bash spawn missing stderr pipe"))?;
 
-        // Capture the child pid for the kill-group fallback below
-        // (kill_on_drop only kills the direct child, not the group).
-        #[cfg(unix)]
-        let child_pid: Option<u32> = child.id();
+        let stdout_activity = abort.activity();
+        let stderr_activity = stdout_activity.clone();
 
-        let abort = ctx.abort.clone();
-        let exec = async move {
-            let read_out = read_capped(&mut stdout, MAX_OUTPUT_BYTES);
-            let read_err = read_capped(&mut stderr, MAX_OUTPUT_BYTES);
-            let (a, b) = tokio::join!(read_out, read_err);
-            let (out_bytes, out_truncated) =
-                a.map_err(|e| AgentError::other(format!("Bash stdout read failed: {e}")))?;
-            let (err_bytes, err_truncated) =
-                b.map_err(|e| AgentError::other(format!("Bash stderr read failed: {e}")))?;
-            let status = child
-                .wait()
-                .await
-                .map_err(|e| AgentError::other(format!("Bash wait failed: {e}")))?;
-            Ok::<(Vec<u8>, bool, Vec<u8>, bool, std::process::ExitStatus), AgentError>((
-                out_bytes,
-                out_truncated,
-                err_bytes,
-                err_truncated,
-                status,
-            ))
-        };
+        enum Completion {
+            Finished(Result<(Vec<u8>, bool, Vec<u8>, bool, std::process::ExitStatus), AgentError>),
+            Aborted,
+            TimedOut,
+        }
 
         // Wait for either: command finishes, timeout fires, or
         // host abort fires. The `kill_on_drop(true)` flag kills the
-        // direct child when the future is dropped; on Unix, we
-        // also `kill -9 -<pgid>` to terminate the whole process
-        // group so descendants don't outlive the timeout.
-        let (stdout_bytes, stdout_truncated, stderr_bytes, stderr_truncated, status) = tokio::select! {
-            biased;
-            _ = abort.cancelled() => {
-                #[cfg(unix)]
-                kill_process_group(child_pid);
-                return Err(AgentError::Aborted(
-                    abort.reason().unwrap_or_else(|| "aborted".into()),
-                ));
-            }
-            result = timeout(Duration::from_secs(timeout_secs), exec) => {
-                match result {
-                    Ok(Ok(quintuple)) => quintuple,
-                    Ok(Err(e)) => return Err(e),
-                    Err(_) => {
-                        #[cfg(unix)]
-                        kill_process_group(child_pid);
-                        return Err(AgentError::other(format!(
-                            "Bash command timed out after {timeout_secs}s. no shell_id was created for this foreground Bash call; BashOutput can only poll commands started with BashRun. For long-running commands, start them with BashRun and then poll that shell_id with BashOutput."
-                        )));
-                    }
-                }
+        // direct child when the future is dropped; the tree guard also kills
+        // the Unix process group or invokes Windows `taskkill /T`. Commands
+        // that intentionally need a surviving process must use `BashRun`.
+        let completion = {
+            let exec = async {
+                let read_out = read_capped(&mut stdout, MAX_OUTPUT_BYTES, &stdout_activity);
+                let read_err = read_capped(&mut stderr, MAX_OUTPUT_BYTES, &stderr_activity);
+                let (a, b, status) = tokio::join!(read_out, read_err, child.wait());
+                let (out_bytes, out_truncated) =
+                    a.map_err(|e| AgentError::other(format!("Bash stdout read failed: {e}")))?;
+                let (err_bytes, err_truncated) =
+                    b.map_err(|e| AgentError::other(format!("Bash stderr read failed: {e}")))?;
+                let status =
+                    status.map_err(|e| AgentError::other(format!("Bash wait failed: {e}")))?;
+                Ok((out_bytes, out_truncated, err_bytes, err_truncated, status))
+            };
+            tokio::pin!(exec);
+            tokio::select! {
+                biased;
+                _ = abort.cancelled() => Completion::Aborted,
+                _ = tokio::time::sleep(Duration::from_secs(timeout_secs)) => Completion::TimedOut,
+                result = &mut exec => Completion::Finished(result),
             }
         };
+
+        let (stdout_bytes, stdout_truncated, stderr_bytes, stderr_truncated, status) =
+            match completion {
+                Completion::Finished(result) => {
+                    process_tree_guard.cleanup_after_leader_exit().await;
+                    result?
+                }
+                Completion::Aborted => {
+                    process_tree_guard.terminate_and_reap(&mut child).await;
+                    return Err(AgentError::Aborted(
+                        abort.reason().unwrap_or_else(|| "aborted".into()),
+                    ));
+                }
+                Completion::TimedOut => {
+                    process_tree_guard.terminate_and_reap(&mut child).await;
+                    return Err(AgentError::other(format!(
+                        "Bash command timed out after {timeout_secs}s. no shell_id was created for this foreground Bash call; BashOutput can only poll commands started with BashRun. For long-running commands, start them with BashRun and then poll that shell_id with BashOutput."
+                    )));
+                }
+            };
 
         let stdout_str = format_capture(stdout_bytes, stdout_truncated);
         let stderr_str = format_capture(stderr_bytes, stderr_truncated);
@@ -453,7 +464,11 @@ impl Tool for BashTool {
 ///
 /// `cap == 0` is treated as "discard everything but track that the
 /// stream was non-empty", so the buffer can never grow.
-async fn read_capped<R>(reader: &mut R, cap: usize) -> std::io::Result<(Vec<u8>, bool)>
+async fn read_capped<R>(
+    reader: &mut R,
+    cap: usize,
+    activity: &TurnActivity,
+) -> std::io::Result<(Vec<u8>, bool)>
 where
     R: AsyncRead + Unpin,
 {
@@ -465,6 +480,7 @@ where
             if n == 0 {
                 break;
             }
+            activity.pulse();
             total = total.saturating_add(n as u64);
         }
         return Ok((Vec::new(), total > 0));
@@ -476,6 +492,7 @@ where
         if n == 0 {
             break;
         }
+        activity.pulse();
         total = total.saturating_add(n as u64);
         for &b in &tmp[..n] {
             if tail.len() == cap {
@@ -521,28 +538,145 @@ fn format_capture(bytes: Vec<u8>, truncated: bool) -> String {
     }
 }
 
-/// Send SIGKILL to the entire process group rooted at `pid` via
-/// `/bin/kill -9 -<pid>`. We shell out instead of pulling `nix` /
-/// `libc` because (a) it works without an `unsafe` block, and (b)
-/// `kill(1)` is on every POSIX target. Best-effort: failures are
-/// logged at `debug` and swallowed so the caller's error path isn't
-/// shadowed.
+struct ProcessTreeGuard {
+    pid: Option<u32>,
+    activity: TurnActivity,
+    armed: bool,
+}
+
+impl ProcessTreeGuard {
+    fn new(pid: Option<u32>, activity: TurnActivity) -> Self {
+        Self {
+            pid,
+            activity,
+            armed: true,
+        }
+    }
+
+    async fn cleanup_after_leader_exit(&mut self) {
+        let signal_succeeded = kill_process_tree(self.pid);
+        let tree_exit_proven = wait_for_process_tree_exit(self.pid, signal_succeeded).await;
+        self.complete_cleanup(tree_exit_proven);
+    }
+
+    async fn terminate_and_reap(&mut self, child: &mut tokio::process::Child) {
+        let signal_succeeded = kill_process_tree(self.pid);
+        let _ = child.start_kill();
+        let direct_child_reaped = matches!(
+            timeout(PROCESS_TREE_CLEANUP_GRACE, child.wait()).await,
+            Ok(Ok(_))
+        );
+        let tree_exit_proven = wait_for_process_tree_exit(self.pid, signal_succeeded).await;
+        self.complete_cleanup(direct_child_reaped && signal_succeeded && tree_exit_proven);
+    }
+
+    fn complete_cleanup(&mut self, proven: bool) {
+        if !proven {
+            self.activity.mark_unresolved_external_work();
+        }
+        self.armed = false;
+    }
+}
+
+impl Drop for ProcessTreeGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = kill_process_tree(self.pid);
+            // A synchronous drop can signal the tree but cannot wait for an
+            // exit proof. Keep scheduler replay fail-closed.
+            self.activity.mark_unresolved_external_work();
+        }
+    }
+}
+
+/// Send SIGKILL to the entire process group rooted at `pid`. Failures are
+/// reported to the guard so unprovable cleanup latches the turn as unresolved
+/// without shadowing the caller's original error.
 #[cfg(unix)]
-fn kill_process_group(pid: Option<u32>) {
-    let Some(pid) = pid else { return };
-    // Negative PID = process group with that leader.
-    let arg = format!("-{pid}");
-    match std::process::Command::new("/bin/kill")
-        .arg("-9")
-        .arg(&arg)
+fn kill_process_tree(pid: Option<u32>) -> bool {
+    let Some(pid) = pid else {
+        return false;
+    };
+    matches!(
+        crate::process::kill_process_group(pid),
+        Ok(crate::process::ProcessGroupSignal::Delivered)
+    )
+}
+
+/// Best-effort Windows descendant cleanup. `kill_on_drop` only terminates the
+/// shell itself, whereas `/T` walks and terminates its child process tree.
+#[cfg(windows)]
+fn kill_process_tree(pid: Option<u32>) -> bool {
+    let Some(pid) = pid else { return false };
+    let pid = pid.to_string();
+    match std::process::Command::new("taskkill")
+        .args(["/F", "/T", "/PID", &pid])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
     {
-        Ok(s) if s.success() => {}
-        Ok(s) => tracing::debug!(pgid = pid, status = ?s, "/bin/kill -9 returned non-zero"),
-        Err(e) => tracing::debug!(pgid = pid, error = %e, "/bin/kill -9 spawn failed"),
+        Ok(s) if s.success() => true,
+        Ok(s) => {
+            tracing::debug!(pid, status = ?s, "taskkill /T returned non-zero");
+            false
+        }
+        Err(e) => {
+            tracing::debug!(pid, error = %e, "taskkill /T spawn failed");
+            false
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn kill_process_tree(_pid: Option<u32>) -> bool {
+    false
+}
+
+async fn wait_for_process_tree_exit(pid: Option<u32>, signal_succeeded: bool) -> bool {
+    #[cfg(unix)]
+    {
+        let _ = signal_succeeded;
+        let deadline = tokio::time::Instant::now() + PROCESS_TREE_CLEANUP_GRACE;
+        loop {
+            match unix_process_tree_state(pid) {
+                ProcessTreeState::Gone => return true,
+                ProcessTreeState::Unknown => return false,
+                ProcessTreeState::Alive if tokio::time::Instant::now() >= deadline => {
+                    return false;
+                }
+                ProcessTreeState::Alive => tokio::time::sleep(PROCESS_TREE_POLL).await,
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    return signal_succeeded;
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (pid, signal_succeeded);
+        false
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessTreeState {
+    Alive,
+    Gone,
+    Unknown,
+}
+
+#[cfg(unix)]
+fn unix_process_tree_state(pid: Option<u32>) -> ProcessTreeState {
+    let Some(pid) = pid else {
+        return ProcessTreeState::Unknown;
+    };
+    match crate::process::process_group_state(pid) {
+        Ok(crate::process::ProcessGroupState::Alive) => ProcessTreeState::Alive,
+        Ok(crate::process::ProcessGroupState::Gone) => ProcessTreeState::Gone,
+        Err(_) => ProcessTreeState::Unknown,
     }
 }
 
@@ -558,363 +692,5 @@ fn signal_of(_status: &std::process::ExitStatus) -> Option<i32> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use agent::abort::AbortController;
-    use std::num::NonZeroUsize;
-    use std::path::Path;
-    use tempfile::TempDir;
-
-    #[test]
-    fn long_running_commands_get_a_forgiving_default() {
-        // Network/build commands get the longer default...
-        for cmd in [
-            "git clone git@github.com:x/y.git",
-            "cd /tmp && npm install",
-            "cargo build --release",
-            "pip install requests",
-            "curl -fsSL https://example.com/install.sh | sh",
-        ] {
-            assert_eq!(default_timeout_for(cmd), LONG_RUNNING_TIMEOUT_SECS, "{cmd}");
-        }
-        // ...while ordinary commands keep the snappy 60s default.
-        for cmd in ["ls -la", "echo hi", "grep foo bar.txt", "cat README.md"] {
-            assert_eq!(default_timeout_for(cmd), DEFAULT_TIMEOUT_SECS, "{cmd}");
-        }
-    }
-
-    #[test]
-    fn cap_for_model_passes_small_output_unchanged() {
-        let s = "hello\nworld\n";
-        let (out, trunc) = cap_for_model(s);
-        assert_eq!(out, s);
-        assert!(!trunc);
-    }
-
-    #[test]
-    fn cap_for_model_head_and_tail_with_notice() {
-        let big = "L\n".repeat(20_000);
-        let (out, trunc) = cap_for_model(&big);
-        assert!(trunc);
-        assert!(out.len() < big.len());
-        assert!(out.starts_with("L\n"));
-        assert!(out.trim_end().ends_with('L'));
-        assert!(out.contains("output truncated"));
-        assert!(out.contains("FileRead"));
-    }
-
-    #[test]
-    fn cap_for_model_never_splits_utf8() {
-        let s = "😀\n".repeat(10_000);
-        let (out, _trunc) = cap_for_model(&s);
-        assert!(out.is_char_boundary(0));
-        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
-    }
-
-    fn ctx() -> ToolUseContext {
-        ToolUseContext {
-            cwd: std::env::current_dir().unwrap(),
-            abort: AbortController::new(),
-            file_cache: Arc::new(agent::file_cache::FileStateCache::new(
-                NonZeroUsize::new(8).unwrap(),
-                1024 * 1024,
-            )),
-            permissions: Arc::new(agent::permission::PermissionManager::new()),
-            hooks: Arc::new(agent::hook::HookRunner::new()),
-            task_depth: 0,
-        }
-    }
-
-    fn policy_for(dir: &Path) -> Arc<WorkspacePolicy> {
-        WorkspacePolicy::new(dir).unwrap().into_arc()
-    }
-
-    #[tokio::test]
-    async fn bash_runs_and_captures_stdout() {
-        let dir = TempDir::new().unwrap();
-        let tool = BashTool::new(policy_for(dir.path()));
-        let out = tool
-            .call(&ctx(), json!({"command": "echo hello"}))
-            .await
-            .unwrap();
-        assert_eq!(out["exit_code"], 0);
-        assert!(out["stdout"].as_str().unwrap().contains("hello"));
-    }
-
-    #[tokio::test]
-    async fn bash_captures_nonzero_exit() {
-        let dir = TempDir::new().unwrap();
-        let tool = BashTool::new(policy_for(dir.path()));
-        let out = tool
-            .call(&ctx(), json!({"command": "exit 7"}))
-            .await
-            .unwrap();
-        assert_eq!(out["exit_code"], 7);
-    }
-
-    #[tokio::test]
-    async fn bash_captures_stderr_separately() {
-        let dir = TempDir::new().unwrap();
-        let tool = BashTool::new(policy_for(dir.path()));
-        let out = tool
-            .call(&ctx(), json!({"command": "echo to-stderr 1>&2"}))
-            .await
-            .unwrap();
-        assert!(out["stderr"].as_str().unwrap().contains("to-stderr"));
-        assert!(out["stdout"].as_str().unwrap().is_empty());
-    }
-
-    // `pwd` on Windows runners is Git-for-Windows' MSYS binary, which
-    // emits `/d/a/...`-style paths that `std::fs::canonicalize` can't
-    // parse as native Windows paths. The cwd-plumbing logic is OS-
-    // independent — coverage on Unix is sufficient.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn bash_runs_in_policy_cwd_by_default() {
-        let dir = TempDir::new().unwrap();
-        let tool = BashTool::new(policy_for(dir.path()));
-        let out = tool.call(&ctx(), json!({"command": "pwd"})).await.unwrap();
-        // Canonicalized tempdir on macOS goes through /private/...,
-        // so just check that the resolved cwd was used.
-        let cwd_in_output = out["stdout"].as_str().unwrap().trim();
-        assert!(
-            std::fs::canonicalize(cwd_in_output)
-                .unwrap()
-                .ends_with(dir.path().file_name().unwrap()),
-            "got {cwd_in_output}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn bash_runs_without_a_controlling_tty() {
-        let dir = TempDir::new().unwrap();
-        let tool = BashTool::new(policy_for(dir.path()));
-        let out = tool
-            .call(
-                &ctx(),
-                json!({"command": "if (: >/dev/tty) 2>/dev/null; then echo HAS_TTY; else echo NO_TTY; fi"}),
-            )
-            .await
-            .unwrap();
-        assert_eq!(out["stdout"].as_str().unwrap().trim(), "NO_TTY");
-    }
-
-    // Same Windows/MSYS pwd issue as above — gate cfg(unix).
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn bash_explicit_cwd_validated_through_policy() {
-        let dir = TempDir::new().unwrap();
-        std::fs::create_dir(dir.path().join("sub")).unwrap();
-        let tool = BashTool::new(policy_for(dir.path()));
-        let out = tool
-            .call(&ctx(), json!({"command": "pwd", "cwd": "sub"}))
-            .await
-            .unwrap();
-        assert!(out["stdout"].as_str().unwrap().trim().ends_with("sub"));
-    }
-
-    #[tokio::test]
-    async fn bash_rejects_cwd_outside_workspace() {
-        let dir = TempDir::new().unwrap();
-        let outside = TempDir::new().unwrap();
-        let tool = BashTool::new(policy_for(dir.path()));
-        let err = tool
-            .call(
-                &ctx(),
-                json!({"command": "pwd", "cwd": outside.path().to_str().unwrap()}),
-            )
-            .await
-            .expect_err("should fail");
-        assert!(err.to_string().contains("policy"));
-    }
-
-    #[tokio::test]
-    async fn bash_empty_command_rejected() {
-        let dir = TempDir::new().unwrap();
-        let tool = BashTool::new(policy_for(dir.path()));
-        let err = tool
-            .call(&ctx(), json!({"command": "   "}))
-            .await
-            .expect_err("empty");
-        assert!(err.to_string().contains("non-empty"));
-    }
-
-    // `sleep` isn't a Windows `cmd` builtin and may not be on PATH in
-    // restricted CI, even though Git-for-Windows runners happen to ship
-    // one. Gate to keep behavior deterministic.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn bash_timeout_kills_long_running_command() {
-        let dir = TempDir::new().unwrap();
-        let tool = BashTool::new(policy_for(dir.path()));
-        let err = tool
-            .call(&ctx(), json!({"command": "sleep 30", "timeout_secs": 1}))
-            .await
-            .expect_err("timeout");
-        assert!(err.to_string().contains("timed out"), "got {err}");
-        assert!(err.to_string().contains("no shell_id"), "got {err}");
-        assert!(err.to_string().contains("BashRun"), "got {err}");
-        assert!(err.to_string().contains("BashOutput"), "got {err}");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn bash_aborts_on_ctx_abort() {
-        let dir = TempDir::new().unwrap();
-        let tool = BashTool::new(policy_for(dir.path()));
-        let c = ctx();
-        c.abort.abort_with_reason("user cancelled");
-        let err = tool
-            .call(&c, json!({"command": "sleep 30"}))
-            .await
-            .expect_err("aborted");
-        assert!(matches!(err, AgentError::Aborted(_)));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn bash_pipe_chain_works() {
-        // Deterministic version: `printf` with explicit \n
-        // produces three lines on every POSIX shell.
-        let dir = TempDir::new().unwrap();
-        let tool = BashTool::new(policy_for(dir.path()));
-        let out = tool
-            .call(&ctx(), json!({"command": "printf 'a\\nb\\nc\\n' | wc -l"}))
-            .await
-            .unwrap();
-        let stdout = out["stdout"].as_str().unwrap().trim();
-        assert_eq!(stdout, "3");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn bash_truncates_huge_stdout_with_tail_preserved() {
-        let dir = TempDir::new().unwrap();
-        let tool = BashTool::new(policy_for(dir.path()));
-        // Print 2 MiB of x's followed by "TAIL_MARKER". Uses POSIX
-        // coreutils — gated cfg(unix) to keep Windows CI happy.
-        let cmd = format!(
-            "head -c {} /dev/zero | tr '\\0' 'x' && echo TAIL_MARKER",
-            2 * 1024 * 1024
-        );
-        let out = tool.call(&ctx(), json!({"command": cmd})).await.unwrap();
-        assert_eq!(out["stdout_truncated"], true);
-        assert!(
-            out["stdout"].as_str().unwrap().contains("TAIL_MARKER"),
-            "tail should be preserved"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn bash_caps_model_facing_stdout() {
-        let dir = TempDir::new().unwrap();
-        let tool = BashTool::new(policy_for(dir.path()));
-        let out = tool
-            .call(&ctx(), json!({"command": "yes L | head -n 20000"}))
-            .await
-            .unwrap();
-        let stdout = out["stdout"].as_str().unwrap();
-        assert_eq!(out["stdout_truncated"], true);
-        assert!(stdout.contains("output truncated"));
-        assert!(stdout.contains("FileRead"));
-        assert!(stdout.len() < 20_000);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn bash_compresses_recognized_command_stdout() {
-        let dir = TempDir::new().unwrap();
-        std::process::Command::new("git")
-            .arg("init")
-            .current_dir(dir.path())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .unwrap();
-        std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
-
-        let tool = BashTool::new(policy_for(dir.path()));
-        let out = tool
-            .call(&ctx(), json!({"command": "git status"}))
-            .await
-            .unwrap();
-        let stdout = out["stdout"].as_str().unwrap();
-        assert!(stdout.contains("git status:"), "{stdout}");
-        assert!(stdout.contains("compressed git status"), "{stdout}");
-        assert!(stdout.contains("1 untracked"), "{stdout}");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn bash_kills_process_group_on_timeout() {
-        // Spawn a shell that backgrounds a long-sleeping child, then
-        // exits the foreground sleep early. With process-group kill
-        // the background child also dies; without it the descendant
-        // would survive past the timeout.
-        // We can't easily observe "process killed externally" from
-        // the test, but we CAN observe that the timeout error fires
-        // — confirming the kill loop ran without panicking.
-        let dir = TempDir::new().unwrap();
-        let tool = BashTool::new(policy_for(dir.path()));
-        let err = tool
-            .call(
-                &ctx(),
-                json!({"command": "sleep 30 & sleep 30", "timeout_secs": 1}),
-            )
-            .await
-            .expect_err("timeout");
-        assert!(err.to_string().contains("timed out"));
-    }
-
-    #[tokio::test]
-    async fn bash_classified_mutating() {
-        let dir = TempDir::new().unwrap();
-        let tool = BashTool::new(policy_for(dir.path()));
-        assert_eq!(tool.safety_class(), SafetyClass::Mutating);
-    }
-
-    #[tokio::test]
-    async fn read_capped_zero_cap_discards_but_flags_truncated() {
-        // cap == 0 must NOT grow the buffer regardless of input size.
-        let mut data: &[u8] = b"abcdefghij";
-        let (out, truncated) = read_capped(&mut data, 0).await.unwrap();
-        assert!(out.is_empty());
-        assert!(truncated);
-        // Empty stream with cap 0 → not truncated.
-        let mut empty: &[u8] = b"";
-        let (out, truncated) = read_capped(&mut empty, 0).await.unwrap();
-        assert!(out.is_empty());
-        assert!(!truncated);
-    }
-
-    #[test]
-    fn trim_to_utf8_boundary_drops_continuation_prefix() {
-        // 4-byte codepoint U+1F600 = F0 9F 98 80. Cut after first byte
-        // and prepend continuations: tail starts at B2/B3-style bytes.
-        let bytes = vec![0x9F, 0x98, 0x80, b'a', b'b'];
-        let trimmed = trim_to_utf8_boundary(bytes);
-        // After trimming continuations, first byte should be ASCII 'a'.
-        assert_eq!(trimmed, b"ab");
-        // ASCII tail unchanged.
-        assert_eq!(trim_to_utf8_boundary(b"hello".to_vec()), b"hello");
-        // Multi-byte start byte (0xC3 = 2-byte) preserved.
-        assert_eq!(trim_to_utf8_boundary(vec![0xC3, 0xA9]), vec![0xC3, 0xA9]);
-    }
-
-    #[tokio::test]
-    async fn bash_caps_caller_supplied_timeout() {
-        // Even if the caller asks for 999_999 seconds, we cap.
-        let dir = TempDir::new().unwrap();
-        let tool = BashTool::new(policy_for(dir.path()));
-        let out = tool
-            .call(
-                &ctx(),
-                json!({"command": "echo ok", "timeout_secs": 999_999}),
-            )
-            .await
-            .unwrap();
-        assert_eq!(out["exit_code"], 0);
-    }
-}
+#[path = "shell_tests.rs"]
+mod tests;

@@ -21,7 +21,7 @@ use crate::abort::AbortController;
 use crate::error::AgentError;
 use crate::message::{ContentBlock, DocumentSource, ImageSource, Message, ToolResultContent};
 use crate::provider::{Provider, ProviderCapabilities, StreamRequest, ToolChoice, ToolDefinition};
-use crate::stream::{Event, EventStream, ResultData};
+use crate::stream::{Event, EventStream, ResultData, TaskEventStream};
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -176,9 +176,17 @@ impl Provider for AnthropicProvider {
         let bytes = response.bytes_stream();
         let (tx, rx) = mpsc::unbounded::<Result<Event, AgentError>>();
 
-        tokio::spawn(parse_sse_into_events(bytes, tx, abort));
+        let stream_work = abort.activity().track_worker();
+        let parser = tokio::spawn(async move {
+            let _work = stream_work;
+            parse_sse_into_events(bytes, tx, abort).await;
+        });
 
-        Ok(Box::new(rx))
+        Ok(Box::new(TaskEventStream::new(
+            rx,
+            parser,
+            "anthropic stream parser",
+        )))
     }
 }
 

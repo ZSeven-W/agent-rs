@@ -40,6 +40,10 @@ pub enum LifecycleError {
     Disabled(String),
     #[error("connector error: {0}")]
     Connector(String),
+    /// A connected server returned a definite terminal tool-level failure.
+    /// Unlike `Connector`, this proves that the RPC received a response.
+    #[error("remote tool error: {0}")]
+    Tool(String),
 }
 
 /// Per-server connection handle. The lifecycle manager uses these

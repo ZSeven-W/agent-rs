@@ -41,7 +41,7 @@ use crate::abort::AbortController;
 use crate::error::AgentError;
 use crate::message::{ContentBlock, Message, ToolResultContent};
 use crate::provider::{Provider, ProviderCapabilities, StreamRequest, ToolChoice, ToolDefinition};
-use crate::stream::{Event, EventStream, ResultData};
+use crate::stream::{Event, EventStream, ResultData, TaskEventStream};
 
 /// Vendor dialect — currently informational; the provider behaves the
 /// same across dialects because the wire shape is identical.
@@ -190,7 +190,9 @@ impl Provider for OpenAiCompatProvider {
 
         let (tx, rx) = mpsc::unbounded::<Result<Event, AgentError>>();
 
-        tokio::spawn(async move {
+        let stream_work = abort.activity().track_worker();
+        let parser = tokio::spawn(async move {
+            let _work = stream_work;
             let mut tool_call_acc: HashMap<u32, ToolCallAccumulator> = HashMap::new();
             let mut model: Option<String> = None;
             let mut stop_reason: Option<String> = None;
@@ -295,7 +297,11 @@ impl Provider for OpenAiCompatProvider {
             }));
         });
 
-        Ok(Box::new(rx))
+        Ok(Box::new(TaskEventStream::new(
+            rx,
+            parser,
+            "openai-compatible stream parser",
+        )))
     }
 }
 

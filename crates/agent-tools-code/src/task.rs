@@ -87,6 +87,58 @@ pub trait TaskObserver: Send + Sync + std::fmt::Debug {
     fn on_finish(&self, id: u64, result: &str, error: Option<&str>);
 }
 
+/// RAII terminal for observer state. Tokio cancellation drops tool futures;
+/// without this guard, an observer row would remain `Running` forever.
+#[derive(Debug)]
+pub struct TaskFinishGuard {
+    observer: Arc<dyn TaskObserver>,
+    id: u64,
+    finished: bool,
+}
+
+impl TaskFinishGuard {
+    pub fn start(
+        observer: Arc<dyn TaskObserver>,
+        agent_type: &str,
+        description: Option<&str>,
+        depth: usize,
+    ) -> Self {
+        let id = observer.on_start(agent_type, description, depth);
+        Self {
+            observer,
+            id,
+            finished: false,
+        }
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn on_event(&self, event: &Event) {
+        self.observer.on_event(self.id, event);
+    }
+
+    pub fn finish(&mut self, result: &str, error: Option<&str>) {
+        if !self.finished {
+            self.observer.on_finish(self.id, result, error);
+            self.finished = true;
+        }
+    }
+}
+
+impl Drop for TaskFinishGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.observer.on_finish(
+                self.id,
+                "",
+                Some("task cancelled before observer completion"),
+            );
+        }
+    }
+}
+
 /// Factory for resolving an `agent_type` string to a concrete
 /// child-loop config. Hosts implement this to enumerate which
 /// sub-agents the model is allowed to summon.
@@ -221,7 +273,7 @@ impl Tool for TaskTool {
         // ToolUseContext it hands its tools, so a grandchild Task call sees
         // the real nesting level. (The previous thread-local guard did not
         // survive the child loop's tokio::spawn / work-stealing.)
-        builder = builder.task_depth(depth + 1);
+        builder = builder.task_depth(depth + 1).root_turn_owner(false);
         let child = builder.build();
         // Forward the parent's abort to the child so cancelling the
         // outer loop also short-circuits the child.
@@ -229,10 +281,14 @@ impl Tool for TaskTool {
 
         let mut stream = child.run(parsed.prompt.clone(), abort).await?;
 
-        let observer = cfg.observer.clone();
-        let sub_id = observer
-            .as_ref()
-            .map(|o| o.on_start(&parsed.agent_type, parsed.description.as_deref(), depth));
+        let mut observation = cfg.observer.clone().map(|observer| {
+            TaskFinishGuard::start(
+                observer,
+                &parsed.agent_type,
+                parsed.description.as_deref(),
+                depth,
+            )
+        });
 
         let mut output = String::new();
         // Usage frames are cumulative WITHIN one provider turn and reset on
@@ -247,8 +303,8 @@ impl Tool for TaskTool {
         let mut stop_reason: Option<String> = None;
         let mut error: Option<AgentError> = None;
         while let Some(event) = stream.next().await {
-            if let (Some(o), Some(id), Ok(ev)) = (&observer, sub_id, &event) {
-                o.on_event(id, ev);
+            if let (Some(observation), Ok(ev)) = (&observation, &event) {
+                observation.on_event(ev);
             }
             match event {
                 Ok(Event::TextDelta { delta }) => output.push_str(&delta),
@@ -283,12 +339,8 @@ impl Tool for TaskTool {
                 }
             }
         }
-        if let (Some(o), Some(id)) = (&observer, sub_id) {
-            o.on_finish(
-                id,
-                &output,
-                error.as_ref().map(|e| e.to_string()).as_deref(),
-            );
+        if let Some(observation) = &mut observation {
+            observation.finish(&output, error.as_ref().map(|e| e.to_string()).as_deref());
         }
         if let Some(e) = error {
             return Err(e);

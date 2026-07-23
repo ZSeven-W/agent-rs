@@ -24,7 +24,8 @@
 //! Process hygiene matches `BashTool`: on Unix the child is started
 //! in a new session, so it has no controlling TTY and its pid is also
 //! the process-group id that `KillShell` can `/bin/kill -9 -<pgid>`.
-//! On Windows we just drop the `Child` (with `kill_on_drop(true)`).
+//! On Windows the supervisor owns the `Child` through termination and uses
+//! `taskkill /T` as a best-effort descendant fallback.
 //!
 //! Hosts that don't enable both this and the `shell` feature get
 //! the BashTool's existing one-shot semantics. The async trio is
@@ -32,6 +33,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,8 +44,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
-use tokio::sync::Mutex as AsyncMutex;
-use tokio::sync::RwLock;
+use tokio::sync::{watch, Mutex as AsyncMutex, RwLock};
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 use crate::policy::{PolicyError, WorkspacePolicy};
@@ -60,19 +62,14 @@ const MAX_SESSIONS_PER_REGISTRY: usize = 32;
 /// catch new output without spinning).
 const DEFAULT_OUTPUT_WAIT_MS: u64 = 0;
 const MAX_OUTPUT_WAIT_MS: u64 = 10_000;
+const TERMINATION_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]
 struct BashSession {
     /// Original command (for logging / introspection).
     command: String,
-    /// Direct child handle — held for `wait()` and PID retrieval
-    /// during kill. Wrapped in async mutex so kill / wait don't
-    /// race; we only ever take the lock briefly.
-    child: Arc<AsyncMutex<Option<Child>>>,
     /// PID captured at spawn for the process-group kill fallback.
-    /// `None` means the OS already reaped it.
-    #[cfg(unix)]
-    pgid: Option<u32>,
+    pid: Option<u32>,
     /// Tail buffers for stdout/stderr + truncation flags. Bounded
     /// at `PER_STREAM_CAP` regardless of stream length.
     stdout: Arc<AsyncMutex<TailBuffer>>,
@@ -80,7 +77,94 @@ struct BashSession {
     /// Latest exit status; `None` while the process is still
     /// running.
     exit: Arc<AsyncMutex<Option<std::process::ExitStatus>>>,
+    running: Arc<AtomicBool>,
+    terminate: watch::Sender<bool>,
+    supervisor: Option<JoinHandle<()>>,
 }
+
+impl BashSession {
+    fn request_stop(&self) {
+        if self.running.load(Ordering::Acquire) {
+            self.terminate.send_replace(true);
+            kill_process_tree(self.pid);
+        }
+    }
+
+    async fn stop(mut self) {
+        self.request_stop();
+        if let Some(mut supervisor) = self.supervisor.take() {
+            if timeout(TERMINATION_GRACE, &mut supervisor).await.is_err() {
+                supervisor.abort();
+                let _ = supervisor.await;
+            }
+        }
+    }
+}
+
+impl Drop for BashSession {
+    fn drop(&mut self) {
+        self.request_stop();
+        if let Some(supervisor) = self.supervisor.take() {
+            // Aborting drops the owned Child and process-tree guard inside the
+            // supervisor. This is the synchronous registry-drop fallback.
+            supervisor.abort();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ProcessTreeGuard {
+    pid: Option<u32>,
+    armed: bool,
+}
+
+impl ProcessTreeGuard {
+    fn new(pid: Option<u32>) -> Self {
+        Self { pid, armed: true }
+    }
+
+    fn kill(&self) {
+        kill_process_tree(self.pid);
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProcessTreeGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.kill();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn kill_process_tree(pid: Option<u32>) {
+    let Some(pid) = pid else { return };
+    let group = format!("-{pid}");
+    let _ = std::process::Command::new("/bin/kill")
+        .args(["-KILL", &group])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(windows)]
+fn kill_process_tree(pid: Option<u32>) {
+    let Some(pid) = pid else { return };
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/T", "/PID", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(not(any(unix, windows)))]
+fn kill_process_tree(_pid: Option<u32>) {}
 
 #[derive(Debug, Default)]
 struct TailBuffer {
@@ -180,24 +264,37 @@ impl Tool for BashRunTool {
     fn safety_class(&self) -> SafetyClass {
         SafetyClass::Mutating
     }
-    async fn call(&self, _ctx: &ToolUseContext, input: Value) -> Result<Value, AgentError> {
+    async fn call(&self, ctx: &ToolUseContext, input: Value) -> Result<Value, AgentError> {
         let parsed: BashRunInput = serde_json::from_value(input)
             .map_err(|e| AgentError::other(format!("BashRun invalid input: {e}")))?;
         if parsed.command.trim().is_empty() {
             return Err(AgentError::other("BashRun command must be non-empty"));
         }
 
-        // Cap the registry so a runaway model can't fork-bomb us.
-        if self.registry.len().await >= MAX_SESSIONS_PER_REGISTRY {
-            return Err(AgentError::other(format!(
-                "BashRun: registry capped at {MAX_SESSIONS_PER_REGISTRY} concurrent sessions; kill an existing one first"
-            )));
-        }
-
         let cwd = match parsed.cwd.as_deref() {
             Some(p) => self.policy.resolve(p, true).map_err(policy_to_agent_err)?,
             None => self.policy.cwd.clone(),
         };
+
+        // Acquire the only awaitable resource before spawning. From spawn
+        // through insertion there are no suspension points, so cancellation
+        // cannot strand an unregistered waiter or process.
+        let abort = ctx.abort.clone();
+        let mut sessions = tokio::select! {
+            biased;
+            _ = abort.cancelled() => {
+                return Err(AgentError::Aborted(
+                    abort.reason().unwrap_or_else(|| "aborted".into()),
+                ));
+            }
+            sessions = self.registry.inner.write() => sessions,
+        };
+        if sessions.len() >= MAX_SESSIONS_PER_REGISTRY {
+            return Err(AgentError::other(format!(
+                "BashRun: registry capped at {MAX_SESSIONS_PER_REGISTRY} concurrent sessions; kill an existing one first"
+            )));
+        }
+        abort.mark_side_effect_risk();
 
         let mut cmd = if cfg!(target_os = "windows") {
             let mut c = Command::new("cmd");
@@ -219,6 +316,8 @@ impl Tool for BashRunTool {
         let mut child = cmd
             .spawn()
             .map_err(|e| AgentError::other(format!("BashRun spawn failed: {e}")))?;
+        let pid = child.id();
+        let mut registration_guard = ProcessTreeGuard::new(pid);
 
         let stdout = child
             .stdout
@@ -229,9 +328,6 @@ impl Tool for BashRunTool {
             .take()
             .ok_or_else(|| AgentError::other("BashRun missing stderr pipe"))?;
 
-        #[cfg(unix)]
-        let pgid = child.id();
-
         let session_id = format!("bash_{}", random_id());
         let stdout_buf: Arc<AsyncMutex<TailBuffer>> =
             Arc::new(AsyncMutex::new(TailBuffer::default()));
@@ -239,59 +335,82 @@ impl Tool for BashRunTool {
             Arc::new(AsyncMutex::new(TailBuffer::default()));
         let exit_slot: Arc<AsyncMutex<Option<std::process::ExitStatus>>> =
             Arc::new(AsyncMutex::new(None));
-        let child_slot: Arc<AsyncMutex<Option<Child>>> = Arc::new(AsyncMutex::new(Some(child)));
+        let running = Arc::new(AtomicBool::new(true));
+        let (terminate, terminate_rx) = watch::channel(false);
 
         // Reader tasks — drain each pipe into its tail buffer.
         spawn_reader(stdout, stdout_buf.clone());
         spawn_reader(stderr, stderr_buf.clone());
 
-        // Waiter task — capture the exit status when the child
-        // finishes so `BashOutput` can surface it. We take the
-        // child out of `child_slot` while waiting, then put a
-        // sentinel `None` back so subsequent kill attempts no-op.
-        {
-            let child_slot = child_slot.clone();
-            let exit_slot = exit_slot.clone();
-            tokio::spawn(async move {
-                let mut taken = {
-                    let mut g = child_slot.lock().await;
-                    g.take()
-                };
-                if let Some(c) = &mut taken {
-                    if let Ok(status) = c.wait().await {
-                        *exit_slot.lock().await = Some(status);
-                    }
-                }
-            });
-        }
+        let supervisor =
+            spawn_supervisor(child, pid, terminate_rx, exit_slot.clone(), running.clone());
 
         let session = BashSession {
             command: parsed.command.clone(),
-            child: child_slot,
-            #[cfg(unix)]
-            pgid,
+            pid,
             stdout: stdout_buf,
             stderr: stderr_buf,
             exit: exit_slot,
+            running,
+            terminate,
+            supervisor: Some(supervisor),
         };
 
-        self.registry
-            .inner
-            .write()
-            .await
-            .insert(session_id.clone(), session);
+        sessions.insert(session_id.clone(), session);
+        registration_guard.disarm();
+        // A registered background shell intentionally survives this tool
+        // future. Scheduled turns must never be retried or recur while that
+        // detached external work remains unresolved.
+        abort.mark_unresolved_external_work();
 
         Ok(json!({
             "shell_id": session_id,
             "command": parsed.command,
             "cwd": cwd.display().to_string(),
-            "pid": child_pid(),
+            "pid": pid,
         }))
     }
 }
 
-fn child_pid() -> Option<u32> {
-    None
+fn spawn_supervisor(
+    mut child: Child,
+    pid: Option<u32>,
+    mut terminate: watch::Receiver<bool>,
+    exit: Arc<AsyncMutex<Option<std::process::ExitStatus>>>,
+    running: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut process_guard = ProcessTreeGuard::new(pid);
+        let status = tokio::select! {
+            status = child.wait() => status.ok(),
+            _ = termination_requested(&mut terminate) => {
+                process_guard.kill();
+                let _ = child.kill().await;
+                timeout(TERMINATION_GRACE, child.wait()).await.ok().and_then(Result::ok)
+            }
+        };
+
+        // Publish terminal state before disarming the drop guard. A concurrent
+        // registry drop then either sees `running` and kills, or relies on this
+        // still-armed guard to finish the same cleanup.
+        running.store(false, Ordering::Release);
+        process_guard.kill();
+        process_guard.disarm();
+        if let Some(status) = status {
+            *exit.lock().await = Some(status);
+        }
+    })
+}
+
+async fn termination_requested(terminate: &mut watch::Receiver<bool>) {
+    loop {
+        if *terminate.borrow_and_update() {
+            return;
+        }
+        if terminate.changed().await.is_err() {
+            return;
+        }
+    }
 }
 
 fn spawn_reader<R>(mut reader: R, buf: Arc<AsyncMutex<TailBuffer>>)
@@ -402,16 +521,17 @@ impl Tool for BashOutputTool {
                     parsed.shell_id
                 ))
             })?;
-            // Clone the buffer Arcs only — the Child handle stays
-            // in the registry.
+            // Clone only observable state; the supervisor remains owned by
+            // the registry entry.
             (
                 s.stdout.clone(),
                 s.stderr.clone(),
                 s.exit.clone(),
+                s.running.clone(),
                 s.command.clone(),
             )
         };
-        let (stdout_buf, stderr_buf, exit_slot, command) = session;
+        let (stdout_buf, stderr_buf, exit_slot, running_flag, command) = session;
 
         // First pass — drain whatever's there now.
         let mut stdout_bytes;
@@ -458,7 +578,7 @@ impl Tool for BashOutputTool {
         }
 
         let exit = *exit_slot.lock().await;
-        let running = exit.is_none();
+        let running = running_flag.load(Ordering::Acquire);
 
         let stdout_raw = String::from_utf8_lossy(&stdout_bytes).into_owned();
         let stderr_raw = String::from_utf8_lossy(&stderr_bytes).into_owned();
@@ -524,9 +644,8 @@ fn signal_of_status(_status: std::process::ExitStatus) -> Option<i32> {
 // KillShell
 // =====================================================================
 
-/// Terminate a background shell. Forwards SIGKILL to the whole
-/// process group on Unix; on Windows just drops the `Child`
-/// (`kill_on_drop(true)` does the rest).
+/// Terminate a background shell. The owned supervisor closes the process tree
+/// and reaps the direct child before this call returns.
 #[derive(Debug)]
 pub struct KillShellTool {
     registry: BashSessionRegistry,
@@ -569,26 +688,7 @@ impl Tool for KillShellTool {
             AgentError::other(format!("KillShell: no shell with id '{}'", parsed.shell_id))
         })?;
 
-        // On Unix, `kill -9 -<pgid>` so descendants die too. The
-        // direct child gets dropped by the registry removal which
-        // triggers `kill_on_drop`; the pgid kill catches anything
-        // the child forked.
-        #[cfg(unix)]
-        if let Some(pid) = session.pgid {
-            let arg = format!("-{pid}");
-            let _ = std::process::Command::new("/bin/kill")
-                .arg("-9")
-                .arg(arg)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
-
-        // Take the Child out of its slot so the drop fires now
-        // (the waiter task already may have taken it; either is
-        // fine — we're only ensuring kill_on_drop runs).
-        let _ = session.child.lock().await.take();
+        session.stop().await;
 
         Ok(json!({
             "shell_id": parsed.shell_id,
@@ -598,269 +698,5 @@ impl Tool for KillShellTool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use agent::abort::AbortController;
-    use agent::file_cache::FileStateCache;
-    use agent::hook::HookRunner;
-    use agent::permission::PermissionManager;
-    use std::num::NonZeroUsize;
-    use std::path::Path;
-    use tempfile::TempDir;
-
-    fn ctx() -> ToolUseContext {
-        ToolUseContext {
-            cwd: std::env::current_dir().unwrap(),
-            abort: AbortController::new(),
-            file_cache: Arc::new(FileStateCache::new(
-                NonZeroUsize::new(8).unwrap(),
-                1024 * 1024,
-            )),
-            permissions: Arc::new(PermissionManager::new()),
-            hooks: Arc::new(HookRunner::new()),
-            task_depth: 0,
-        }
-    }
-
-    fn policy_for(dir: &Path) -> Arc<WorkspacePolicy> {
-        WorkspacePolicy::new(dir).unwrap().into_arc()
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn run_then_output_then_kill() {
-        let dir = TempDir::new().unwrap();
-        let registry = BashSessionRegistry::new();
-        let run = BashRunTool::new(policy_for(dir.path()), registry.clone());
-        let out = BashOutputTool::new(registry.clone());
-        let kill = KillShellTool::new(registry.clone());
-
-        // Start an infinite tick loop.
-        let started = run
-            .call(
-                &ctx(),
-                json!({"command": "i=0; while true; do echo tick$i; i=$((i+1)); sleep 0.05; done"}),
-            )
-            .await
-            .unwrap();
-        let shell_id = started["shell_id"].as_str().unwrap().to_string();
-
-        // Wait briefly for some output. wait_ms lets the tool block
-        // until a tick arrives.
-        let polled = out
-            .call(&ctx(), json!({"shell_id": &shell_id, "wait_ms": 500}))
-            .await
-            .unwrap();
-        let stdout = polled["stdout"].as_str().unwrap();
-        assert!(stdout.contains("tick"), "got stdout: {stdout:?}");
-        assert_eq!(polled["running"], true);
-
-        // Second poll: buffer drained, but more output should arrive
-        // within the wait window.
-        let polled2 = out
-            .call(&ctx(), json!({"shell_id": &shell_id, "wait_ms": 500}))
-            .await
-            .unwrap();
-        assert!(polled2["stdout"].as_str().unwrap().contains("tick"));
-
-        // Kill it. Subsequent BashOutput should report not-running.
-        let killed = kill
-            .call(&ctx(), json!({"shell_id": &shell_id}))
-            .await
-            .unwrap();
-        assert_eq!(killed["killed"], true);
-
-        // Killed shell is removed from the registry.
-        let err = out
-            .call(&ctx(), json!({"shell_id": &shell_id, "wait_ms": 0}))
-            .await
-            .expect_err("should be gone");
-        assert!(err.to_string().contains("no shell"));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn output_caps_model_facing_stdout() {
-        let registry = BashSessionRegistry::new();
-        let shell_id = "model-cap-test".to_string();
-        let stdout = Arc::new(AsyncMutex::new(TailBuffer::default()));
-        stdout.lock().await.push_chunk(&vec![b'L'; 20_000]);
-        registry.inner.write().await.insert(
-            shell_id.clone(),
-            BashSession {
-                command: "synthetic-large-output".to_string(),
-                child: Arc::new(AsyncMutex::new(None)),
-                pgid: None,
-                stdout,
-                stderr: Arc::new(AsyncMutex::new(TailBuffer::default())),
-                exit: Arc::new(AsyncMutex::new(None)),
-            },
-        );
-        let out = BashOutputTool::new(registry);
-
-        let polled = out
-            .call(&ctx(), json!({"shell_id": &shell_id, "wait_ms": 0}))
-            .await
-            .unwrap();
-
-        let stdout = polled["stdout"].as_str().unwrap();
-        assert_eq!(polled["stdout_truncated"], true);
-        assert!(stdout.contains("output truncated"));
-        assert!(stdout.contains("FileRead"));
-        assert!(stdout.len() < 20_000);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn output_compresses_recognized_command_stdout() {
-        let dir = TempDir::new().unwrap();
-        std::process::Command::new("git")
-            .arg("init")
-            .current_dir(dir.path())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .unwrap();
-        std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
-
-        let registry = BashSessionRegistry::new();
-        let run = BashRunTool::new(policy_for(dir.path()), registry.clone());
-        let out = BashOutputTool::new(registry);
-        let started = run
-            .call(&ctx(), json!({"command": "git status"}))
-            .await
-            .unwrap();
-        let shell_id = started["shell_id"].as_str().unwrap().to_string();
-
-        let mut polled = out
-            .call(&ctx(), json!({"shell_id": &shell_id, "wait_ms": 1000}))
-            .await
-            .unwrap();
-        for _ in 0..20 {
-            if polled["running"] == false {
-                break;
-            }
-            polled = out
-                .call(&ctx(), json!({"shell_id": &shell_id, "wait_ms": 1000}))
-                .await
-                .unwrap();
-        }
-
-        let stdout = polled["stdout"].as_str().unwrap();
-        assert!(stdout.contains("git status:"), "{stdout}");
-        assert!(stdout.contains("compressed git status"), "{stdout}");
-        assert!(stdout.contains("1 untracked"), "{stdout}");
-    }
-
-    #[tokio::test]
-    async fn run_rejects_empty_command() {
-        let dir = TempDir::new().unwrap();
-        let registry = BashSessionRegistry::new();
-        let run = BashRunTool::new(policy_for(dir.path()), registry);
-        let err = run
-            .call(&ctx(), json!({"command": "  "}))
-            .await
-            .expect_err("empty");
-        assert!(err.to_string().contains("non-empty"));
-    }
-
-    #[tokio::test]
-    async fn output_unknown_shell_errors() {
-        let registry = BashSessionRegistry::new();
-        let out = BashOutputTool::new(registry);
-        let err = out
-            .call(&ctx(), json!({"shell_id": "bogus"}))
-            .await
-            .expect_err("not found");
-        assert!(err.to_string().contains("no shell"));
-    }
-
-    #[tokio::test]
-    async fn kill_unknown_shell_errors() {
-        let registry = BashSessionRegistry::new();
-        let kill = KillShellTool::new(registry);
-        let err = kill
-            .call(&ctx(), json!({"shell_id": "bogus"}))
-            .await
-            .expect_err("not found");
-        assert!(err.to_string().contains("no shell"));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn output_surfaces_exit_code_after_short_command() {
-        let dir = TempDir::new().unwrap();
-        let registry = BashSessionRegistry::new();
-        let run = BashRunTool::new(policy_for(dir.path()), registry.clone());
-        let out = BashOutputTool::new(registry.clone());
-
-        let started = run
-            .call(&ctx(), json!({"command": "echo done && exit 7"}))
-            .await
-            .unwrap();
-        let shell_id = started["shell_id"].as_str().unwrap().to_string();
-
-        // Poll with a wait long enough for the short command to
-        // finish.
-        let polled = out
-            .call(&ctx(), json!({"shell_id": &shell_id, "wait_ms": 1000}))
-            .await
-            .unwrap();
-        // Either still running or done; if done, exit code must be 7.
-        if polled["running"] == false {
-            assert_eq!(polled["exit_code"], 7);
-        }
-        // A second poll definitely catches the exit (waiter task
-        // had time to run by now).
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let polled2 = out
-            .call(&ctx(), json!({"shell_id": &shell_id, "wait_ms": 0}))
-            .await
-            .unwrap();
-        assert_eq!(polled2["running"], false);
-        assert_eq!(polled2["exit_code"], 7);
-        assert!(
-            polled["stdout"].as_str().unwrap().contains("done")
-                || polled2["stdout"].as_str().unwrap().contains("done")
-        );
-    }
-
-    #[tokio::test]
-    async fn registry_caps_concurrent_sessions() {
-        let dir = TempDir::new().unwrap();
-        let registry = BashSessionRegistry::new();
-        let run = BashRunTool::new(policy_for(dir.path()), registry.clone());
-        // Stuff the registry to the cap with no-op sessions.
-        for _ in 0..MAX_SESSIONS_PER_REGISTRY {
-            registry.inner.write().await.insert(
-                random_id(),
-                BashSession {
-                    command: "noop".into(),
-                    child: Arc::new(AsyncMutex::new(None)),
-                    #[cfg(unix)]
-                    pgid: None,
-                    stdout: Arc::new(AsyncMutex::new(TailBuffer::default())),
-                    stderr: Arc::new(AsyncMutex::new(TailBuffer::default())),
-                    exit: Arc::new(AsyncMutex::new(None)),
-                },
-            );
-        }
-        let err = run
-            .call(&ctx(), json!({"command": "echo hi"}))
-            .await
-            .expect_err("over cap");
-        assert!(err.to_string().contains("capped"));
-    }
-
-    #[tokio::test]
-    async fn run_classified_mutating_output_read_only_kill_mutating() {
-        let dir = TempDir::new().unwrap();
-        let registry = BashSessionRegistry::new();
-        let run = BashRunTool::new(policy_for(dir.path()), registry.clone());
-        let out = BashOutputTool::new(registry.clone());
-        let kill = KillShellTool::new(registry);
-        assert_eq!(run.safety_class(), SafetyClass::Mutating);
-        assert_eq!(out.safety_class(), SafetyClass::ReadOnly);
-        assert_eq!(kill.safety_class(), SafetyClass::Mutating);
-    }
-}
+#[path = "bash_async_tests.rs"]
+mod tests;

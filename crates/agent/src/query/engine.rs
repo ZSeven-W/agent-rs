@@ -7,7 +7,7 @@ use crate::abort::AbortController;
 use crate::error::AgentError;
 use crate::message::{ContentBlock, Header, Message, MessageStore};
 use crate::provider::{Provider, StreamRequest};
-use crate::stream::{Event, EventStream, ResultData};
+use crate::stream::{Event, EventStream, ResultData, TaskEventStream};
 use crate::tool::ToolRegistry;
 
 /// Glue layer that drives one turn of an LLM conversation.
@@ -96,7 +96,10 @@ impl QueryEngine {
 
     /// Run a single turn. Returns a stream of `Event`s; the stream
     /// completes after the provider's stream ends and the engine has
-    /// pushed the Assistant message + emitted `Event::Result`.
+    /// pushed the Assistant message + emitted `Event::Result`. Dropping the
+    /// stream hard-cancels its owned producer. A caller that will immediately
+    /// reuse the same store after hard drop must retain a clone of `abort` and
+    /// await `abort.activity().wait_for_quiescence()` first.
     pub async fn run(
         &self,
         user_msg: impl Into<String>,
@@ -134,9 +137,17 @@ impl QueryEngine {
         let (tx, rx) = mpsc::unbounded::<Result<Event, AgentError>>();
         let store = self.store.clone();
 
-        tokio::spawn(forward_turn(upstream, tx, store, user_uuid));
+        let forward_work = abort.activity().track_worker();
+        let forward = tokio::spawn(async move {
+            let _work = forward_work;
+            forward_turn(upstream, tx, store, user_uuid).await;
+        });
 
-        Ok(Box::new(rx))
+        Ok(Box::new(TaskEventStream::new(
+            rx,
+            forward,
+            "query forwarding",
+        )))
     }
 }
 
@@ -186,6 +197,8 @@ async fn forward_turn(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
     use crate::message::Message;
     use crate::testing::MockProvider;
@@ -305,6 +318,85 @@ mod tests {
             let res = engine.run("hi", AbortController::new()).await;
             assert!(matches!(res, Err(AgentError::Provider { .. })));
         });
+    }
+
+    #[tokio::test]
+    async fn dropped_engine_stream_has_a_quiescence_fence_before_store_reuse() {
+        #[derive(Debug)]
+        struct PendingProvider {
+            dropped: Arc<AtomicBool>,
+        }
+
+        #[derive(Debug)]
+        struct PendingStream {
+            dropped: Arc<AtomicBool>,
+        }
+
+        impl futures::Stream for PendingStream {
+            type Item = Result<Event, AgentError>;
+
+            fn poll_next(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Self::Item>> {
+                std::task::Poll::Pending
+            }
+        }
+
+        impl Drop for PendingStream {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::SeqCst);
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl Provider for PendingProvider {
+            fn id(&self) -> &str {
+                "pending"
+            }
+
+            fn capabilities(&self) -> crate::provider::ProviderCapabilities {
+                crate::provider::ProviderCapabilities::default()
+            }
+
+            async fn stream(
+                &self,
+                _req: StreamRequest,
+                _abort: AbortController,
+            ) -> Result<Box<dyn EventStream>, AgentError> {
+                Ok(Box::new(PendingStream {
+                    dropped: self.dropped.clone(),
+                }))
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let engine = QueryEngine::new(
+            Arc::new(PendingProvider {
+                dropped: dropped.clone(),
+            }),
+            "pending",
+        );
+        let abort = AbortController::new();
+        let activity = abort.activity();
+        let stream = engine.run("first", abort).await.unwrap();
+        assert_eq!(activity.active_workers(), 1);
+
+        drop(stream);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            activity.wait_for_quiescence(),
+        )
+        .await
+        .expect("engine producer reached quiescence");
+
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(activity.active_workers(), 0);
+        // Only the synchronously appended user turn remains. Once the fence
+        // resolves there can be no late assistant tail-write into this store.
+        assert_eq!(engine.snapshot().unwrap().len(), 1);
+        tokio::task::yield_now().await;
+        assert_eq!(engine.snapshot().unwrap().len(), 1);
     }
 
     #[test]

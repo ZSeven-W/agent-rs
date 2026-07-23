@@ -351,7 +351,16 @@ async fn fetch_with_pinned_redirects(
         // free wall-clock; wrap in `tokio::time::timeout(remaining)`
         // and recompute `remaining` after it returns so the request
         // timeout reflects the budget actually left.
-        let (host, _port, addrs) = match timeout(remaining, resolve_and_validate(&current)).await {
+        let resolution = tokio::select! {
+            biased;
+            _ = abort.cancelled() => {
+                return Err(AgentError::Aborted(
+                    abort.reason().unwrap_or_else(|| "aborted".into()),
+                ));
+            }
+            result = timeout(remaining, resolve_and_validate(&current)) => result,
+        };
+        let (host, _port, addrs) = match resolution {
             Ok(Ok(triple)) => triple,
             Ok(Err(e)) => return Err(e),
             Err(_) => {

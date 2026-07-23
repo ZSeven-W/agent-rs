@@ -23,7 +23,7 @@ use crate::abort::AbortController;
 use crate::error::AgentError;
 use crate::message::{ContentBlock, Message, ToolResultContent};
 use crate::provider::{Provider, ProviderCapabilities, StreamRequest, ToolChoice, ToolDefinition};
-use crate::stream::{Event, EventStream, ResultData};
+use crate::stream::{Event, EventStream, ResultData, TaskEventStream};
 
 const DEFAULT_HOST: &str = "http://localhost";
 const DEFAULT_PORT: u16 = 11434;
@@ -142,7 +142,9 @@ impl Provider for OllamaProvider {
         let (tx, rx) = mpsc::unbounded::<Result<Event, AgentError>>();
         let error_model = request_model;
 
-        tokio::spawn(async move {
+        let stream_work = abort.activity().track_worker();
+        let parser = tokio::spawn(async move {
+            let _work = stream_work;
             let mut model: Option<String> = None;
             let mut last_done = false;
             // Ollama's `ToolCall` has no id field (the daemon matches
@@ -214,7 +216,11 @@ impl Provider for OllamaProvider {
             }));
         });
 
-        Ok(Box::new(rx))
+        Ok(Box::new(TaskEventStream::new(
+            rx,
+            parser,
+            "ollama stream parser",
+        )))
     }
 }
 

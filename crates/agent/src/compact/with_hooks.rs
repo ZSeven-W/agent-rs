@@ -102,10 +102,13 @@ pub async fn compact_with_hooks(
         abort,
     } = request;
     let pre_outcome = hooks
-        .run(&HookEvent::PreCompact {
-            trigger: trigger.as_str().into(),
-            custom_instructions: custom_instructions.map(String::from),
-        })
+        .run_with_abort(
+            &HookEvent::PreCompact {
+                trigger: trigger.as_str().into(),
+                custom_instructions: custom_instructions.map(String::from),
+            },
+            &abort,
+        )
         .await;
     if matches!(pre_outcome, HookOutcome::Block) {
         return Err(CompactError::Aborted);
@@ -117,30 +120,36 @@ pub async fn compact_with_hooks(
         model.clone(),
         custom_instructions,
         direction,
-        abort,
+        abort.clone(),
     )
     .await;
 
     match &result {
         Ok(r) => {
             let _ = hooks
-                .run(&HookEvent::PostCompact {
-                    pre_tokens: r.pre_compact_tokens,
-                    post_tokens: r.post_compact_tokens,
-                    replaced_count: r.replaced_uuids.len() as u32,
-                })
+                .run_with_abort(
+                    &HookEvent::PostCompact {
+                        pre_tokens: r.pre_compact_tokens,
+                        post_tokens: r.post_compact_tokens,
+                        replaced_count: r.replaced_uuids.len() as u32,
+                    },
+                    &abort,
+                )
                 .await;
         }
         Err(_) => {
             let _ = hooks
-                .run(&HookEvent::PostCompact {
-                    pre_tokens: messages
-                        .iter()
-                        .map(super::estimate_tokens)
-                        .fold(0u32, u32::saturating_add),
-                    post_tokens: 0,
-                    replaced_count: 0,
-                })
+                .run_with_abort(
+                    &HookEvent::PostCompact {
+                        pre_tokens: messages
+                            .iter()
+                            .map(super::estimate_tokens)
+                            .fold(0u32, u32::saturating_add),
+                        post_tokens: 0,
+                        replaced_count: 0,
+                    },
+                    &abort,
+                )
                 .await;
         }
     }

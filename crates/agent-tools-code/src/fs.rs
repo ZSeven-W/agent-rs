@@ -218,7 +218,7 @@ impl Tool for FileWriteTool {
     }
     async fn call(
         &self,
-        _ctx: &ToolUseContext,
+        ctx: &ToolUseContext,
         input: serde_json::Value,
     ) -> Result<serde_json::Value, AgentError> {
         let parsed: FileWriteInput = serde_json::from_value(input)
@@ -254,7 +254,7 @@ impl Tool for FileWriteTool {
             }
         }
         self.policy
-            .write_file(&resolved, &bytes)
+            .write_file_tracked(&resolved, &bytes, &ctx.abort)
             .await
             .map_err(|e| io_to_agent_err("write", &parsed.path, e))?;
         Ok(json!({
@@ -321,7 +321,7 @@ impl Tool for FileEditTool {
     }
     async fn call(
         &self,
-        _ctx: &ToolUseContext,
+        ctx: &ToolUseContext,
         input: serde_json::Value,
     ) -> Result<serde_json::Value, AgentError> {
         let parsed: FileEditInput = serde_json::from_value(input)
@@ -380,7 +380,7 @@ impl Tool for FileEditTool {
             .check_size(new_text.len() as u64)
             .map_err(policy_to_agent_err)?;
         self.policy
-            .write_file(&resolved, new_text.as_bytes())
+            .write_file_tracked(&resolved, new_text.as_bytes(), &ctx.abort)
             .await
             .map_err(|e| io_to_agent_err("write", &parsed.path, e))?;
         Ok(json!({
@@ -526,7 +526,7 @@ impl Tool for MkdirTool {
     }
     async fn call(
         &self,
-        _ctx: &ToolUseContext,
+        ctx: &ToolUseContext,
         input: serde_json::Value,
     ) -> Result<serde_json::Value, AgentError> {
         let parsed: MkdirInput = serde_json::from_value(input)
@@ -536,7 +536,7 @@ impl Tool for MkdirTool {
             .resolve(&parsed.path, false)
             .map_err(policy_to_agent_err)?;
         self.policy
-            .create_dir(&resolved, parsed.recursive)
+            .create_dir_tracked(&resolved, parsed.recursive, &ctx.abort)
             .await
             .map_err(|e| io_to_agent_err("mkdir", &parsed.path, e))?;
         Ok(json!({"path": resolved.display().to_string(), "status": "ok"}))
@@ -590,7 +590,7 @@ impl Tool for MoveTool {
     }
     async fn call(
         &self,
-        _ctx: &ToolUseContext,
+        ctx: &ToolUseContext,
         input: serde_json::Value,
     ) -> Result<serde_json::Value, AgentError> {
         let parsed: MoveInput = serde_json::from_value(input)
@@ -610,7 +610,7 @@ impl Tool for MoveTool {
             )));
         }
         self.policy
-            .rename(&from, &to)
+            .rename_tracked(&from, &to, &ctx.abort)
             .await
             .map_err(|e| io_to_agent_err("rename", &parsed.from, e))?;
         Ok(json!({
@@ -669,7 +669,7 @@ impl Tool for RemoveTool {
     }
     async fn call(
         &self,
-        _ctx: &ToolUseContext,
+        ctx: &ToolUseContext,
         input: serde_json::Value,
     ) -> Result<serde_json::Value, AgentError> {
         let parsed: RemoveInput = serde_json::from_value(input)
@@ -682,7 +682,7 @@ impl Tool for RemoveTool {
             .await
             .map_err(|e| io_to_agent_err("stat", &parsed.path, e))?;
         self.policy
-            .remove(&resolved, parsed.recursive, meta.is_dir())
+            .remove_tracked(&resolved, parsed.recursive, meta.is_dir(), &ctx.abort)
             .await
             .map_err(|e| io_to_agent_err("remove", &parsed.path, e))?;
         Ok(json!({"path": resolved.display().to_string(), "status": "ok"}))
